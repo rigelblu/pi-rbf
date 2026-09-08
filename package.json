@@ -1,0 +1,14 @@
+{
+  "name": "pi-rbf",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "typescript": "~5.8.2",
+    "vitest": "^3.0.0"
+  }
+}
