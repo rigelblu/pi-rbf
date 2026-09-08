@@ -1,0 +1,10 @@
+# Use $REPO/docs/conventions/metadata.md
+[repo]
+product = "@pi"
+owner = "@tom-rigelblu"
+
+[project]
+type = "product"
+product_id = ["pi"]
+project_type = "new capabilities"
+rb_drive_store = "pi-rbf-drive"
