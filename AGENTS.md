@@ -41,3 +41,6 @@ Trigger on your first action, not on whether the request sounded like a feature.
 
 # 🔵⋯ Custom Project Rules
 This project's own rules — add them here. Everything above is common to every project, and `prj-setup retrofit` rewrites it.
+
+- When adding new features to the product ship plan, also added it to `rb-drive/projects/v0.x/research/on-claude-code-terminal-ui-cli.md`
+
