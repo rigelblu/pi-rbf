@@ -7,6 +7,18 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.8.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see skills loaded blend into background (not stand out) (#pi-4)
+
+---
+
+# 🔵⋯ v0.7.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat | use /clear to start a new chat (#pi-16)
+
+---
+
 # 🔵⋯ v0.6.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat (ux) | see read file output and code blocks without markdown code fences and without extra blank line (#pi-11)

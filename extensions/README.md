@@ -133,4 +133,44 @@ Local Pi extension that provides a clean, unboxed glance presentation for the `e
 - Global installation: `cp ./extensions/rbf-edit-glance.ts ~/.pi/agent/extensions/rbf-edit-glance.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-edit-glance.ts`
 
+---
 
+# 🔵⋯ rbf-clear
+
+## 🟠⋯ Overview
+Local Pi extension registering the `/clear` slash command to start a new chat session cleanly, honoring Claude Code terminal muscle memory while matching native Pi `/new` behavior.
+
+## 🟠⋯ Capabilities & Behavior
+- Command registration: registers `/clear` with description `Clear conversation and start a new session`
+- Official session replacement: calls `ctx.newSession()`, which persists the previous session transcript to `.pi/agent/sessions/`, resets the message tree, clears the chat container, and rebinds active extensions
+- Visual confirmation: displays `✓ New session started` via `withSession` post-switch callback, matching native Pi `/new` feedback
+- Argument tolerance: trailing arguments (e.g. `/clear now` or trailing spaces) are ignored without error
+- No prompts: executes immediately without confirmation modals
+- Zero dependencies: pure TypeScript extension using standard Pi extension APIs
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-clear.ts`, type `/clear`, press Enter
+- Global installation: `cp ./extensions/rbf-clear.ts ~/.pi/agent/extensions/rbf-clear.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-clear.ts`
+
+---
+
+# 🔵⋯ rbf-skill-loaded-blended
+
+## 🟠⋯ Overview
+Local Pi extension that blends skill invocations directly into the terminal background by setting transparent fill (`bgFn = undefined`) and zero vertical padding (`paddingY = 0`) on `SkillInvocationMessageComponent`, presenting a compact, uncluttered Claude Code layout.
+
+## 🟠⋯ Capabilities & Behavior
+- Blended collapsed state: removes the solid colored card background box (`customMessageBg`) and top/bottom blank lines, reducing skill invocations to two unboxed rows:
+  - Line 1: `● Skill(<name>)` with a green bullet (`success`), bold "Skill", and unbolded `(<name>)`
+  - Line 2: `  └  Successfully loaded skill` with a muted branch symbol (`muted`) and muted status label
+- Clutter removal: strips the redundant `[skill]` tag and `(Ctrl+O to expand)` hint from the collapsed view
+- Clean expanded state: pressing `Ctrl+O` or clicking expands the component to display the same clean two-line header followed by a spacer and full unboxed markdown instructions
+- Zero dependencies: pure TypeScript extension utilizing standard Pi extension APIs and component inheritance
+- Idempotent: monkey-patches `SkillInvocationMessageComponent.prototype.updateDisplay` safely with symbol guard `Symbol.for("rbf.skillLoadedBlended.patched")` and provides `restoreSkillLoadedBlended()`
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-skill-loaded-blended.ts`, invoke a skill (e.g. `/skill:find-skills` or `/find-skills`), and observe the clean unboxed indicator
+- Expand/collapse check: press `Ctrl+O` on the loaded skill row to expand full markdown instructions, then press `Ctrl+O` again to collapse
+- Global installation: `cp ./extensions/rbf-skill-loaded-blended.ts ~/.pi/agent/extensions/rbf-skill-loaded-blended.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-skill-loaded-blended.ts`

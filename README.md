@@ -4,6 +4,8 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-skill-loaded-blended`](extensions/rbf-skill-loaded-blended.ts) (v0.8.0) — Routine loaded skills blend transparently into terminal background matching Claude Code.
+- [`rbf-clear`](extensions/rbf-clear.ts) (v0.7.0) — Use `/clear` to start a new chat session cleanly, matching native `/new`.
 - [`rbf-clean-markdown-code`](extensions/rbf-clean-markdown-code.ts) (v0.6.0) — Clean read output without markdown fences/blank lines, and syntax highlighting matching Claude Code.
 - [`rbf-edit-glance`](extensions/rbf-edit-glance.ts) (v0.5.0) — See first few lines of each edit at a glance with Claude Code background tints.
 - [`rbf-tool-execution-blended`](extensions/rbf-tool-execution-blended.ts) (v0.4.0) — Routine collapsed tool calls blend into terminal background.
