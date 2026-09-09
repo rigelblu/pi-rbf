@@ -174,3 +174,27 @@ Local Pi extension that blends skill invocations directly into the terminal back
 - Expand/collapse check: press `Ctrl+O` on the loaded skill row to expand full markdown instructions, then press `Ctrl+O` again to collapse
 - Global installation: `cp ./extensions/rbf-skill-loaded-blended.ts ~/.pi/agent/extensions/rbf-skill-loaded-blended.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-skill-loaded-blended.ts`
+
+---
+
+# 🔵⋯ rbf-cache-guardian
+
+## 🟠⋯ Overview
+Local Pi extension that acts as a passive Cache Guardian for prompt-caching providers (starting with Pi's direct-Anthropic path): tracks the documented 5-minute cache window from provider request start, renders a live 1-second countdown below the editor with a 10-pip right-to-left draining battery progress bar, alerts at ≤ 10% remaining (30s), and prompts to `/clear` stale history at 0:00 with Claude Code styled accent text.
+
+## 🟠⋯ Capabilities & Behavior
+- Absolute window tracking: computes deadline from provider request start (`startedAt + 300_000`), accurately accounting for model generation time, tool runs, and sleep/wake jumps
+- Conservative support boundary: supports direct Anthropic short-retention path only; stays quiet when `PI_CACHE_RETENTION=long`, on Codex, or when turns report zero cached tokens
+- Monospace below-editor widget:
+  - Calm (> 30% remaining): muted text `4:12 TTL [████████░░] 182.6k cached`
+  - Warning (≤ 30% remaining, 1:30): yellow warning tint with `⚠️ 1:15 TTL [██░░░░░░░░] 182.6k cached`
+  - Critical (≤ 10% remaining, 0:30): red error tint with `🚨 0:25 TTL [░░░░░░░░░░] 182.6k cached`
+  - Elapsed (0:00): Claude Code styled call-to-action `new task? /clear to save 182.6k tokens` with `/clear` and token count highlighted in accent color
+- Dual notifications: triggers one terminal toast (`ctx.ui.notify`) and one macOS desktop notification (`pi.exec` via `/usr/bin/osascript`, with terminal bell fallback) once at the critical ≤ 10% boundary
+- Safe lifecycle invalidation: automatically clears timers, advances epochs, and removes the widget on user input, session switch, compaction, tree navigation, model change, or thinking level change
+- Passive operation: makes zero background provider completions and registers no keep-alive commands
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-cache-guardian.ts`, run a prompt against Anthropic, and observe the live countdown below the editor
+- Global installation: `cp ./extensions/rbf-cache-guardian.ts ~/.pi/agent/extensions/rbf-cache-guardian.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-cache-guardian.ts`
