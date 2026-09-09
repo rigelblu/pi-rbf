@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.3.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see less vertical padding on my previous messages (#pi-1)
+
+---
+
 # 🔵⋯ v0.2.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat | use /exit to quit pi (#pi-9)
