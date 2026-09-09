@@ -79,3 +79,22 @@ Local Pi extension registering the `/exit` slash command to quit Pi cleanly, mat
 - Local verification: launch `pi -e ./extensions/rbf-exit.ts`, type `/exit`, press Enter
 - Global installation: `cp ./extensions/rbf-exit.ts ~/.pi/agent/extensions/rbf-exit.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-exit.ts`
+
+---
+
+# 🔵⋯ rbf-user-message-padding
+
+## 🟠⋯ Overview
+Local Pi extension that compacts vertical padding on previous user messages by setting `paddingY: 0` on `UserMessageComponent`.
+
+## 🟠⋯ Capabilities & Behavior
+- Compact padding: replaces the default 1-row blank top and 1-row blank bottom cream background padding with 0, reducing a 1-line user prompt from 3 rows to 1 row
+- Clean separation: preserves standard external terminal spacing (`Spacer(1)`) between the user message and subsequent assistant replies
+- Horizontal padding: leaves `outputPad` (default 1) untouched so left margin alignment is preserved
+- Idempotent: safe against multiple extension reloads without nested function wrappers
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-user-message-padding.ts`, enter a prompt, and observe the compact single-row background strip hugging the text
+- Global installation: `cp ./extensions/rbf-user-message-padding.ts ~/.pi/agent/extensions/rbf-user-message-padding.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-user-message-padding.ts`
+
