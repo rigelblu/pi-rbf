@@ -112,9 +112,25 @@ Local Pi extension that blends collapsed tool executions into the terminal backg
 - Idempotent: wraps `ToolExecutionComponent.prototype.updateDisplay` exactly once, guarded by a unique Symbol
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi -e ./extensions/rbf-tool-execution-blended.ts`, trigger a tool call (e.g. read a file), and observe the collapsed summary sits directly on the terminal background without colored card bars
-- Toggle check: press `Ctrl+O` or click the tool row to expand; verify the standard boxed card appears; press `Ctrl+O` again to collapse back
-- Global installation: `cp ./extensions/rbf-tool-execution-blended.ts ~/.pi/agent/extensions/rbf-tool-execution-blended.ts`
-- Removal: `rm -f ~/.pi/agent/extensions/rbf-tool-execution-blended.ts`
+---
+
+# 🔵⋯ rbf-edit-glance
+
+## 🟠⋯ Overview
+Local Pi extension that provides a clean, unboxed glance presentation for the `edit` tool matching Claude Code's diff UI: blends into the terminal background, displays an immediate line-count summary (`└ Added <A> lines, removed <R> lines`), caps collapsed diffs to 8 changed lines with an expansion hint, and highlights added and removed lines with subtle line-level background tints.
+
+## 🟠⋯ Capabilities & Behavior
+- Unboxed background: removes the solid colored card background and vertical padding from `edit` executions (`bgFn = undefined`, `paddingY = 0`, `paddingX = 0`), allowing edits to blend directly into the terminal background
+- Line-count summary: calculates added and removed lines from the diff and displays `└ Added <A> line(s), removed <R> line(s)` immediately beneath the file path header
+- Glance truncation cap: in collapsed mode (default), displays context lines plus up to 8 changed lines; diffs exceeding this cap append `... (<N> more lines, ctrl+o to expand)`
+- Expanded full diff: pressing `Ctrl+O` or clicking expands the component to display the entire diff with all context and changed lines
+- Line-level tinting: context lines remain plain with dim line numbers on transparent background; removed lines `-` receive subtle red background tinting with red text; added lines `+` receive subtle green background tinting with green text; single-line replacements retain word-level reverse video highlighting
+- Idempotent: wraps `ToolExecutionComponent.prototype.updateDisplay` safely, guarded by a unique Symbol, and cleanly restores via `restoreEditGlance()`
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-edit-glance.ts`, execute a file edit, and observe the unboxed diff with summary line and line-level tinting
+- Expand/collapse check: press `Ctrl+O` on a truncated edit diff to expand to full view, then press `Ctrl+O` again to return to glance mode
+- Global installation: `cp ./extensions/rbf-edit-glance.ts ~/.pi/agent/extensions/rbf-edit-glance.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-edit-glance.ts`
 
 
