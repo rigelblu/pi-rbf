@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.9.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat | see when prompt cache reuse is no longer guaranteed (#pi-15.1)
+
+---
+
 # 🔵⋯ v0.8.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat (ux) | see skills loaded blend into background (not stand out) (#pi-4)
