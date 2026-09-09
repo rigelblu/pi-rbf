@@ -1,4 +1,3 @@
-import * as Diff from "diff";
 import { keyHint, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -57,6 +56,69 @@ export interface FormatGlanceDiffResult {
 	remainingLines: number;
 }
 
+export interface WordDiffPart {
+	value: string;
+	added?: boolean;
+	removed?: boolean;
+}
+
+/**
+ * Tokenize string into words, whitespace, and punctuation for intra-line diffing.
+ */
+export function tokenizeWords(text: string): string[] {
+	return text.match(/\s+|[^\s\w]+|\w+/g) || [];
+}
+
+/**
+ * Pure LCS word-level diff without external dependencies.
+ */
+export function diffWords(oldText: string, newText: string): WordDiffPart[] {
+	const oldTokens = tokenizeWords(oldText);
+	const newTokens = tokenizeWords(newText);
+	const n = oldTokens.length;
+	const m = newTokens.length;
+
+	const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+	for (let i = 1; i <= n; i++) {
+		for (let j = 1; j <= m; j++) {
+			if (oldTokens[i - 1] === newTokens[j - 1]) {
+				dp[i][j] = dp[i - 1][j - 1] + 1;
+			} else {
+				dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+			}
+		}
+	}
+
+	let i = n;
+	let j = m;
+	const parts: WordDiffPart[] = [];
+	while (i > 0 || j > 0) {
+		if (i > 0 && j > 0 && oldTokens[i - 1] === newTokens[j - 1]) {
+			parts.push({ value: oldTokens[i - 1] });
+			i--;
+			j--;
+		} else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+			parts.push({ value: newTokens[j - 1], added: true });
+			j--;
+		} else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
+			parts.push({ value: oldTokens[i - 1], removed: true });
+			i--;
+		}
+	}
+	parts.reverse();
+
+	const merged: WordDiffPart[] = [];
+	for (const part of parts) {
+		const last = merged[merged.length - 1];
+		if (last && Boolean(last.added) === Boolean(part.added) && Boolean(last.removed) === Boolean(part.removed)) {
+			last.value += part.value;
+		} else {
+			merged.push({ ...part });
+		}
+	}
+	return merged;
+}
+
 /**
  * Parse diff line to extract prefix (+, -, or space), line number, and content.
  * Matches Pi's native diff format: "+123 content" | "-123 content" | " 123 content" | "     ..."
@@ -89,7 +151,7 @@ export function renderIntraLineDiff(
 	newContent: string,
 	activeTheme: any,
 ): { removedLine: string; addedLine: string } {
-	const wordDiff = Diff.diffWords(oldContent, newContent);
+	const wordDiff = diffWords(oldContent, newContent);
 	let removedLine = "";
 	let addedLine = "";
 	let isFirstRemoved = true;
@@ -128,17 +190,89 @@ export function renderIntraLineDiff(
 }
 
 /**
+ * Detect whether the active theme is a light theme.
+ * Checks known light theme naming conventions, background luminance,
+ * and foreground text luminance.
+ */
+export function isLightTheme(theme: any): boolean {
+	if (!theme) return false;
+	const name = typeof theme.name === "string" ? theme.name.toLowerCase() : "";
+	if (
+		name.includes("light") ||
+		name.includes("dawn") ||
+		name.includes("latte") ||
+		name.includes("day") ||
+		name.includes("white") ||
+		name.includes("solarized-light") ||
+		name.includes("quiet") ||
+		name.includes("paper")
+	) {
+		return true;
+	}
+
+	const tryGetRgb = (ansi: string | undefined): { r: number; g: number; b: number } | null => {
+		if (!ansi || typeof ansi !== "string") return null;
+		const match = ansi.match(/\[(?:38|48);2;(\d+);(\d+);(\d+)m/);
+		if (match) {
+			return { r: Number(match[1]), g: Number(match[2]), b: Number(match[3]) };
+		}
+		return null;
+	};
+
+	const bgAnsi =
+		theme.bgColors instanceof Map
+			? theme.bgColors.get("userMessageBg") ||
+				theme.bgColors.get("selectedBg") ||
+				theme.bgColors.get("toolPendingBg")
+			: undefined;
+	const bgRgb = tryGetRgb(bgAnsi);
+	if (bgRgb) {
+		const bgLum = bgRgb.r * 0.299 + bgRgb.g * 0.587 + bgRgb.b * 0.114;
+		return bgLum > 150;
+	}
+
+	const fgAnsi = theme.fgColors instanceof Map ? theme.fgColors.get("text") : undefined;
+	const fgRgb = tryGetRgb(fgAnsi);
+	if (fgRgb) {
+		const fgLum = fgRgb.r * 0.299 + fgRgb.g * 0.587 + fgRgb.b * 0.114;
+		return fgLum < 120; // dark text indicates light theme
+	}
+
+	return false;
+}
+
+/**
+ * Text component that ensures line-level diff background colors span the full width
+ * of the terminal line, matching Claude Code's presentation.
+ */
+export class DiffTextComponent extends Text {
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		return lines.map((line) => {
+			if (line.includes("\x1b[48;") && line.includes("\x1b[49m")) {
+				const match = line.match(/^(.*)\x1b\[49m(\s*)$/);
+				if (match && match[2].length > 0) {
+					return `${match[1]}${match[2]}\x1b[49m`;
+				}
+			}
+			return line;
+		});
+	}
+}
+
+/**
  * Generate ANSI background color sequence for line-level diff tinting.
+ * Matches Claude Code light pink (#ffdcdc) and light green (#dcffdc).
  */
 export function getDiffBgAnsi(kind: "added" | "removed", activeTheme: any): string {
 	const mode = typeof activeTheme.getColorMode === "function" ? activeTheme.getColorMode() : "truecolor";
-	const isLight = typeof activeTheme.name === "string" ? activeTheme.name.toLowerCase().includes("light") : false;
+	const isLight = isLightTheme(activeTheme);
 
 	if (mode === "truecolor") {
 		if (kind === "removed") {
-			return isLight ? "\x1b[48;2;255;235;235m" : "\x1b[48;2;55;20;20m";
+			return isLight ? "\x1b[48;2;255;220;220m" : "\x1b[48;2;55;20;20m";
 		}
-		return isLight ? "\x1b[48;2;230;255;235m" : "\x1b[48;2;20;48;25m";
+		return isLight ? "\x1b[48;2;220;255;220m" : "\x1b[48;2;20;48;25m";
 	}
 
 	// 256color fallback
@@ -380,7 +514,7 @@ export function patchEditComponent(comp: any): void {
 	}
 	callComponent.addChild(new Text(formatted.summaryLine, 0, 0));
 	if (formatted.diffText) {
-		callComponent.addChild(new Text(formatted.diffText, 0, 0));
+		callComponent.addChild(new DiffTextComponent(formatted.diffText, 0, 0));
 	}
 	callBox.invalidateCache?.();
 }

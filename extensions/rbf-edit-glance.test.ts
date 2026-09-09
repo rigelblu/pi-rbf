@@ -6,10 +6,12 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import rbfEditGlance, {
 	applyEditGlance,
 	DEFAULT_MAX_GLANCE_CHANGED_LINES,
+	DiffTextComponent,
 	EDIT_GLANCE_PATCHED_KEY,
 	formatEditSummaryLine,
 	formatGlanceDiff,
 	getDiffBgAnsi,
+	isLightTheme,
 	parseDiffLine,
 	renderIntraLineDiff,
 	replaceTabs,
@@ -77,7 +79,37 @@ describe("rbf-edit-glance parsing and formatting helpers", () => {
 		expect(stripAnsi(line3)).toBe("└ Added 0 lines, removed 0 lines");
 	});
 
-	it("getDiffBgAnsi provides appropriate background escape sequences", () => {
+	it("isLightTheme correctly detects light themes by name and luminance", () => {
+		// Name checks
+		expect(isLightTheme({ name: "rose-pine-dawn" })).toBe(true);
+		expect(isLightTheme({ name: "catppuccin-latte" })).toBe(true);
+		expect(isLightTheme({ name: "solarized-light" })).toBe(true);
+		expect(isLightTheme({ name: "quiet-light" })).toBe(true);
+		expect(isLightTheme({ name: "dark" })).toBe(false);
+		expect(isLightTheme({ name: "rose-pine-moon" })).toBe(false);
+
+		// Luminance checks via userMessageBg / selectedBg
+		const lightByBg = {
+			name: "custom-theme",
+			bgColors: new Map([["userMessageBg", "\x1b[48;2;250;244;237m"]]),
+		};
+		expect(isLightTheme(lightByBg)).toBe(true);
+
+		const darkByBg = {
+			name: "custom-dark",
+			bgColors: new Map([["userMessageBg", "\x1b[48;2;30;30;30m"]]),
+		};
+		expect(isLightTheme(darkByBg)).toBe(false);
+
+		// Luminance check via dark text foreground
+		const lightByFg = {
+			name: "custom-paper",
+			fgColors: new Map([["text", "\x1b[38;2;80;80;80m"]]),
+		};
+		expect(isLightTheme(lightByFg)).toBe(true);
+	});
+
+	it("getDiffBgAnsi provides Claude Code pink and green background escape sequences", () => {
 		const themeMockTruecolorDark = {
 			getColorMode: () => "truecolor",
 			name: "dark",
@@ -85,12 +117,21 @@ describe("rbf-edit-glance parsing and formatting helpers", () => {
 		expect(getDiffBgAnsi("removed", themeMockTruecolorDark)).toBe("\x1b[48;2;55;20;20m");
 		expect(getDiffBgAnsi("added", themeMockTruecolorDark)).toBe("\x1b[48;2;20;48;25m");
 
+		// Light mode: Claude Code exact light pink (#ffdcdc) and light green (#dcffdc)
 		const themeMockTruecolorLight = {
 			getColorMode: () => "truecolor",
 			name: "light",
 		};
-		expect(getDiffBgAnsi("removed", themeMockTruecolorLight)).toBe("\x1b[48;2;255;235;235m");
-		expect(getDiffBgAnsi("added", themeMockTruecolorLight)).toBe("\x1b[48;2;230;255;235m");
+		expect(getDiffBgAnsi("removed", themeMockTruecolorLight)).toBe("\x1b[48;2;255;220;220m");
+		expect(getDiffBgAnsi("added", themeMockTruecolorLight)).toBe("\x1b[48;2;220;255;220m");
+
+		// rose-pine-dawn theme should also get Claude Code light pink and green
+		const themeRosePineDawn = {
+			getColorMode: () => "truecolor",
+			name: "rose-pine-dawn",
+		};
+		expect(getDiffBgAnsi("removed", themeRosePineDawn)).toBe("\x1b[48;2;255;220;220m");
+		expect(getDiffBgAnsi("added", themeRosePineDawn)).toBe("\x1b[48;2;220;255;220m");
 
 		const themeMock256 = {
 			getColorMode: () => "256color",
@@ -98,6 +139,32 @@ describe("rbf-edit-glance parsing and formatting helpers", () => {
 		};
 		expect(getDiffBgAnsi("removed", themeMock256)).toBe("\x1b[48;5;52m");
 		expect(getDiffBgAnsi("added", themeMock256)).toBe("\x1b[48;5;22m");
+
+		const themeMock256Light = {
+			getColorMode: () => "256color",
+			name: "light",
+		};
+		expect(getDiffBgAnsi("removed", themeMock256Light)).toBe("\x1b[48;5;224m");
+		expect(getDiffBgAnsi("added", themeMock256Light)).toBe("\x1b[48;5;194m");
+	});
+
+	it("DiffTextComponent spans background colors across full line width", () => {
+		const removedLine = "\x1b[48;2;255;220;220m-11 const a = 1;\x1b[49m";
+		const addedLine = "\x1b[48;2;220;255;220m+11 const a = 2;\x1b[49m";
+		const contextLine = " 12 context";
+
+		const diffText = [removedLine, addedLine, contextLine].join("\n");
+		const comp = new DiffTextComponent(diffText, 0, 0);
+		const rendered = comp.render(80);
+
+		expect(rendered.length).toBe(3);
+
+		// Removed line: background reset \x1b[49m should be at the very end of the line (after padding spaces)
+		expect(rendered[0]).toMatch(/\x1b\[48;2;255;220;220m.* \x1b\[49m$/);
+		// Added line: background reset \x1b[49m should be at the very end of the line
+		expect(rendered[1]).toMatch(/\x1b\[48;2;220;255;220m.* \x1b\[49m$/);
+		// Context line: no background escape sequence
+		expect(rendered[2]).not.toContain("\x1b[48;");
 	});
 
 	it("formatGlanceDiff handles small diff without truncation in collapsed mode", () => {
