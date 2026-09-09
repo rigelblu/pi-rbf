@@ -7,6 +7,14 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.6.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see read file output and code blocks without markdown code fences and without extra blank line (#pi-11)
+- 2026-09-09 - feat (ux) | syntax highlighting for TOML keys in teal and section headers in purple matching Claude Code (#pi-11)
+- 2026-09-09 - fix (ux) | full-width pink/green diff background tinting with zero-dependency LCS word diff (#pi-6)
+
+---
+
 # 🔵⋯ v0.5.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat (ux) | see only the first few lines of each edit at a glance, blend into background instead of standout (#pi-6)
