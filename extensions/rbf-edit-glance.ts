@@ -477,6 +477,44 @@ export function formatGlanceDiff(
 }
 
 /**
+ * Return a background coloring function that renders the active theme's Rosé Pine `base` color:
+ * - Dawn: #faf4ed (\x1b[48;2;250;244;237m or \x1b[48;5;255m)
+ * - Moon: #232136 (\x1b[48;2;35;33;54m or \x1b[48;5;235m)
+ * - Main: #191724 (\x1b[48;2;25;23;36m or \x1b[48;5;234m)
+ */
+export function getBaseBgFn(theme?: any): (text: string) => string {
+	const activeTheme = theme ?? getActiveTheme();
+	const themeName = (activeTheme?.name ?? "").toLowerCase();
+	const mode = typeof activeTheme?.getColorMode === "function" ? activeTheme.getColorMode() : "truecolor";
+
+	if (themeName.includes("dawn")) {
+		return mode === "256color"
+			? (text: string) => `\x1b[48;5;255m${text}\x1b[49m`
+			: (text: string) => `\x1b[48;2;250;244;237m${text}\x1b[49m`;
+	}
+	if (themeName.includes("moon")) {
+		return mode === "256color"
+			? (text: string) => `\x1b[48;5;235m${text}\x1b[49m`
+			: (text: string) => `\x1b[48;2;35;33;54m${text}\x1b[49m`;
+	}
+	if (themeName.includes("rose-pine")) {
+		return mode === "256color"
+			? (text: string) => `\x1b[48;5;234m${text}\x1b[49m`
+			: (text: string) => `\x1b[48;2;25;23;36m${text}\x1b[49m`;
+	}
+
+	if (typeof activeTheme?.bg === "function") {
+		try {
+			return (text: string) => activeTheme.bg("toolSuccessBg", text);
+		} catch {
+			// fallback
+		}
+	}
+
+	return (text: string) => text;
+}
+
+/**
  * Patch ToolExecutionComponent instance specifically when executing `edit`.
  */
 export function patchEditComponent(comp: any): void {
@@ -487,8 +525,10 @@ export function patchEditComponent(comp: any): void {
 
 	const callBox = callComponent as any;
 
-	// 1. Unbox container so it blends directly into the terminal background
-	callBox.setBgFn(undefined);
+	// 1. Set container background to active theme's Rose Pine base color
+	const activeTheme = getActiveTheme();
+	const baseBgFn = getBaseBgFn(activeTheme);
+	callBox.setBgFn(baseBgFn);
 	callBox.paddingY = 0;
 	callBox.paddingX = 0;
 

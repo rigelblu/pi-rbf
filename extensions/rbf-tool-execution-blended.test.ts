@@ -5,6 +5,7 @@ import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-age
 import { Box, Text } from "@earendil-works/pi-tui";
 import rbfToolExecutionBlended, {
 	applyToolExecutionBlended,
+	getBaseBgFn,
 	restoreToolExecutionBlended,
 	TOOL_EXECUTION_BLENDED_KEY,
 } from "./rbf-tool-execution-blended.ts";
@@ -48,14 +49,14 @@ describe("rbf-tool-execution-blended extension", () => {
 		expect(lines.length).toBe(4);
 	});
 
-	it("applyToolExecutionBlended() sets paddingY = 0 and bgFn = undefined in collapsed mode", () => {
+	it("applyToolExecutionBlended() sets paddingY = 0 and bgFn = undefined for non-file tools in collapsed mode", () => {
 		const applied = applyToolExecutionBlended();
 		expect(applied).toBe(true);
 
 		const comp = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"call_1",
-			{ path: "test.txt" },
+			{ command: "ls" },
 			{},
 			dummyToolDef as any,
 			mockUi as any,
@@ -66,12 +67,38 @@ describe("rbf-tool-execution-blended extension", () => {
 		expect(contentBox.paddingY).toBe(0);
 		expect(contentBox.bgFn).toBeUndefined();
 
-		// Total lines: 1 top spacer + 1 content line = 2 lines (reduced from 4)
+		// Total lines: 1 top spacer + 1 content line = 2 lines
 		const lines = comp.render(80);
 		expect(lines.length).toBe(2);
 		expect(lines[1]).toContain("read test.txt");
 		// Unboxed transparent text contains no background ANSI color escape codes (\x1b[4...)
 		expect(lines[1]).not.toMatch(/\x1b\[4\d/);
+	});
+
+	it("applyToolExecutionBlended() applies Rose Pine base background and paddingY = 0 to file tools (read, edit, write) in collapsed mode", () => {
+		applyToolExecutionBlended();
+
+		for (const toolName of ["read", "edit", "write"]) {
+			const comp = new ToolExecutionComponent(
+				toolName,
+				`call_${toolName}`,
+				{ path: "test.txt" },
+				{},
+				dummyToolDef as any,
+				mockUi as any,
+				"/cwd",
+			);
+
+			const contentBox = (comp as any).contentBox as any;
+			expect(contentBox.paddingY).toBe(0);
+			expect(contentBox.bgFn).toBeDefined();
+
+			// Compact 2 lines (1 spacer + 1 content line) with base background
+			const lines = comp.render(80);
+			expect(lines.length).toBe(2);
+			// Content line contains background ANSI code
+			expect(lines[1]).toMatch(/\x1b\[4/);
+		}
 	});
 
 	it("restores standard Box styling (paddingY = 1 and bgFn) when expanded", () => {
@@ -106,13 +133,13 @@ describe("rbf-tool-execution-blended extension", () => {
 		expect(lines.some((l) => /\x1b\[4\d/.test(l))).toBe(true);
 	});
 
-	it("toggles cleanly between collapsed and expanded modes", () => {
+	it("toggles cleanly between collapsed and expanded modes for non-file tool", () => {
 		applyToolExecutionBlended();
 
 		const comp = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"call_1",
-			{ path: "test.txt" },
+			{ command: "echo ok" },
 			{},
 			dummyToolDef as any,
 			mockUi as any,
@@ -167,13 +194,13 @@ describe("rbf-tool-execution-blended extension", () => {
 		expect(contentText.customBgFn).toBeDefined();
 	});
 
-	it("collapsed error state renders unboxed with transparent background", () => {
+	it("collapsed error state renders with paddingY = 0", () => {
 		applyToolExecutionBlended();
 
 		const comp = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"call_err",
-			{ path: "missing.txt" },
+			{ command: "false" },
 			{},
 			dummyToolDef as any,
 			mockUi as any,
@@ -181,7 +208,7 @@ describe("rbf-tool-execution-blended extension", () => {
 		);
 
 		comp.updateResult({
-			content: [{ type: "text", text: "File not found" }],
+			content: [{ type: "text", text: "Command failed" }],
 			isError: true,
 		});
 
@@ -234,17 +261,41 @@ describe("rbf-tool-execution-blended extension", () => {
 	it("extension entrypoint rbfToolExecutionBlended applies the patch", () => {
 		rbfToolExecutionBlended();
 
-		const comp = new ToolExecutionComponent(
-			"read",
+		const compBash = new ToolExecutionComponent(
+			"bash",
 			"call_1",
+			{ command: "ls" },
+			{},
+			dummyToolDef as any,
+			mockUi as any,
+			"/cwd",
+		);
+		expect(((compBash as any).contentBox as any).paddingY).toBe(0);
+		expect(((compBash as any).contentBox as any).bgFn).toBeUndefined();
+
+		const compRead = new ToolExecutionComponent(
+			"read",
+			"call_2",
 			{ path: "test.txt" },
 			{},
 			dummyToolDef as any,
 			mockUi as any,
 			"/cwd",
 		);
-		expect(((comp as any).contentBox as any).paddingY).toBe(0);
-		expect(((comp as any).contentBox as any).bgFn).toBeUndefined();
+		expect(((compRead as any).contentBox as any).paddingY).toBe(0);
+		expect(((compRead as any).contentBox as any).bgFn).toBeDefined();
+	});
+
+	it("getBaseBgFn returns correct Rosé Pine base color ANSI codes", () => {
+		const dawnTheme = { name: "rose-pine-dawn", getColorMode: () => "truecolor" };
+		const moonTheme = { name: "rose-pine-moon", getColorMode: () => "truecolor" };
+		const mainTheme = { name: "rose-pine", getColorMode: () => "truecolor" };
+		const dawn256 = { name: "rose-pine-dawn", getColorMode: () => "256color" };
+
+		expect(getBaseBgFn(dawnTheme)("text")).toContain("250;244;237m");
+		expect(getBaseBgFn(moonTheme)("text")).toContain("35;33;54m");
+		expect(getBaseBgFn(mainTheme)("text")).toContain("25;23;36m");
+		expect(getBaseBgFn(dawn256)("text")).toContain("48;5;255m");
 	});
 
 	it("source code contains no unauthorized sinks or network/child_process imports", () => {

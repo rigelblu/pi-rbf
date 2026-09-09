@@ -1,7 +1,7 @@
 # Use $REPO/docs/conventions/metadata.md
 [repo]
 product = "@pi"
-owner = "@tom-rigelblu"
+owner = "@tom-rigelblu-6"
 
 [project]
 type = "product"
