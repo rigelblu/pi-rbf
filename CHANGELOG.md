@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.4.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see tools calls blend into background (not standout) in collapsed state (#pi-2.1)
+
+---
+
 # 🔵⋯ v0.3.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat (ux) | see less vertical padding on my previous messages (#pi-1)
