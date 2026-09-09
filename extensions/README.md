@@ -61,3 +61,21 @@ Troubleshooting steps:
 - Registration skipped: if startup diagnostics report `Skipping.`, stop, quit Pi, remove duplicate or conflicting extension files, and relaunch with exactly one verified copy
 - Duplicate copies: if two status lines appear, quit Pi completely, ensure only one copy exists between `-e` and `~/.pi/agent/extensions/`, and relaunch cleanly
 - Unverified Pi version: if `pi --version` is not `0.85.1`, do not install globally; run `pi -e` locally and verify all automated and terminal scenarios before accepting compatibility
+
+---
+
+# 🔵⋯ rbf-exit
+
+## 🟠⋯ Overview
+Local Pi extension registering the `/exit` slash command to quit Pi cleanly, matching built-in `/quit` and standard shell muscle memory.
+
+## 🟠⋯ Capabilities & Behavior
+- Command registration: registers `/exit` with description `Exit pi`
+- Immediate clean shutdown: calls `ctx.shutdown()`, which tears down the TUI, runs runtime cleanup, prints the session resume command, and exits process with code 0
+- Argument tolerance: trailing arguments (e.g. `/exit now` or trailing spaces) are ignored without error
+- No prompts: exits immediately without confirmation dialogs
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-exit.ts`, type `/exit`, press Enter
+- Global installation: `cp ./extensions/rbf-exit.ts ~/.pi/agent/extensions/rbf-exit.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-exit.ts`
