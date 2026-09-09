@@ -98,3 +98,23 @@ Local Pi extension that compacts vertical padding on previous user messages by s
 - Global installation: `cp ./extensions/rbf-user-message-padding.ts ~/.pi/agent/extensions/rbf-user-message-padding.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-user-message-padding.ts`
 
+---
+
+# 🔵⋯ rbf-tool-execution-blended
+
+## 🟠⋯ Overview
+Local Pi extension that blends collapsed tool executions into the terminal background by setting transparent fill (`bgFn = undefined`) and zero vertical padding (`paddingY = 0`) on `ToolExecutionComponent`, while restoring standard boxed card styling when expanded.
+
+## 🟠⋯ Capabilities & Behavior
+- Blended collapsed state: removes the full-width colored background box (`toolPendingBg`, `toolSuccessBg`, `toolErrorBg`) and top/bottom blank lines, reducing routine tool rows to subtle, unboxed lines hugging the text
+- Framed expanded state: restoring standard `Box(1, 1, bgFn)` when a tool execution is expanded (`Ctrl+O` or click), cleanly containerizing multi-line output, diffs, and inspectable data
+- Fallback tolerance: handles both renderer-defined tools and generic `contentText` fallbacks
+- Idempotent: wraps `ToolExecutionComponent.prototype.updateDisplay` exactly once, guarded by a unique Symbol
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-tool-execution-blended.ts`, trigger a tool call (e.g. read a file), and observe the collapsed summary sits directly on the terminal background without colored card bars
+- Toggle check: press `Ctrl+O` or click the tool row to expand; verify the standard boxed card appears; press `Ctrl+O` again to collapse back
+- Global installation: `cp ./extensions/rbf-tool-execution-blended.ts ~/.pi/agent/extensions/rbf-tool-execution-blended.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-tool-execution-blended.ts`
+
+
