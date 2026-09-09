@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.5.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see only the first few lines of each edit at a glance, blend into background instead of standout (#pi-6)
+
+---
+
 # 🔵⋯ v0.4.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat (ux) | see tools calls blend into background (not standout) in collapsed state (#pi-2.1)
