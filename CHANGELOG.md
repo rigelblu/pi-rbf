@@ -7,6 +7,18 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.19.0 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat (ux) | see and cancel shell commands running in the background (#pi-29)
+
+---
+
+# 🔵⋯ v0.18.0 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat (ux) | make command mode (i.e. using ! prefix) look different from input mode (#pi-28)
+
+---
+
 # 🔵⋯ v0.17.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat | use /rename to name or rename the current Pi session (#pi-27)

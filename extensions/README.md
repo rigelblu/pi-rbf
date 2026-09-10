@@ -402,4 +402,53 @@ Local Pi extension registering `/rename <name>` as a familiar alias for Pi's nat
 - Global installation: `cp ./extensions/rbf-rename.ts ~/.pi/agent/extensions/rbf-rename.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-rename.ts`
 
+---
 
+# 🔵⋯ rbf-shell-mode-indicator
+
+## 🟠⋯ Overview
+Local Pi extension that distinguishes shell command mode (commands starting with `!` or `!!`) from standard prompt input mode by dynamically tinting top and bottom editor horizontal border lines to `#FF0087`, styling the leading `!` in `#FF0087`, and displaying `In shell mode` in `#FF0087` on the same line as the bottom horizontal border line.
+
+## 🟠⋯ Capabilities & Behavior
+- Keystroke-reactive activation: typing `!` or `!!` as the prompt prefix immediately turns top and bottom horizontal border lines to `#FF0087` (vivid magenta-pink)
+- Prompt prefix styling: formats the leading `!` or `!!` in the editor prompt text with `#FF0087`, with seamless cursor reverse-video rendering and single-space visual prefix padding between `!` and the cursor / command text
+- Same-line bottom indicator: renders `In shell mode` directly on the bottom horizontal border line in `#FF0087` (`── In shell mode ─────────────────────`), saving vertical terminal space with zero below-editor line overhead
+- Instant reversion: deleting `!` or clearing the editor immediately reverts horizontal borders to the default theme border color, removes the shell mode label, and restores normal prompt styling
+- Clean solid top border: renders clean solid horizontal line in `#FF0087` without punctuation symbols on the top rule
+- TrueColor precision: renders `#FF0087` via 24-bit ANSI truecolor (`\x1b[38;2;255;0;135m`) across all themes
+- Parity between single and double exclamation: both `!` (bash with context) and `!!` (bash without context) receive `#FF0087` styling, visual prefix padding, and activate shell mode indicators
+- Border width preservation: preserves terminal column width matching exactly, including scroll indicators (`↑ N more`, `↓ N more`)
+- Vim mode coordination: coordinates with `rbf-vim`'s `VimEditor`, rendering `── NORMAL ── In shell mode ───────` or `── INSERT ── In shell mode ───────` with Vim mode badges styled and border rules and shell label in `#FF0087`
+- Standout commands chaining: cleanly chains with `rbf-standout-commands` without conflicting border or text patches
+- Zero external dependencies: implemented in a single self-contained file with prototype-safe scoping
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-shell-mode-indicator.ts`, type `!`, observe `#FF0087` horizontal lines, `#FF0087` colored `!`, visual space padding before the cursor (`! █`), and `── In shell mode ──────` on the bottom border; backspace `!`, observe instant reversion to standard prompt
+- Global installation: `cp ./extensions/rbf-shell-mode-indicator.ts ~/.pi/agent/extensions/rbf-shell-mode-indicator.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-shell-mode-indicator.ts`
+
+---
+
+# 🔵⋯ rbf-background-tasks
+
+## 🟠⋯ Overview
+Local Pi extension enabling users to detach running foreground shell commands (`!`) to the background using `Ctrl+B`, inspect background task progress and logs via `/tasks` (alias `/bashes`), directly cancel tasks via `/cancel <id>` (alias `/kill <id>`), view active background counts in the footer status badge (`1 shell`), and cleanly terminate child process groups on session shutdown.
+
+## 🟠⋯ Capabilities & Behavior
+- Foreground Detachment: While a user `!` shell command runs in the foreground, `(ctrl+b to run in background · Esc to cancel)` is displayed. Pressing `Ctrl+B` immediately detaches the command to the background, prints the task ID and log path in the chat row, and restores the prompt.
+- Kitty & Legacy Protocol Parity: Captures `Ctrl+B` via `matchesKey` supporting both Kitty keyboard protocol CSI-u sequences (Ghostty/cmux) and legacy ASCII control codes (`\x02`).
+- Pass-Through Navigation: When no foreground command is executing, `Ctrl+B` passes through cleanly to the prompt editor to preserve cursor-left navigation.
+- Task Viewer (`/tasks`, `/bashes`):
+  - Single task: opens the `Shell details` modal directly showing status, live elapsed runtime, executed command, log file path, boxed scrollable output with line counts, and controls.
+  - Multiple tasks: opens an interactive `Shell tasks` list allowing navigation, viewing details with `Enter`, or stopping a task with `x`. Pressing `←` in details returns to the list.
+- Cancellation (`/cancel <id>`, `/kill <id>`, or `x` in modal): Cleanly terminates the child process group via `SIGTERM` followed by `SIGKILL` escalation.
+- Footer Status: Displays `1 shell` / `N shells` in the status line while background commands are active, automatically clearing when all tasks exit.
+- Log Management & Truncation: Writes task logs to `/tmp/pi-tasks/session-<id>/<taskId>.log` (mode `0700` directory), capped at 10MB to protect disk space.
+- Zombie Process Protection: On session shutdown (`pi.on("session_shutdown")`), terminates all active background process trees immediately.
+- Concurrency Cap: Limits concurrent background tasks to 10 to prevent system resource exhaustion.
+- Zero Conflict with Sandboxing: Scoped strictly to user `!` commands via `user_bash`, leaving agent tool bindings untouched.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-background-tasks.ts`, run `! sleep 15`, verify `(ctrl+b to run in background)` appears, press `Ctrl+B`, inspect `/tasks`, stop task with `x`, verify footer badge clears.
+- Global installation: `cp ./extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-background-tasks.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-background-tasks.ts`
