@@ -1,15 +1,17 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type {
-	AgentSettledEvent,
-	AgentStartEvent,
-	BeforeProviderRequestEvent,
-	ExtensionAPI,
-	ExtensionContext,
-	TurnEndEvent,
-	TurnStartEvent,
+import {
+	type AgentSettledEvent,
+	type AgentStartEvent,
+	type BeforeProviderRequestEvent,
+	type ExtensionAPI,
+	type ExtensionContext,
+	FooterComponent,
+	type TurnEndEvent,
+	type TurnStartEvent,
 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export interface AfterProviderResponseEvent {
 	type?: "after_provider_response";
@@ -27,8 +29,10 @@ export const DEFAULT_PROVIDER_TTL_MS: Record<string, number> = {
 };
 export const WARNING_THRESHOLD = 0.30; // 30% (1:30 on 5m, 3:00 on 10m)
 export const CRITICAL_THRESHOLD = 0.10; // 10% (30s on 5m, 60s on 10m)
-export const TOTAL_PIPS = 10;
+export const TOTAL_PIPS = 5;
 export const OPENAI_CACHE_MIN_INPUT_TOKENS = 1024;
+export const FOOTER_PATCHED_KEY = Symbol.for("rbf.cacheGuardian.footerPatched");
+export const ORIGINAL_FOOTER_RENDER_KEY = Symbol.for("rbf.cacheGuardian.originalFooterRender");
 
 export type GuardianThreshold = "calm" | "warning" | "critical" | "elapsed";
 
@@ -40,11 +44,52 @@ export interface PendingRequest {
 	responseStatus: number | null;
 }
 
-export function formatCountdown(ms: number): string {
+export interface ActiveGuardianState {
+	remainingMs: number;
+	totalTtlMs: number;
+	tokens: number;
+}
+
+const FALLBACK_THEME = {
+	fg: (_color: string, text: string) => text,
+	bg: (_color: string, text: string) => text,
+	bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+};
+
+export function getActiveTheme(): any {
+	return (
+		(typeof globalThis !== "undefined"
+			? (globalThis as any)[Symbol.for("@earendil-works/pi-coding-agent:theme")] ??
+				(globalThis as any)[Symbol.for("@mariozechner/pi-coding-agent:theme")]
+			: undefined) ?? FALLBACK_THEME
+	);
+}
+
+let activeGuardianState: ActiveGuardianState | null = null;
+
+export function getActiveGuardianState(): ActiveGuardianState | null {
+	return activeGuardianState;
+}
+
+export function setActiveGuardianState(state: ActiveGuardianState | null): void {
+	activeGuardianState = state;
+}
+
+export function formatCountdown(ms: number, format: "minute" | "exact" = "minute"): string {
 	const totalSec = Math.max(0, Math.floor(ms / 1000));
-	const m = Math.floor(totalSec / 60);
-	const s = totalSec % 60;
-	return `${m}:${s.toString().padStart(2, "0")}`;
+	if (format === "exact") {
+		const m = Math.floor(totalSec / 60);
+		const s = totalSec % 60;
+		return `${m}:${s.toString().padStart(2, "0")}`;
+	}
+	if (totalSec <= 0) {
+		return "0m";
+	}
+	if (totalSec >= 60) {
+		const m = Math.ceil(totalSec / 60);
+		return `${m}m`;
+	}
+	return `${totalSec}s`;
 }
 
 export function formatTokens(count: number): string {
@@ -223,9 +268,135 @@ export function renderGuardianWidgetContent(
 	return theme.fg("error", raw);
 }
 
+export function getNextTickDelayMs(
+	remainingMs: number,
+	totalTtlMs: number,
+	warnedAtCritical: boolean,
+): number {
+	if (remainingMs <= 0) {
+		return 0;
+	}
+	const criticalMs = totalTtlMs * CRITICAL_THRESHOLD;
+	if (!warnedAtCritical && remainingMs > criticalMs) {
+		const msUntilCritical = remainingMs - criticalMs;
+		if (msUntilCritical < 60_000) {
+			return Math.max(1_000, msUntilCritical);
+		}
+	}
+	if (remainingMs < 60_000) {
+		return Math.max(1_000, remainingMs);
+	}
+	return 60_000;
+}
+
+export function formatFooterPwdLineWithGuardian(
+	pwdLine: string,
+	guardianContent: string,
+	width: number,
+	theme?: { fg: (color: any, text: string) => string },
+): string {
+	if (!guardianContent) {
+		return pwdLine;
+	}
+	if (pwdLine.endsWith(guardianContent)) {
+		return pwdLine;
+	}
+
+	const leftWidth = visibleWidth(pwdLine);
+	const rightWidth = visibleWidth(guardianContent);
+	const minPadding = 2;
+
+	if (leftWidth + minPadding + rightWidth <= width) {
+		const pad = " ".repeat(Math.max(minPadding, width - leftWidth - rightWidth));
+		return pwdLine + pad + guardianContent;
+	}
+
+	const availableForLeft = width - rightWidth - minPadding;
+	if (availableForLeft >= 8) {
+		const ellipsis = theme?.fg ? theme.fg("dim", "...") : "...";
+		const truncatedLeft = truncateToWidth(pwdLine, availableForLeft, ellipsis);
+		const pad = " ".repeat(Math.max(minPadding, width - visibleWidth(truncatedLeft) - rightWidth));
+		return truncatedLeft + pad + guardianContent;
+	}
+
+	if (width >= rightWidth) {
+		return guardianContent;
+	}
+	return truncateToWidth(guardianContent, width, "");
+}
+
+export function patchFooterComponent(): boolean {
+	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
+		return false;
+	}
+	if ((FooterComponent.prototype as any)[FOOTER_PATCHED_KEY]) {
+		return true;
+	}
+
+	const originalRender = FooterComponent.prototype.render;
+	(FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY] = originalRender;
+	(FooterComponent.prototype as any)[FOOTER_PATCHED_KEY] = true;
+
+	(FooterComponent.prototype as any)[Symbol.for("rbf.cacheGuardian.getActiveContent")] = function (this: any): string {
+		const state = getActiveGuardianState();
+		if (!state) return "";
+		const theme = this.session?.theme ?? getActiveTheme();
+		return renderGuardianWidgetContent(
+			state.remainingMs,
+			state.totalTtlMs,
+			state.tokens,
+			theme,
+		);
+	};
+
+	FooterComponent.prototype.render = function (this: any, width: number): string[] {
+		const lines = originalRender.call(this, width);
+		const state = getActiveGuardianState();
+		if (state && lines && lines.length > 0) {
+			const theme = this.session?.theme ?? getActiveTheme();
+			const guardianContent = renderGuardianWidgetContent(
+				state.remainingMs,
+				state.totalTtlMs,
+				state.tokens,
+				theme,
+			);
+			lines[0] = formatFooterPwdLineWithGuardian(lines[0], guardianContent, width, theme);
+		}
+		return lines;
+	};
+
+	return true;
+}
+
+export function unpatchFooterComponent(): void {
+	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
+		return;
+	}
+	if ((FooterComponent.prototype as any)[FOOTER_PATCHED_KEY]) {
+		const originalRender = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
+		if (originalRender) {
+			FooterComponent.prototype.render = originalRender;
+		}
+		delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
+		delete (FooterComponent.prototype as any)[FOOTER_PATCHED_KEY];
+		delete (FooterComponent.prototype as any)[Symbol.for("rbf.cacheGuardian.getActiveContent")];
+	}
+}
+
+export function triggerFooterRerender(ctx?: ExtensionContext): void {
+	if (!ctx?.ui) return;
+	try {
+		ctx.ui.setWidget?.(WIDGET_KEY, undefined);
+	} catch {
+		// Ignore if ui or setWidget is unavailable
+	}
+}
+
 export default function rbfCacheGuardian(pi: ExtensionAPI): void {
+	patchFooterComponent();
+
 	let epoch = 0;
-	let intervalId: ReturnType<typeof setInterval> | undefined;
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
 	let deadlineAt: number | null = null;
 	let totalTtlMs = DEFAULT_ANTHROPIC_TTL_MS;
 	let lastCachedTokens: number | null = null;
@@ -237,9 +408,9 @@ export default function rbfCacheGuardian(pi: ExtensionAPI): void {
 	let correlationUnsafe = false;
 
 	function clearTimers(): void {
-		if (intervalId !== undefined) {
-			clearInterval(intervalId);
-			intervalId = undefined;
+		if (timeoutId !== undefined) {
+			clearTimeout(timeoutId);
+			timeoutId = undefined;
 		}
 	}
 
@@ -253,13 +424,15 @@ export default function rbfCacheGuardian(pi: ExtensionAPI): void {
 		activeTurnIndex = null;
 		pendingRequest = null;
 		correlationUnsafe = false;
-		ctx?.ui?.setWidget?.(WIDGET_KEY, undefined);
+		setActiveGuardianState(null);
+		triggerFooterRerender(ctx);
 	}
 
 	pi.on("agent_start", (_event: AgentStartEvent, ctx: ExtensionContext) => {
 		correlationUnsafe = false;
 		clearTimers();
-		ctx.ui?.setWidget?.(WIDGET_KEY, undefined);
+		setActiveGuardianState(null);
+		triggerFooterRerender(ctx);
 	});
 
 	pi.on("turn_start", (event: TurnStartEvent) => {
@@ -369,6 +542,8 @@ export default function rbfCacheGuardian(pi: ExtensionAPI): void {
 		const tick = () => {
 			if (epoch !== currentEpoch || deadlineAt === null || lastCachedTokens === null) {
 				clearTimers();
+				setActiveGuardianState(null);
+				triggerFooterRerender(ctx);
 				return;
 			}
 
@@ -399,20 +574,26 @@ export default function rbfCacheGuardian(pi: ExtensionAPI): void {
 
 			previousRemainingMs = remainingMs;
 
-			const theme = ctx.ui?.theme ?? { fg: (_c: string, text: string) => text };
-			const widgetLine = renderGuardianWidgetContent(remainingMs, totalTtlMs, lastCachedTokens, theme);
-			ctx.ui?.setWidget?.(WIDGET_KEY, [widgetLine], { placement: "belowEditor" });
+			setActiveGuardianState({
+				remainingMs,
+				totalTtlMs,
+				tokens: lastCachedTokens,
+			});
+
+			triggerFooterRerender(ctx);
 
 			if (remainingMs <= 0) {
 				clearTimers();
+				return;
+			}
+
+			const nextDelay = getNextTickDelayMs(remainingMs, totalTtlMs, warnedAtCritical);
+			if (nextDelay > 0) {
+				timeoutId = setTimeout(tick, nextDelay);
 			}
 		};
 
 		tick();
-		const remainingMsNow = Math.max(0, deadlineAt - Date.now());
-		if (remainingMsNow > 0) {
-			intervalId = setInterval(tick, 1000);
-		}
 	});
 
 	const onSessionInvalidate = (_event: unknown, ctx: ExtensionContext) => {
