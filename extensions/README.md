@@ -322,7 +322,8 @@ Local Pi extension that adds familiar Vim modal navigation and editing in Pi's p
   - Undo: `u` (undo last change via editor's undo stack)
   - Yank & Paste: `yy` (yank line), `yw` (yank word), `y$` (yank to line end), `p` (paste below/after), `P` (paste above/before)
   - Insertion Entry Points: `i` (insert before cursor), `I` (insert at first non-blank), `a` (append after cursor), `A` (append at end of line), `o` (open newline below), `O` (open newline above)
-  - Count Multipliers: Numerical prefixes (`2w`, `3dd`, `5x`, `2j`) repeat motions and verbs.
+  - Text Objects: Supports inner (`i`) and around (`a`) text objects under operators `d`, `c`, `y`: word (`w`), quotes (`"`, `'`, `` ` ``), parentheses (`(`, `)`, `b`), brackets (`[`, `]`), braces (`{`, `}`, `B`), and angle brackets (`<`, `>`). Nested pairs, count multipliers (e.g. `2diw`), and quote jump-ahead supported.
+  - Count Multipliers: Numerical prefixes (`2w`, `3dd`, `5x`, `2j`, `2diw`) repeat motions and verbs.
 - Bottom Border Mode Badge: Overrides `renderBottomBorder(width, hiddenLineCount)` to embed ` NORMAL ` (yellow) or ` INSERT ` (dim) directly into the bottom frame without layout shifts or colliding with autocomplete popups.
 - Runtime Toggle & Persistence: `/vim` command toggles modal editing on/off (`/vim`, `/vim on`, `/vim off`), persisting `"editorMode": "vim"` directly to `~/.pi/agent/settings.json`.
 - Zero External Dependencies: Built purely using Node standard modules (`node:fs`, `node:path`, `node:os`) and `@earendil-works/*`.

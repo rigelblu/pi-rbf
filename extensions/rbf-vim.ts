@@ -13,6 +13,7 @@ export const VIM_SETTINGS_KEY = "editorMode";
 export type VimMode = "insert" | "normal";
 export type PendingOp = "d" | "c" | "y" | "g" | null;
 export type PendingAction = "r" | "f" | "F" | null;
+export type PendingModifier = "i" | "a" | null;
 
 /**
  * Determine word boundaries for forward word motion (Vim 'w')
@@ -95,6 +96,206 @@ export function decodePrintableChar(data: string): string | undefined {
 }
 
 /**
+ * Find range of inner word (Vim 'iw') around col.
+ * Identifies contiguous word characters, contiguous whitespace, or contiguous punctuation.
+ */
+export function findInnerWordRange(
+	line: string,
+	col: number,
+	count = 1,
+): { startCol: number; endCol: number } | null {
+	if (!line || line.length === 0) return null;
+	const safeCol = Math.max(0, Math.min(col, line.length - 1));
+
+	const isWordChar = (ch: string) => /\w/.test(ch);
+	const isSpaceChar = (ch: string) => /\s/.test(ch);
+
+	const charAt = line[safeCol] || "";
+	const isWord = isWordChar(charAt);
+	const isSpace = isSpaceChar(charAt);
+
+	let start = safeCol;
+	let end = safeCol + 1;
+
+	if (isSpace) {
+		while (start > 0 && isSpaceChar(line[start - 1] || "")) start--;
+		while (end < line.length && isSpaceChar(line[end] || "")) end++;
+	} else if (isWord) {
+		while (start > 0 && isWordChar(line[start - 1] || "")) start--;
+		while (end < line.length && isWordChar(line[end] || "")) end++;
+	} else {
+		// Punctuation
+		while (start > 0 && !isWordChar(line[start - 1] || "") && !isSpaceChar(line[start - 1] || "")) start--;
+		while (end < line.length && !isWordChar(line[end] || "") && !isSpaceChar(line[end] || "")) end++;
+	}
+
+	// If count > 1, expand forward over additional word/space pairs
+	for (let c = 1; c < count; c++) {
+		while (end < line.length && isSpaceChar(line[end] || "")) end++;
+		if (end >= line.length) break;
+		const nextChar = line[end] || "";
+		if (isWordChar(nextChar)) {
+			while (end < line.length && isWordChar(line[end] || "")) end++;
+		} else {
+			while (end < line.length && !isWordChar(line[end] || "") && !isSpaceChar(line[end] || "")) end++;
+		}
+	}
+
+	return { startCol: start, endCol: end };
+}
+
+/**
+ * Find range of a word (Vim 'aw') around col.
+ * Expands inner word range to consume trailing whitespace (or leading if at EOL).
+ */
+export function findAWordRange(
+	line: string,
+	col: number,
+	count = 1,
+): { startCol: number; endCol: number } | null {
+	const inner = findInnerWordRange(line, col, count);
+	if (!inner) return null;
+
+	let { startCol, endCol } = inner;
+	const isSpaceChar = (ch: string) => /\s/.test(ch);
+
+	// If the inner selection is already all spaces, return it
+	const isAllSpaces = isSpaceChar(line[startCol] || "");
+	if (isAllSpaces) {
+		return { startCol, endCol };
+	}
+
+	// 1. Prefer consuming trailing whitespace
+	if (endCol < line.length && isSpaceChar(line[endCol] || "")) {
+		while (endCol < line.length && isSpaceChar(line[endCol] || "")) endCol++;
+	} else {
+		// 2. If at EOL or no trailing space, consume leading whitespace
+		while (startCol > 0 && isSpaceChar(line[startCol - 1] || "")) startCol--;
+	}
+
+	return { startCol, endCol };
+}
+
+/**
+ * Find quote range (Vim i", a", i', a', i`, a`) enclosing col or next on line.
+ */
+export function findQuoteRange(
+	line: string,
+	col: number,
+	quote: string,
+	around: boolean,
+): { startCol: number; endCol: number } | null {
+	if (!line || line.length < 2) return null;
+
+	const indices: number[] = [];
+	for (let i = 0; i < line.length; i++) {
+		if (line[i] === quote) {
+			let backslashes = 0;
+			let j = i - 1;
+			while (j >= 0 && line[j] === "\\") {
+				backslashes++;
+				j--;
+			}
+			if (backslashes % 2 === 0) {
+				indices.push(i);
+			}
+		}
+	}
+
+	if (indices.length < 2) return null;
+
+	let targetPair: [number, number] | null = null;
+
+	// 1. Look for pair enclosing col: open <= col <= close
+	for (let i = 0; i + 1 < indices.length; i += 2) {
+		const open = indices[i];
+		const close = indices[i + 1];
+		if (open <= col && col <= close) {
+			targetPair = [open, close];
+			break;
+		}
+	}
+
+	// 2. If not inside any pair, find first pair ahead of col
+	if (!targetPair) {
+		for (let i = 0; i + 1 < indices.length; i += 2) {
+			const open = indices[i];
+			const close = indices[i + 1];
+			if (col < open) {
+				targetPair = [open, close];
+				break;
+			}
+		}
+	}
+
+	if (!targetPair) return null;
+
+	const [open, close] = targetPair;
+	if (!around) {
+		return { startCol: open + 1, endCol: close };
+	}
+
+	return { startCol: open, endCol: close + 1 };
+}
+
+/**
+ * Find matching bracket/pair range (Vim i(, a(, i[, a[, i{, a{, i<, a<).
+ */
+export function findPairRange(
+	line: string,
+	col: number,
+	openChar: string,
+	closeChar: string,
+	around: boolean,
+): { startCol: number; endCol: number } | null {
+	if (!line) return null;
+
+	const pairs: Array<{ open: number; close: number }> = [];
+	const stack: number[] = [];
+
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i];
+		if (ch === openChar) {
+			stack.push(i);
+		} else if (ch === closeChar) {
+			if (stack.length > 0) {
+				const open = stack.pop()!;
+				pairs.push({ open, close: i });
+			}
+		}
+	}
+
+	if (pairs.length === 0) return null;
+
+	// Find enclosing pairs: open <= col <= close
+	const enclosing = pairs.filter((p) => p.open <= col && col <= p.close);
+
+	let targetPair: { open: number; close: number } | null = null;
+	if (enclosing.length > 0) {
+		// Innermost pair: smallest span (close - open)
+		enclosing.sort((a, b) => a.close - a.open - (b.close - b.open));
+		targetPair = enclosing[0];
+	} else {
+		// Look for next pair starting after col
+		const upcoming = pairs
+			.filter((p) => col < p.open)
+			.sort((a, b) => a.open - b.open);
+		if (upcoming.length > 0) {
+			targetPair = upcoming[0];
+		}
+	}
+
+	if (!targetPair) return null;
+
+	const { open, close } = targetPair;
+	if (!around) {
+		return { startCol: open + 1, endCol: close };
+	}
+
+	return { startCol: open, endCol: close + 1 };
+}
+
+/**
  * VimEditor provides modal navigation and editing in Pi's prompt box.
  * Extends CustomEditor to maintain all app-level shortcuts, while adding
  * full vim motions, operators, and double-Esc safety.
@@ -103,6 +304,7 @@ export class VimEditor extends CustomEditor {
 	private mode: VimMode = "insert";
 	private pendingOp: PendingOp = null;
 	private pendingAction: PendingAction = null;
+	private pendingModifier: PendingModifier = null;
 	private count = 0;
 	private lastFind: { char: string; direction: "f" | "F" } | null = null;
 	private register = "";
@@ -118,10 +320,19 @@ export class VimEditor extends CustomEditor {
 		return this.mode;
 	}
 
+	getPendingModifier(): PendingModifier {
+		return this.pendingModifier;
+	}
+
+	getRegister(): string {
+		return this.register;
+	}
+
 	setMode(mode: VimMode): void {
 		this.mode = mode;
 		this.pendingOp = null;
 		this.pendingAction = null;
+		this.pendingModifier = null;
 		this.count = 0;
 		this.tui?.requestRender?.();
 	}
@@ -179,6 +390,7 @@ export class VimEditor extends CustomEditor {
 				this.mode = "normal";
 				this.pendingOp = null;
 				this.pendingAction = null;
+				this.pendingModifier = null;
 				this.count = 0;
 				// In Vim, returning to normal mode moves cursor back 1 col if possible
 				const cursor = this.getCursor();
@@ -191,6 +403,7 @@ export class VimEditor extends CustomEditor {
 			// In NORMAL mode: clear pending state and SWALLOW. Never abort the agent!
 			this.pendingOp = null;
 			this.pendingAction = null;
+			this.pendingModifier = null;
 			this.count = 0;
 			this.tui?.requestRender?.();
 			return;
@@ -272,6 +485,53 @@ export class VimEditor extends CustomEditor {
 			(this as any).setCursorCol?.(0);
 			this.tui?.requestRender?.();
 			return;
+		}
+
+		// Text object execution when pendingOp and pendingModifier are both active
+		if (this.pendingOp && this.pendingModifier) {
+			const op = this.pendingOp as "d" | "c" | "y";
+			const modifier = this.pendingModifier;
+			const around = modifier === "a";
+			const count = this.count || 1;
+			const cur = this.getCursor();
+			const line = this.getLines()[cur.line] || "";
+
+			let range: { startCol: number; endCol: number } | null = null;
+
+			if (data === "w") {
+				range = around ? findAWordRange(line, cur.col, count) : findInnerWordRange(line, cur.col, count);
+			} else if (data === '"' || data === "'" || data === "`") {
+				range = findQuoteRange(line, cur.col, data, around);
+			} else if (data === "(" || data === ")" || data === "b") {
+				range = findPairRange(line, cur.col, "(", ")", around);
+			} else if (data === "[" || data === "]") {
+				range = findPairRange(line, cur.col, "[", "]", around);
+			} else if (data === "{" || data === "}" || data === "B") {
+				range = findPairRange(line, cur.col, "{", "}", around);
+			} else if (data === "<" || data === ">") {
+				range = findPairRange(line, cur.col, "<", ">", around);
+			}
+
+			if (range) {
+				this.applyRangeOp(op, range);
+			}
+
+			this.pendingOp = null;
+			this.pendingModifier = null;
+			this.count = 0;
+			this.tui?.requestRender?.();
+			return;
+		}
+
+		// Modifier initiator for pending operator ("i" or "a" after "d", "c", or "y")
+		if (
+			(this.pendingOp === "d" || this.pendingOp === "c" || this.pendingOp === "y") &&
+			this.pendingModifier === null
+		) {
+			if (data === "i" || data === "a") {
+				this.pendingModifier = data;
+				return;
+			}
 		}
 
 		// Pending operator handling: d (delete)
@@ -659,6 +919,39 @@ export class VimEditor extends CustomEditor {
 		if (cur.col < line.length) {
 			lines[cur.line] = line.slice(0, cur.col) + char + line.slice(cur.col + 1);
 			(this as any).onChange?.(this.getText());
+		}
+	}
+
+	private applyRangeOp(
+		op: "d" | "c" | "y",
+		range: { startCol: number; endCol: number },
+	): void {
+		const cur = this.getCursor();
+		const lines = this.getStateLines();
+		const line = lines[cur.line] || "";
+		const startCol = Math.max(0, Math.min(range.startCol, line.length));
+		const endCol = Math.max(startCol, Math.min(range.endCol, line.length));
+
+		const selectedText = line.slice(startCol, endCol);
+		this.register = selectedText;
+
+		if (op === "y") {
+			return;
+		}
+
+		(this as any).pushUndoSnapshot?.();
+		lines[cur.line] = line.slice(0, startCol) + line.slice(endCol);
+
+		if (op === "c") {
+			(this as any).setCursorCol?.(startCol);
+			(this as any).onChange?.(this.getText());
+			this.mode = "insert";
+		} else if (op === "d") {
+			const newLineLen = lines[cur.line].length;
+			const targetCol = newLineLen === 0 ? 0 : Math.min(startCol, newLineLen - 1);
+			(this as any).setCursorCol?.(targetCol);
+			(this as any).onChange?.(this.getText());
+			this.mode = "normal";
 		}
 	}
 
