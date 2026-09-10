@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.16.0 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat (ux) | use /rewind as an alias for /tree to navigate session branches (#pi-20)
+
+---
+
 # 🔵⋯ v0.15.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat (ux) | use form to select answer to question (#pi-19)

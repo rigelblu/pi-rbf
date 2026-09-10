@@ -364,3 +364,23 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 - Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
 
+---
+
+# 🔵⋯ rbf-rewind
+
+## 🟠⋯ Overview
+Local Pi extension registering `/rewind` as a first-class alias for Pi's session tree navigator `/tree`. Allows users accustomed to Claude Code muscle memory to navigate checkpoints and switch session branches cleanly by typing `/rewind`.
+
+## 🟠⋯ Capabilities & Behavior
+- First-Class Alias: Typing `/rewind` in Pi's prompt editor immediately launches Pi's native session tree selector modal (`showTreeSelector()`) and clears the prompt editor.
+- Argument Tolerance: Ignores trailing whitespace and arguments (e.g. `/rewind 2`, `/rewind now`, `  /rewind  `), matching native `/tree` behavior.
+- Autocomplete: Registered in Pi's command list with description `"Navigate session tree (switch branches) (alias for /tree)"`, making it discoverable when typing `/re`.
+- Standout Syntax Highlighting: Supported by `rbf-standout-commands`, highlighting `/rewind` as a valid keyword in the prompt.
+- Non-Interactive / RPC Fallback: If executed in headless or non-interactive environments where interactive UI is unavailable, outputs an informational notification explaining that tree navigation requires interactive mode.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-rewind.ts`, type `/re` to inspect autocomplete, press Enter on `/rewind` to verify tree navigation modal opens.
+- Global installation: `cp ./extensions/rbf-rewind.ts ~/.pi/agent/extensions/rbf-rewind.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-rewind.ts`
+
+

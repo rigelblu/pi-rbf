@@ -4,6 +4,8 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-rewind`](extensions/rbf-rewind.ts) (v0.16.0) — Use `/rewind` as a first-class alias for `/tree` to navigate session branches and checkpoints.
+- [`rbf-question-form`](extensions/rbf-question-form.ts) (v0.15.0) — Select answer to agent questions using an inline, non-modal quick-pick form with compact number chips, additional notes input, and write-in support.
 - [`rbf-vim`](extensions/rbf-vim.ts) (v0.14.1) — Use vim motions and text objects (ciw, diw, caw, daw, yiw, quotes, brackets) in input box with modal state machine, bottom-border mode badge, /vim toggle, and double-Esc safety.
 - [`rbf-standout-commands`](extensions/rbf-standout-commands.ts) (v0.13.0) — See skills and slash commands standout in prompt as I type with vivid theme link blue highlighting and strict registry validation.
 - [`rbf-click-cursor`](extensions/rbf-click-cursor.ts) (v0.12.0) — Place the prompt cursor where I click in fullscreen TUI mode with immediate screen repaint and selection prevention.
