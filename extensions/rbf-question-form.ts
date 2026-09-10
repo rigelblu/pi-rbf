@@ -1,17 +1,32 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, Text, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Key, matchesKey, Text } from "@earendil-works/pi-tui";
 import type { TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const WIDGET_KEY = "rbf-question-form";
+// ─── Option types & chips ───────────────────────────────────────────────────
 
-// ─── Option types ────────────────────────────────────────────────────────────
-
-interface NormalizedOption {
+export interface NormalizedOption {
 	index: number;
 	label: string;
 	description?: string;
 	fullText: string;
+}
+
+export interface QuestionChip {
+	key: string;
+	type: "option" | "write-in" | "canned";
+	label: string;
+	fullText?: string;
+	cannedCommand?: string;
+}
+
+export interface QuestionFormState {
+	chips: QuestionChip[];
+	selectedChipIndex: number;
+	focus: "options" | "notes";
+	notesText: string;
+	notesCursorPos: number;
+	theme: Theme;
 }
 
 // ─── Text detection heuristic ────────────────────────────────────────────────
@@ -84,8 +99,7 @@ export function detectQuestionOptions(text: string): string[] | null {
 }
 
 /**
- * Parse a numbered option line like "1. Codex retries internally — one execution owner ← recommended"
- * into a NormalizedOption.
+ * Parse a numbered option line into a NormalizedOption.
  */
 export function parseNumberedOption(line: string, index: number): NormalizedOption {
 	const match = line.match(/^\s*\d+\.\s+(.*)/);
@@ -116,7 +130,7 @@ const QuestionParams = Type.Object({
 });
 
 /**
- * Normalize a tool option (string or { label, description }) into a NormalizedOption.
+ * Normalize a tool option into a NormalizedOption.
  */
 export function normalizeToolOption(raw: string | { label: string; description?: string }, index: number): NormalizedOption {
 	if (typeof raw === "string") {
@@ -135,189 +149,308 @@ export function normalizeToolOption(raw: string | { label: string; description?:
 	};
 }
 
-// ─── Inline selector widget ─────────────────────────────────────────────────
+// ─── Chips & submission helpers ──────────────────────────────────────────────
 
-interface SelectorState {
-	options: NormalizedOption[];
-	highlightIndex: number;
-	theme: Theme;
+export function buildChips(options: NormalizedOption[]): QuestionChip[] {
+	const chips: QuestionChip[] = options.map((opt, i) => ({
+		key: String(i + 1),
+		type: "option" as const,
+		label: String(i + 1),
+		fullText: opt.fullText,
+	}));
+
+	// Write-in option
+	const writeInKey = String(options.length + 1);
+	chips.push({
+		key: writeInKey,
+		type: "write-in",
+		label: `${writeInKey}. Write-in`,
+	});
+
+	// Canned reply option
+	chips.push({
+		key: "c",
+		type: "canned",
+		label: "C. /convo-is-very-best",
+		cannedCommand: "/skill:convo-is-very-best",
+	});
+
+	return chips;
 }
 
-/**
- * Render the inline selector as widget lines.
- */
-export function renderSelectorLines(state: SelectorState, width: number): string[] {
-	const { options, highlightIndex, theme } = state;
+export function buildSubmissionText(chip: QuestionChip, notes: string): string {
+	const trimmedNotes = notes.trim();
+
+	if (chip.type === "canned") {
+		const cmd = chip.cannedCommand ?? "/skill:convo-is-very-best";
+		if (!trimmedNotes) return cmd;
+		return `${cmd}\n\nAdd notes to selection: ${trimmedNotes}`;
+	}
+
+	if (chip.type === "write-in") {
+		if (!trimmedNotes) return "Write-in";
+		return trimmedNotes;
+	}
+
+	const baseText = chip.fullText ?? chip.label;
+	if (!trimmedNotes) return baseText;
+	return `${baseText}\n\nAdd notes to selection: ${trimmedNotes}`;
+}
+
+// ─── Component Rendering ────────────────────────────────────────────────────
+
+export function renderQuestionFormLines(state: QuestionFormState, width: number): string[] {
+	const { chips, selectedChipIndex, focus, notesText, notesCursorPos, theme } = state;
+	const renderWidth = Math.max(20, width);
 	const lines: string[] = [];
-	const renderWidth = Math.max(1, width);
 
-	lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+	// Top border
+	const title = " Select Answer ";
+	const borderDashCount = Math.max(0, renderWidth - title.length - 1);
+	lines.push(theme.fg("accent", "─" + title + "─".repeat(borderDashCount)));
 
-	for (let i = 0; i < options.length; i++) {
-		const opt = options[i];
-		const selected = i === highlightIndex;
-		const prefix = selected ? theme.fg("accent", "▸ ") : "  ";
-		const optText = opt.fullText;
-		const color = selected ? "accent" : "text";
-
-		// Truncate option text to fit width
-		const maxTextWidth = renderWidth - 4; // prefix + padding
-		const truncated = visibleWidth(optText) > maxTextWidth
-			? truncateToWidth(optText, maxTextWidth) + "…"
-			: optText;
-
-		lines.push(`${prefix}${theme.fg(color as any, truncated)}`);
-
-		if (opt.description) {
-			const descPrefix = "     ";
-			const maxDescWidth = renderWidth - visibleWidth(descPrefix);
-			const descLines = wrapTextWithAnsi(opt.description, Math.max(1, maxDescWidth));
-			for (const dl of descLines) {
-				lines.push(`${descPrefix}${theme.fg("muted", dl)}`);
-			}
+	// Chips row
+	const chipRenders = chips.map((chip, idx) => {
+		const isSelected = idx === selectedChipIndex;
+		if (isSelected) {
+			// Dark background and light text for active selection
+			return `\x1b[48;5;236m\x1b[1;38;5;255m ${chip.label} \x1b[0m`;
 		}
+		return theme.fg("muted", `[ ${chip.label} ]`);
+	});
+	lines.push(`  ${chipRenders.join("   ")}`);
+	lines.push("");
+
+	// Notes field
+	const notesLabel = "  Add notes to selection: ";
+	if (focus === "notes") {
+		const beforeCursor = notesText.slice(0, notesCursorPos);
+		const atCursor = notesText.slice(notesCursorPos, notesCursorPos + 1) || " ";
+		const afterCursor = notesText.slice(notesCursorPos + 1);
+		const cursorChar = `\x1b[7m${atCursor}\x1b[0m`;
+		lines.push(theme.fg("accent", notesLabel) + beforeCursor + cursorChar + afterCursor);
+	} else {
+		const displayNotes = notesText ? theme.fg("text", notesText) : theme.fg("dim", "(optional, press Tab or ↓ to type)");
+		lines.push(theme.fg("muted", notesLabel) + displayNotes);
 	}
 
 	lines.push("");
-	const hint = options.length <= 9
-		? `[1-${options.length}] select · [↑↓/jk] navigate · [Enter] confirm · [Esc] dismiss`
-		: `[↑↓/jk] navigate · [Enter] confirm · [Esc] dismiss`;
-	const hintWrapped = wrapTextWithAnsi(theme.fg("dim", `  ${hint}`), renderWidth);
-	lines.push(...hintWrapped);
+
+	// Hint line
+	const hint = "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
+	lines.push(theme.fg("dim", hint));
+
+	// Bottom border
 	lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
 	return lines;
 }
 
-/**
- * Truncate a string to fit within a visible width.
- */
-function truncateToWidth(text: string, maxWidth: number): string {
-	let result = "";
-	let currentWidth = 0;
-	for (const char of text) {
-		const charWidth = visibleWidth(char);
-		if (currentWidth + charWidth > maxWidth) break;
-		result += char;
-		currentWidth += charWidth;
+// ─── Component Factory ──────────────────────────────────────────────────────
+
+export function createQuestionFormComponent(
+	options: NormalizedOption[],
+	tui: TUI,
+	theme: Theme,
+	done: (result: string | null) => void,
+) {
+	const chips = buildChips(options);
+	const state: QuestionFormState = {
+		chips,
+		selectedChipIndex: 0,
+		focus: "options",
+		notesText: "",
+		notesCursorPos: 0,
+		theme,
+	};
+
+	function handleInput(data: string): void {
+		// Escape handling
+		if (data === "\x1b" || matchesKey(data, Key.escape)) {
+			if (state.focus === "notes" && state.notesText.length > 0) {
+				state.notesText = "";
+				state.notesCursorPos = 0;
+				state.focus = "options";
+				tui.requestRender();
+				return;
+			}
+			done(null);
+			return;
+		}
+
+		// Enter: submit
+		if (data === "\r" || data === "\n" || matchesKey(data, Key.enter)) {
+			const selectedChip = state.chips[state.selectedChipIndex];
+			const result = buildSubmissionText(selectedChip, state.notesText);
+			done(result);
+			return;
+		}
+
+		if (state.focus === "options") {
+			// Number keys 1..9
+			if (data.length === 1 && data >= "1" && data <= "9") {
+				const num = parseInt(data, 10);
+				const targetIdx = state.chips.findIndex((c) => c.key === String(num));
+				if (targetIdx !== -1) {
+					state.selectedChipIndex = targetIdx;
+					if (state.chips[targetIdx].type === "write-in") {
+						state.focus = "notes";
+					}
+					tui.requestRender();
+					return;
+				}
+			}
+
+			// C key for canned reply
+			if (data === "c" || data === "C") {
+				const targetIdx = state.chips.findIndex((c) => c.type === "canned");
+				if (targetIdx !== -1) {
+					state.selectedChipIndex = targetIdx;
+					tui.requestRender();
+					return;
+				}
+			}
+
+			// Left / h
+			if (data === "h" || data === "\x1b[D" || matchesKey(data, Key.left)) {
+				state.selectedChipIndex = Math.max(0, state.selectedChipIndex - 1);
+				tui.requestRender();
+				return;
+			}
+
+			// Right / l
+			if (data === "l" || data === "\x1b[C" || matchesKey(data, Key.right)) {
+				state.selectedChipIndex = Math.min(state.chips.length - 1, state.selectedChipIndex + 1);
+				tui.requestRender();
+				return;
+			}
+
+			// Tab or Down / j -> move to notes
+			if (data === "\t" || data === "j" || data === "\x1b[B" || matchesKey(data, Key.tab) || matchesKey(data, Key.down)) {
+				state.focus = "notes";
+				tui.requestRender();
+				return;
+			}
+		} else {
+			// focus === "notes"
+
+			// Tab or Up -> move to options
+			if (data === "\t" || data === "\x1b[A" || matchesKey(data, Key.tab) || matchesKey(data, Key.up)) {
+				state.focus = "options";
+				tui.requestRender();
+				return;
+			}
+
+			// Backspace
+			if (data === "\x7f" || data === "\b" || matchesKey(data, Key.backspace)) {
+				if (state.notesCursorPos > 0) {
+					state.notesText = state.notesText.slice(0, state.notesCursorPos - 1) + state.notesText.slice(state.notesCursorPos);
+					state.notesCursorPos--;
+					tui.requestRender();
+				}
+				return;
+			}
+
+			// Left
+			if (data === "\x1b[D" || matchesKey(data, Key.left)) {
+				state.notesCursorPos = Math.max(0, state.notesCursorPos - 1);
+				tui.requestRender();
+				return;
+			}
+
+			// Right
+			if (data === "\x1b[C" || matchesKey(data, Key.right)) {
+				state.notesCursorPos = Math.min(state.notesText.length, state.notesCursorPos + 1);
+				tui.requestRender();
+				return;
+			}
+
+			// Home
+			if (data === "\x1b[H" || matchesKey(data, Key.home)) {
+				state.notesCursorPos = 0;
+				tui.requestRender();
+				return;
+			}
+
+			// End
+			if (data === "\x1b[F" || matchesKey(data, Key.end)) {
+				state.notesCursorPos = state.notesText.length;
+				tui.requestRender();
+				return;
+			}
+
+			// Printable character
+			if (data.length === 1 && data >= " ") {
+				state.notesText = state.notesText.slice(0, state.notesCursorPos) + data + state.notesText.slice(state.notesCursorPos);
+				state.notesCursorPos++;
+				tui.requestRender();
+				return;
+			}
+
+			// Multi-char text (paste)
+			if (data.length > 1 && !data.startsWith("\x1b")) {
+				const clean = data.replace(/\r?\n/g, " ");
+				state.notesText = state.notesText.slice(0, state.notesCursorPos) + clean + state.notesText.slice(state.notesCursorPos);
+				state.notesCursorPos += clean.length;
+				tui.requestRender();
+				return;
+			}
+		}
 	}
-	return result;
+
+	return {
+		render(width: number): string[] {
+			return renderQuestionFormLines(state, width);
+		},
+		handleInput,
+		invalidate() {},
+	};
 }
 
 // ─── Extension entry point ──────────────────────────────────────────────────
 
 export default function rbfQuestionForm(pi: ExtensionAPI): void {
-	// State shared between event handlers
 	let lastAssistantText = "";
 	let pendingToolOptions: NormalizedOption[] | null = null;
-	let activeSelector: {
-		state: SelectorState;
-		unsubscribe: () => void;
-		dismiss: () => void;
-	} | null = null;
+	let lastDetectedOptions: NormalizedOption[] | null = null;
+	let isFormOpen = false;
 
 	/**
-	 * Show the inline selector widget with options.
+	 * Open the question form replacing the input box via ctx.ui.custom().
 	 */
-	function showSelector(options: NormalizedOption[], ctx: ExtensionContext): void {
-		// Don't show if already active or no options
-		if (activeSelector || options.length === 0) return;
+	async function openQuestionForm(options: NormalizedOption[], ctx: ExtensionContext): Promise<void> {
+		if (isFormOpen || options.length === 0) return;
 		if (ctx.mode !== "tui") return;
 
-		const theme = ctx.ui.theme;
-		const state: SelectorState = {
-			options,
-			highlightIndex: 0,
-			theme,
-		};
+		// Cache for accidental ESC recovery
+		lastDetectedOptions = options;
+		isFormOpen = true;
 
-		function updateWidget() {
-			ctx.ui.setWidget(WIDGET_KEY, (_tui: TUI, _theme: Theme) => {
-				return {
-					render(w: number): string[] {
-						return renderSelectorLines(state, w);
-					},
-					invalidate() {},
-				};
-			}, { placement: "belowEditor" });
-		}
+		try {
+			const customFn = (ctx.ui as any).custom;
+			if (typeof customFn === "function") {
+				const result = await (ctx.ui as any).custom((tui: TUI, theme: Theme, _kb: any, done: (res: string | null) => void) => {
+					return createQuestionFormComponent(options, tui, theme, done);
+				});
 
-		function dismiss() {
-			if (!activeSelector) return;
-			activeSelector.unsubscribe();
-			ctx.ui.setWidget(WIDGET_KEY, undefined);
-			activeSelector = null;
-		}
-
-		function submitOption(opt: NormalizedOption) {
-			dismiss();
-			pi.sendUserMessage(opt.fullText);
-		}
-
-		// Intercept keyboard input
-		const unsubscribe = ctx.ui.onTerminalInput((data: string) => {
-			if (!activeSelector) return undefined;
-
-			// Number keys 1-9: instant select
-			if (data.length === 1 && data >= "1" && data <= "9") {
-				const idx = parseInt(data, 10) - 1;
-				if (idx < state.options.length) {
-					submitOption(state.options[idx]);
-					return { consume: true };
+				if (result) {
+					pi.sendUserMessage(result);
 				}
 			}
-
-			// Arrow up or k: move highlight up
-			if (data === "k" || data === "\x1b[A" || matchesKey(data, Key.up)) {
-				state.highlightIndex = Math.max(0, state.highlightIndex - 1);
-				updateWidget();
-				return { consume: true };
-			}
-
-			// Arrow down or j: move highlight down
-			if (data === "j" || data === "\x1b[B" || matchesKey(data, Key.down)) {
-				state.highlightIndex = Math.min(state.options.length - 1, state.highlightIndex + 1);
-				updateWidget();
-				return { consume: true };
-			}
-
-			// Enter: submit highlighted option
-			if (data === "\r" || data === "\n" || matchesKey(data, Key.enter)) {
-				submitOption(state.options[state.highlightIndex]);
-				return { consume: true };
-			}
-
-			// Escape: dismiss without submitting
-			if (data === "\x1b" || matchesKey(data, Key.escape)) {
-				dismiss();
-				return { consume: true };
-			}
-
-			// Any other printable character: dismiss and let it pass through to editor
-			if (data.length === 1 && data >= " " && data <= "~") {
-				dismiss();
-				return undefined; // let the character pass through to the editor
-			}
-
-			return undefined;
-		});
-
-		activeSelector = { state, unsubscribe, dismiss };
-		updateWidget();
+		} finally {
+			isFormOpen = false;
+		}
 	}
 
 	// ─── Event handlers ──────────────────────────────────────────────────────
 
-	// Capture the last assistant message text on agent_end
 	pi.on("agent_end", async (event, _ctx) => {
 		lastAssistantText = "";
 		if (!event.messages) return;
 
-		// Find the last assistant message
 		for (let i = event.messages.length - 1; i >= 0; i--) {
 			const msg = event.messages[i] as any;
 			if (msg.role === "assistant") {
-				// Extract text content from the assistant message
 				if (typeof msg.content === "string") {
 					lastAssistantText = msg.content;
 				} else if (Array.isArray(msg.content)) {
@@ -331,13 +464,12 @@ export default function rbfQuestionForm(pi: ExtensionAPI): void {
 		}
 	});
 
-	// On agent_settled, check for pending tool options or text detection
 	pi.on("agent_settled", async (_event, ctx) => {
 		// Priority 1: tool-provided options
 		if (pendingToolOptions) {
 			const options = pendingToolOptions;
 			pendingToolOptions = null;
-			showSelector(options, ctx);
+			await openQuestionForm(options, ctx);
 			return;
 		}
 
@@ -346,16 +478,43 @@ export default function rbfQuestionForm(pi: ExtensionAPI): void {
 			const detectedLines = detectQuestionOptions(lastAssistantText);
 			if (detectedLines) {
 				const options = detectedLines.map((line, i) => parseNumberedOption(line, i));
-				showSelector(options, ctx);
+				await openQuestionForm(options, ctx);
 			}
 		}
 	});
 
-	// Dismiss selector on new agent start
-	pi.on("agent_start", async (_event, _ctx) => {
-		if (activeSelector) {
-			activeSelector.dismiss();
-		}
+	// ─── Slash Commands & Shortcut to re-open after ESC ───────────────────────
+
+	pi.registerCommand("pick", {
+		description: "Re-open the selection form for the last agent question",
+		handler: async (_args, ctx) => {
+			if (!lastDetectedOptions || lastDetectedOptions.length === 0) {
+				ctx.ui.notify("No recent question options to pick from", "warning");
+				return;
+			}
+			await openQuestionForm(lastDetectedOptions, ctx);
+		},
+	});
+
+	pi.registerCommand("question", {
+		description: "Re-open the selection form for the last agent question",
+		handler: async (_args, ctx) => {
+			if (!lastDetectedOptions || lastDetectedOptions.length === 0) {
+				ctx.ui.notify("No recent question options to pick from", "warning");
+				return;
+			}
+			await openQuestionForm(lastDetectedOptions, ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+q", {
+		description: "Re-open the selection form for the last agent question",
+		handler: async (ctx) => {
+			if (!lastDetectedOptions || lastDetectedOptions.length === 0) {
+				return;
+			}
+			await openQuestionForm(lastDetectedOptions, ctx);
+		},
 	});
 
 	// ─── Tool registration ───────────────────────────────────────────────────
@@ -377,11 +536,9 @@ export default function rbfQuestionForm(pi: ExtensionAPI): void {
 			const normalized = params.options.map((opt, i) => normalizeToolOption(opt, i));
 
 			if (ctx.mode === "tui") {
-				// Store options for presentation on agent_settled
 				pendingToolOptions = normalized;
 			}
 
-			// Return the question text so it appears in the transcript
 			const optionsText = normalized.map((opt) => opt.fullText).join("\n");
 			return {
 				content: [{ type: "text" as const, text: `${params.question}\n\n${optionsText}\n\nWaiting for user selection...` }],
@@ -415,7 +572,6 @@ export default function rbfQuestionForm(pi: ExtensionAPI): void {
 
 	pi.registerTool(toolDef);
 
-	// Register alias
 	pi.registerTool({
 		...toolDef,
 		name: "ask_question",

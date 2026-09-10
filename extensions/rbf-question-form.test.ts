@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { Key } from "@earendil-works/pi-tui";
 import rbfQuestionForm, {
+	buildChips,
+	buildSubmissionText,
+	createQuestionFormComponent,
 	detectQuestionOptions,
 	normalizeToolOption,
 	parseNumberedOption,
-	renderSelectorLines,
+	renderQuestionFormLines,
 } from "./rbf-question-form.ts";
 
 // ─── detectQuestionOptions ───────────────────────────────────────────────────
@@ -151,83 +154,215 @@ describe("normalizeToolOption", () => {
 	});
 });
 
-// ─── renderSelectorLines ─────────────────────────────────────────────────────
+// ─── buildChips ─────────────────────────────────────────────────────────────
 
-describe("renderSelectorLines", () => {
-	const mockTheme: any = {
-		fg: (_color: string, text: string) => text,
-	};
+describe("buildChips", () => {
+	it("creates chips for options plus Write-in and Canned reply", () => {
+		const options = [
+			{ index: 0, label: "A", fullText: "1. A" },
+			{ index: 1, label: "B", fullText: "2. B" },
+			{ index: 2, label: "C", fullText: "3. C" },
+		];
+		const chips = buildChips(options);
 
-	function makeOptions(labels: string[]) {
-		return labels.map((label, i) => ({
-			index: i,
-			label,
-			description: undefined,
-			fullText: `${i + 1}. ${label}`,
-		}));
-	}
-
-	it("renders all options with highlight on first", () => {
-		const options = makeOptions(["Option A", "Option B", "Option C"]);
-		const lines = renderSelectorLines({ options, highlightIndex: 0, theme: mockTheme }, 80);
-
-		// Should contain all option texts
-		const joined = lines.join("\n");
-		expect(joined).toContain("1. Option A");
-		expect(joined).toContain("2. Option B");
-		expect(joined).toContain("3. Option C");
-	});
-
-	it("renders highlight marker on selected option", () => {
-		const options = makeOptions(["A", "B"]);
-		const lines = renderSelectorLines({ options, highlightIndex: 1, theme: mockTheme }, 80);
-
-		const joined = lines.join("\n");
-		// Option B should have the ▸ prefix
-		expect(joined).toContain("▸ ");
-	});
-
-	it("includes hint line with key instructions", () => {
-		const options = makeOptions(["A", "B"]);
-		const lines = renderSelectorLines({ options, highlightIndex: 0, theme: mockTheme }, 80);
-
-		const joined = lines.join("\n");
-		expect(joined).toContain("[1-2] select");
-		expect(joined).toContain("[Enter] confirm");
-		expect(joined).toContain("[Esc] dismiss");
-	});
-
-	it("renders descriptions when present", () => {
-		const options = [{
-			index: 0,
-			label: "Option A",
-			description: "This is a detailed description",
-			fullText: "1. Option A",
-		}];
-		const lines = renderSelectorLines({ options, highlightIndex: 0, theme: mockTheme }, 80);
-
-		const joined = lines.join("\n");
-		expect(joined).toContain("This is a detailed description");
-	});
-
-	it("starts and ends with separator lines", () => {
-		const options = makeOptions(["A"]);
-		// Need at least 2 options for the real flow, but rendering works with 1
-		const lines = renderSelectorLines({ options, highlightIndex: 0, theme: mockTheme }, 40);
-
-		// First and last lines should be separator dashes
-		expect(lines[0]).toMatch(/─+/);
-		expect(lines[lines.length - 1]).toMatch(/─+/);
+		expect(chips).toHaveLength(5);
+		expect(chips[0]).toEqual({ key: "1", type: "option", label: "1", fullText: "1. A" });
+		expect(chips[1]).toEqual({ key: "2", type: "option", label: "2", fullText: "2. B" });
+		expect(chips[2]).toEqual({ key: "3", type: "option", label: "3", fullText: "3. C" });
+		expect(chips[3]).toEqual({ key: "4", type: "write-in", label: "4. Write-in" });
+		expect(chips[4]).toEqual({
+			key: "c",
+			type: "canned",
+			label: "C. /convo-is-very-best",
+			cannedCommand: "/skill:convo-is-very-best",
+		});
 	});
 });
 
-// ─── rbfQuestionForm Extension Lifecycle & Interaction ──────────────────────
+// ─── buildSubmissionText ────────────────────────────────────────────────────
 
-describe("rbfQuestionForm extension integration", () => {
+describe("buildSubmissionText", () => {
+	const optChip = { key: "1", type: "option" as const, label: "1", fullText: "1. First choice" };
+	const writeInChip = { key: "4", type: "write-in" as const, label: "4. Write-in" };
+	const cannedChip = {
+		key: "c",
+		type: "canned" as const,
+		label: "C. /convo-is-very-best",
+		cannedCommand: "/skill:convo-is-very-best",
+	};
+
+	it("returns base fullText when notes are empty", () => {
+		expect(buildSubmissionText(optChip, "")).toBe("1. First choice");
+		expect(buildSubmissionText(optChip, "   ")).toBe("1. First choice");
+	});
+
+	it("appends 'Add notes to selection:' when notes are provided", () => {
+		const result = buildSubmissionText(optChip, "make sure tests pass");
+		expect(result).toBe("1. First choice\n\nAdd notes to selection: make sure tests pass");
+	});
+
+	it("handles write-in option", () => {
+		expect(buildSubmissionText(writeInChip, "")).toBe("Write-in");
+		expect(buildSubmissionText(writeInChip, "my custom answer")).toBe("my custom answer");
+	});
+
+	it("handles canned reply with and without notes", () => {
+		expect(buildSubmissionText(cannedChip, "")).toBe("/skill:convo-is-very-best");
+		expect(buildSubmissionText(cannedChip, "focus on edge cases")).toBe(
+			"/skill:convo-is-very-best\n\nAdd notes to selection: focus on edge cases",
+		);
+	});
+});
+
+// ─── renderQuestionFormLines ────────────────────────────────────────────────
+
+describe("renderQuestionFormLines", () => {
+	const mockTheme: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+
+	it("renders dark background and light text for active selection", () => {
+		const chips = [
+			{ key: "1", type: "option" as const, label: "1" },
+			{ key: "2", type: "option" as const, label: "2" },
+		];
+		const lines = renderQuestionFormLines(
+			{
+				chips,
+				selectedChipIndex: 0,
+				focus: "options",
+				notesText: "",
+				notesCursorPos: 0,
+				theme: mockTheme,
+			},
+			80,
+		);
+
+		const joined = lines.join("\n");
+		// Active chip 1 has dark background ANSI code
+		expect(joined).toContain("\x1b[48;5;236m\x1b[1;38;5;255m 1 \x1b[0m");
+		// Unselected chip 2 has brackets
+		expect(joined).toContain("[ 2 ]");
+		// Top border has Select Answer
+		expect(joined).toContain("Select Answer");
+		// Has notes label
+		expect(joined).toContain("Add notes to selection:");
+	});
+
+	it("renders cursor and typed notes when focus is on notes", () => {
+		const chips = [{ key: "1", type: "option" as const, label: "1" }];
+		const lines = renderQuestionFormLines(
+			{
+				chips,
+				selectedChipIndex: 0,
+				focus: "notes",
+				notesText: "hello",
+				notesCursorPos: 5,
+				theme: mockTheme,
+			},
+			80,
+		);
+
+		const joined = lines.join("\n");
+		expect(joined).toContain("hello");
+		expect(joined).toContain("\x1b[7m"); // inverse cursor
+	});
+});
+
+// ─── createQuestionFormComponent input handling ──────────────────────────────
+
+describe("createQuestionFormComponent input handling", () => {
+	const mockTheme: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+
+	function createComponent() {
+		const options = [
+			{ index: 0, label: "Alpha", fullText: "1. Alpha" },
+			{ index: 1, label: "Beta", fullText: "2. Beta" },
+		];
+		const tui = {
+			requestRender: vi.fn(),
+		};
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
+		return { comp, tui, done };
+	}
+
+	it("navigates options with arrow keys and submits on Enter", () => {
+		const { comp, done } = createComponent();
+
+		// Move right to option 2
+		comp.handleInput("\x1b[C");
+		// Submit with Enter
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("2. Beta");
+	});
+
+	it("switches to notes with Tab and types text", () => {
+		const { comp, done } = createComponent();
+
+		// Select option 1
+		comp.handleInput("1");
+		// Tab to notes
+		comp.handleInput("\t");
+		// Type 'h', 'i'
+		comp.handleInput("h");
+		comp.handleInput("i");
+		// Submit with Enter
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("1. Alpha\n\nAdd notes to selection: hi");
+	});
+
+	it("clears notes on Esc first, then dismisses on second Esc", () => {
+		const { comp, done } = createComponent();
+
+		// Tab to notes and type
+		comp.handleInput("\t");
+		comp.handleInput("x");
+
+		// First Esc clears notes text
+		comp.handleInput("\x1b");
+		expect(done).not.toHaveBeenCalled();
+
+		// Second Esc dismisses
+		comp.handleInput("\x1b");
+		expect(done).toHaveBeenCalledWith(null);
+	});
+
+	it("selects canned reply with 'c' key", () => {
+		const { comp, done } = createComponent();
+
+		// Press 'c' to select canned reply
+		comp.handleInput("c");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("/skill:convo-is-very-best");
+	});
+
+	it("selects write-in option and focuses notes", () => {
+		const { comp, done } = createComponent();
+
+		// 3 is Write-in (2 options + 1)
+		comp.handleInput("3");
+		// Directly type custom text since write-in auto-focuses notes
+		comp.handleInput("M");
+		comp.handleInput("y");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("My");
+	});
+});
+
+// ─── rbfQuestionForm Extension Lifecycle & Commands ─────────────────────────
+
+describe("rbfQuestionForm extension integration & commands", () => {
 	function createMockExtensionContext(mode = "tui") {
-		let terminalInputListener: ((data: string) => any) | undefined;
-		let currentWidget: any = undefined;
-		let currentWidgetOptions: any = undefined;
+		let customComponent: any = null;
 
 		const ctx = {
 			mode,
@@ -238,47 +373,42 @@ describe("rbfQuestionForm extension integration", () => {
 					fg: (_color: string, text: string) => text,
 					bold: (text: string) => text,
 				},
-				setWidget: vi.fn((key: string, content: any, options?: any) => {
-					currentWidget = content;
-					currentWidgetOptions = options;
-				}),
-				onTerminalInput: vi.fn((listener: (data: string) => any) => {
-					terminalInputListener = listener;
-					return () => {
-						if (terminalInputListener === listener) {
-							terminalInputListener = undefined;
-						}
-					};
+				notify: vi.fn(),
+				custom: vi.fn((factory: (tui: any, theme: any, kb: any, done: any) => any) => {
+					return new Promise((resolve) => {
+						const comp = factory({ requestRender: vi.fn() }, ctx.ui.theme, {}, (result: any) => {
+							resolve(result);
+						});
+						customComponent = comp;
+					});
 				}),
 			},
 		};
 
 		return {
 			ctx,
-			get currentWidget() {
-				return currentWidget;
-			},
-			get currentWidgetOptions() {
-				return currentWidgetOptions;
-			},
-			sendTerminalInput(data: string) {
-				if (!terminalInputListener) return undefined;
-				return terminalInputListener(data);
-			},
-			hasInputListener() {
-				return terminalInputListener !== undefined;
+			get customComponent() {
+				return customComponent;
 			},
 		};
 	}
 
 	function createMockExtensionAPI() {
 		const registeredTools = new Map<string, any>();
+		const registeredCommands = new Map<string, any>();
+		const registeredShortcuts = new Map<string, any>();
 		const listeners = new Map<string, Array<(...args: any[]) => any>>();
 		const sendUserMessageMock = vi.fn();
 
 		const api = {
 			registerTool: vi.fn((tool: any) => {
 				registeredTools.set(tool.name, tool);
+			}),
+			registerCommand: vi.fn((name: string, def: any) => {
+				registeredCommands.set(name, def);
+			}),
+			registerShortcut: vi.fn((shortcut: string, def: any) => {
+				registeredShortcuts.set(shortcut, def);
 			}),
 			on: vi.fn((event: string, handler: (...args: any[]) => any) => {
 				const list = listeners.get(event) ?? [];
@@ -291,6 +421,8 @@ describe("rbfQuestionForm extension integration", () => {
 		return {
 			api,
 			registeredTools,
+			registeredCommands,
+			registeredShortcuts,
 			sendUserMessageMock,
 			emit: async (event: string, ...args: any[]) => {
 				const handlers = listeners.get(event) ?? [];
@@ -301,218 +433,16 @@ describe("rbfQuestionForm extension integration", () => {
 		};
 	}
 
-	it("registers question and ask_question tools with the same schema", () => {
+	it("registers /pick and /question commands and ctrl+q shortcut", () => {
 		const mockAPI = createMockExtensionAPI();
 		rbfQuestionForm(mockAPI.api as any);
 
-		expect(mockAPI.registeredTools.has("question")).toBe(true);
-		expect(mockAPI.registeredTools.has("ask_question")).toBe(true);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		const askTool = mockAPI.registeredTools.get("ask_question");
-
-		expect(qTool.name).toBe("question");
-		expect(askTool.name).toBe("ask_question");
-		expect(qTool.description).toContain("Ask the user a question");
-		expect(askTool.description).toContain("Ask the user a question");
+		expect(mockAPI.registeredCommands.has("pick")).toBe(true);
+		expect(mockAPI.registeredCommands.has("question")).toBe(true);
+		expect(mockAPI.registeredShortcuts.has("ctrl+q")).toBe(true);
 	});
 
-	it("executes question tool and presents selector on agent_settled", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		const result = await qTool.execute(
-			"call_1",
-			{
-				question: "Pick a strategy",
-				options: [
-					"Option 1: Quick fix",
-					{ label: "Option 2: Proper refactor", description: "Takes longer" },
-				],
-			},
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		// Returns formatted markdown response for transcript
-		expect(result.content[0].text).toContain("Pick a strategy");
-		expect(result.content[0].text).toContain("1. Option 1: Quick fix");
-		expect(result.content[0].text).toContain("2. Option 2: Proper refactor");
-		expect(result.content[0].text).toContain("Waiting for user selection...");
-
-		// Not shown until agent_settled
-		expect(mockCtx.ctx.ui.setWidget).not.toHaveBeenCalled();
-
-		// Agent settles
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-
-		expect(mockCtx.ctx.ui.setWidget).toHaveBeenCalledWith(
-			"rbf-question-form",
-			expect.any(Function),
-			{ placement: "belowEditor" },
-		);
-		expect(mockCtx.hasInputListener()).toBe(true);
-
-		// Renders widget lines correctly
-		const widget = mockCtx.currentWidget({ width: 80 }, mockCtx.ctx.ui.theme);
-		const rendered = widget.render(80);
-		expect(rendered.join("\n")).toContain("1. Option 1: Quick fix");
-		expect(rendered.join("\n")).toContain("2. Option 2: Proper refactor");
-	});
-
-	it("selects option 1 instantly with number key '1'", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		await qTool.execute(
-			"call_1",
-			{
-				question: "Choose",
-				options: ["Alpha", "Beta"],
-			},
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-
-		const inputResult = mockCtx.sendTerminalInput("1");
-		expect(inputResult).toEqual({ consume: true });
-
-		// Submitted full option text
-		expect(mockAPI.sendUserMessageMock).toHaveBeenCalledWith("1. Alpha");
-
-		// Widget dismissed
-		expect(mockCtx.ctx.ui.setWidget).toHaveBeenLastCalledWith("rbf-question-form", undefined);
-		expect(mockCtx.hasInputListener()).toBe(false);
-	});
-
-	it("navigates with 'j' and confirms with Enter", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		await qTool.execute(
-			"call_1",
-			{
-				question: "Choose",
-				options: ["First choice", "Second choice"],
-			},
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-
-		// Press 'j' to move highlight down to option 2
-		const moveDown = mockCtx.sendTerminalInput("j");
-		expect(moveDown).toEqual({ consume: true });
-
-		// Press Enter to confirm highlighted option
-		const enter = mockCtx.sendTerminalInput("\r");
-		expect(enter).toEqual({ consume: true });
-
-		expect(mockAPI.sendUserMessageMock).toHaveBeenCalledWith("2. Second choice");
-		expect(mockCtx.hasInputListener()).toBe(false);
-	});
-
-	it("navigates up and down with arrow keys", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		await qTool.execute(
-			"call_1",
-			{
-				question: "Choose",
-				options: ["A", "B", "C"],
-			},
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-
-		mockCtx.sendTerminalInput("\x1b[B"); // to B (index 1)
-		mockCtx.sendTerminalInput("\x1b[B"); // to C (index 2)
-		mockCtx.sendTerminalInput("\x1b[A"); // back to B (index 1)
-		mockCtx.sendTerminalInput("\r");
-
-		expect(mockAPI.sendUserMessageMock).toHaveBeenCalledWith("2. B");
-	});
-
-	it("dismisses without submitting when Escape is pressed", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		await qTool.execute(
-			"call_1",
-			{
-				question: "Choose",
-				options: ["Opt 1", "Opt 2"],
-			},
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-
-		const escResult = mockCtx.sendTerminalInput("\x1b");
-		expect(escResult).toEqual({ consume: true });
-
-		// Did not submit message
-		expect(mockAPI.sendUserMessageMock).not.toHaveBeenCalled();
-
-		// Widget cleared
-		expect(mockCtx.ctx.ui.setWidget).toHaveBeenLastCalledWith("rbf-question-form", undefined);
-		expect(mockCtx.hasInputListener()).toBe(false);
-	});
-
-	it("dismisses and lets character pass through when user types printable char", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		await qTool.execute(
-			"call_1",
-			{
-				question: "Choose",
-				options: ["Opt 1", "Opt 2"],
-			},
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-
-		// Typing 'w' (e.g. user starts typing freeform)
-		const charResult = mockCtx.sendTerminalInput("w");
-		expect(charResult).toBeUndefined(); // NOT consumed, passes through to editor
-
-		// Did not submit message
-		expect(mockAPI.sendUserMessageMock).not.toHaveBeenCalled();
-
-		// Widget cleared
-		expect(mockCtx.ctx.ui.setWidget).toHaveBeenLastCalledWith("rbf-question-form", undefined);
-		expect(mockCtx.hasInputListener()).toBe(false);
-	});
-
-	it("auto-detects question from assistant message on agent_settled", async () => {
+	it("opens form on agent_settled and allows /pick after Esc to re-open", async () => {
 		const mockAPI = createMockExtensionAPI();
 		const mockCtx = createMockExtensionContext("tui");
 		rbfQuestionForm(mockAPI.api as any);
@@ -522,59 +452,55 @@ describe("rbfQuestionForm extension integration", () => {
 			content: [
 				{
 					type: "text",
-					text: `• Recommendation: Let Codex own retries inside its active turn.
+					text: `• Recommendation: Which strategy?
 
-1. Codex retries internally — one execution owner ← recommended
-2. Pi automatically resends — smoother recovery / can duplicate partially completed work
-3. Do nothing — simplest / user must re-prompt on any transient error`,
+1. Fast strategy ← recommended
+2. Slow strategy`,
 				},
 			],
 		};
 
-		// agent_end delivers messages
+		// 1. Deliver message on agent_end
 		await mockAPI.emit("agent_end", { messages: [assistantMessage] }, mockCtx.ctx);
 
-		// agent_settled activates selector
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
+		// 2. Settle agent -> opens custom form
+		const settlePromise = mockAPI.emit("agent_settled", {}, mockCtx.ctx);
 
-		expect(mockCtx.ctx.ui.setWidget).toHaveBeenCalledWith(
-			"rbf-question-form",
-			expect.any(Function),
-			{ placement: "belowEditor" },
-		);
+		expect(mockCtx.ctx.ui.custom).toHaveBeenCalled();
+		expect(mockCtx.customComponent).toBeDefined();
 
-		// Select option 1 via key '1'
-		mockCtx.sendTerminalInput("1");
+		// 3. User accidentally presses Esc
+		mockCtx.customComponent.handleInput("\x1b");
+		await settlePromise;
+
+		// No message submitted
+		expect(mockAPI.sendUserMessageMock).not.toHaveBeenCalled();
+
+		// 4. User runs /pick to restore the question form!
+		const pickCmd = mockAPI.registeredCommands.get("pick");
+		const pickPromise = pickCmd.handler("", mockCtx.ctx);
+
+		expect(mockCtx.customComponent).toBeDefined();
+
+		// 5. User selects option 1 with notes
+		mockCtx.customComponent.handleInput("1");
+		mockCtx.customComponent.handleInput("\t");
+		mockCtx.customComponent.handleInput("u");
+		mockCtx.customComponent.handleInput("r");
+		mockCtx.customComponent.handleInput("g");
+		mockCtx.customComponent.handleInput("e");
+		mockCtx.customComponent.handleInput("n");
+		mockCtx.customComponent.handleInput("t");
+		mockCtx.customComponent.handleInput("\r");
+
+		await pickPromise;
+
 		expect(mockAPI.sendUserMessageMock).toHaveBeenCalledWith(
-			"1. Codex retries internally — one execution owner ← recommended",
+			"1. Fast strategy ← recommended\n\nAdd notes to selection: urgent",
 		);
 	});
 
-	it("dismisses active selector when agent_start fires", async () => {
-		const mockAPI = createMockExtensionAPI();
-		const mockCtx = createMockExtensionContext("tui");
-		rbfQuestionForm(mockAPI.api as any);
-
-		const qTool = mockAPI.registeredTools.get("question");
-		await qTool.execute(
-			"call_1",
-			{ question: "Q", options: ["A", "B"] },
-			new AbortController().signal,
-			vi.fn(),
-			mockCtx.ctx,
-		);
-
-		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
-		expect(mockCtx.hasInputListener()).toBe(true);
-
-		// New agent turn starts
-		await mockAPI.emit("agent_start", {}, mockCtx.ctx);
-
-		expect(mockCtx.ctx.ui.setWidget).toHaveBeenLastCalledWith("rbf-question-form", undefined);
-		expect(mockCtx.hasInputListener()).toBe(false);
-	});
-
-	it("renders tool call and result representations", () => {
+	it("renders tool representations", () => {
 		const mockAPI = createMockExtensionAPI();
 		rbfQuestionForm(mockAPI.api as any);
 
@@ -584,11 +510,14 @@ describe("rbfQuestionForm extension integration", () => {
 			bold: (s: string) => s,
 		};
 
-		const callText = qTool.renderCall({ question: "Which one?", options: ["A", "B"] }, theme);
+		const callText = qTool.renderCall({ question: "Pick one?", options: ["A", "B"] }, theme);
 		expect(callText).toBeDefined();
 
-		const resultText = qTool.renderResult({ content: [{ type: "text", text: "Waiting..." }], details: { question: "Which one?", options: ["A", "B"] } }, {}, theme);
+		const resultText = qTool.renderResult(
+			{ content: [{ type: "text", text: "Waiting..." }], details: { question: "Pick one?", options: ["A", "B"] } },
+			{},
+			theme,
+		);
 		expect(resultText).toBeDefined();
 	});
 });
-
