@@ -33,6 +33,7 @@ export const DEFAULT_BUILTIN_COMMANDS = new Set([
 	"quit",
 	"exit",
 	"clear",
+	"rewind",
 ]);
 
 /**
