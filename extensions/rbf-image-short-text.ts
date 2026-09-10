@@ -54,16 +54,12 @@ export function isClipboardImageFile(filePath: string): boolean {
 	if (typeof filePath !== "string" || !filePath.trim()) {
 		return false;
 	}
-	// Reject multi-line text (pasting text or code blocks that mention paths)
-	if (filePath.includes("\n") || filePath.includes("\r")) {
-		return false;
-	}
 	const cleaned = normalizePastedPath(filePath);
 	if (!cleaned) {
 		return false;
 	}
-	const fileName = path.basename(cleaned);
-	if (!fileName.startsWith("clipboard-") && !fileName.startsWith("pi-clipboard-")) {
+	// Reject multi-line text (pasting text or code blocks that mention paths)
+	if (cleaned.includes("\n") || cleaned.includes("\r")) {
 		return false;
 	}
 	const ext = path.extname(cleaned).toLowerCase();
@@ -71,6 +67,7 @@ export function isClipboardImageFile(filePath: string): boolean {
 		return false;
 	}
 
+	const fileName = path.basename(cleaned);
 	const resolvedPath = path.resolve(cleaned);
 	const resolvedTmp = path.resolve(os.tmpdir());
 	const dir = path.dirname(resolvedPath);
@@ -83,7 +80,16 @@ export function isClipboardImageFile(filePath: string): boolean {
 		resolvedPath.startsWith("/var/tmp/") ||
 		resolvedPath.startsWith("/var/folders/");
 
-	if (!isInTempDir) {
+	const isTempClipboard =
+		(fileName.startsWith("clipboard-") || fileName.startsWith("pi-clipboard-")) &&
+		isInTempDir;
+
+	const isCleanShot =
+		fileName.startsWith("CleanShot") ||
+		resolvedPath.includes("/Library/Application Support/CleanShot/") ||
+		resolvedPath.includes("/CleanShot/media/");
+
+	if (!isTempClipboard && !isCleanShot) {
 		return false;
 	}
 

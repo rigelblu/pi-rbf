@@ -160,6 +160,39 @@ describe("Pure helpers", () => {
 			expect(isClipboardImageFile(txtFile)).toBe(false);
 		});
 
+		it("returns true for an existing CleanShot screenshot in CleanShot media directory", () => {
+			const cleanShotDir = path.join(os.tmpdir(), "test-cleanshot", "Library", "Application Support", "CleanShot", "media", "media_test123");
+			fs.mkdirSync(cleanShotDir, { recursive: true });
+			const cleanShotFile = path.join(cleanShotDir, "CleanShot 2026-09-10 at 4.37.35 AM@2x.png");
+			fs.writeFileSync(cleanShotFile, Buffer.from("fake cleanshot png data"));
+			tmpFiles.push(cleanShotFile);
+
+			expect(isClipboardImageFile(cleanShotFile)).toBe(true);
+			// Also accepts terminal-escaped spaces
+			const escapedPath = cleanShotFile.replace(/ /g, "\\ ");
+			expect(isClipboardImageFile(escapedPath)).toBe(true);
+			// Also accepts wrapped in quotes
+			expect(isClipboardImageFile(`"${cleanShotFile}"`)).toBe(true);
+		});
+
+		it("returns true for CleanShot filename prefix anywhere", () => {
+			const csFile = path.join(os.tmpdir(), `CleanShot-${crypto.randomUUID()}.png`);
+			fs.writeFileSync(csFile, Buffer.from("data"));
+			tmpFiles.push(csFile);
+
+			expect(isClipboardImageFile(csFile)).toBe(true);
+		});
+
+		it("returns false for non-clipboard filenames outside tempdir", () => {
+			const customDir = path.join(os.tmpdir(), "other-app");
+			fs.mkdirSync(customDir, { recursive: true });
+			const regularFile = path.join(customDir, `regular-photo-${crypto.randomUUID()}.png`);
+			fs.writeFileSync(regularFile, Buffer.from("data"));
+			tmpFiles.push(regularFile);
+
+			expect(isClipboardImageFile(regularFile)).toBe(false);
+		});
+
 		it("returns false for multi-line inputs", () => {
 			const filePath = path.join(os.tmpdir(), `pi-clipboard-${crypto.randomUUID()}.png`);
 			fs.writeFileSync(filePath, Buffer.from("fake png data"));
@@ -614,6 +647,42 @@ describe("Editor & CustomEditor monkey-patching", () => {
 		expect(inserted).toBe("[Image #1]");
 		expect(manager.getActiveEntries()).toHaveLength(1);
 		expect(manager.getActiveEntries()[0].chip).toBe("[Image #1]");
+	});
+
+	it("intercepts terminal paste of CleanShot screenshot with escaped spaces and inserts [Image #1] chip", () => {
+		const manager = new ImageShortTextManager();
+		setActiveManager(manager);
+		patchEditorPaste();
+
+		const cleanShotDir = path.join(os.tmpdir(), "Application Support", "CleanShot", "media", "media_test");
+		fs.mkdirSync(cleanShotDir, { recursive: true });
+		const cleanShotFile = path.join(cleanShotDir, "CleanShot 2026-09-10 at 4.37.35 AM@2x.png");
+		fs.writeFileSync(cleanShotFile, Buffer.from("cleanshot png content"));
+		tmpFiles.push(cleanShotFile);
+
+		let inserted: string | undefined;
+		const fakeEditor = {
+			getText: vi.fn(() => ""),
+			state: { lines: [""], cursorLine: 0, cursorCol: 0 },
+			cancelAutocomplete: vi.fn(),
+			exitHistoryBrowsing: vi.fn(),
+			pushUndoSnapshot: vi.fn(),
+			lastAction: null,
+			normalizeText: vi.fn((t: string) => t),
+			insertTextAtCursorInternal: vi.fn((t: string) => {
+				inserted = t;
+			}),
+			handlePaste: (Editor.prototype as any).handlePaste,
+		};
+
+		// Terminal pastes path with escaped spaces
+		const escapedPath = cleanShotFile.replace(/ /g, "\\ ");
+		fakeEditor.handlePaste(escapedPath);
+
+		expect(inserted).toBe("[Image #1]");
+		expect(manager.getActiveEntries()).toHaveLength(1);
+		expect(manager.getActiveEntries()[0].chip).toBe("[Image #1]");
+		expect(manager.getActiveEntries()[0].filePath).toBe(cleanShotFile);
 	});
 
 	it("prepends a space when character before cursor is a word character", () => {
