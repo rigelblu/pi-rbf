@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.14.1 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat (ux) | support text objects ciw, diw, caw, daw (#pi-18.1)
+
+---
+
 # 🔵⋯ v0.14.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat (ux) | use vim motions in input box (#pi-18)
