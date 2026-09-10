@@ -180,9 +180,11 @@ Local Pi extension that blends skill invocations directly into the terminal back
 # 🔵⋯ rbf-cache-guardian
 
 ## 🟠⋯ Overview
-Local Pi extension that acts as a passive Cache Guardian for prompt-caching providers (Anthropic, OpenAI Codex, OpenAI): tracks the cache window from provider request start, renders a live 1-second countdown below the editor with a 10-pip right-to-left draining battery progress bar, alerts at ≤ 10% remaining, and prompts to `/clear` stale history at 0:00 with Claude Code styled accent text.
+Local Pi extension that acts as a passive Cache Guardian for prompt-caching providers (Anthropic, OpenAI Codex, OpenAI): tracks the cache window from provider request start, renders a live status meter right-aligned inline on line 0 of Pi's footer (on the same row as the working directory and git branch), updates on a calm 1-minute cadence with a 5-pip draining progress bar, alerts at ≤ 10% remaining, and prompts to `/clear` stale history at 0m with Claude Code styled accent text.
 
 ## 🟠⋯ Capabilities & Behavior
+- Inline footer placement: monkey-patches `FooterComponent.prototype.render` to place the status meter right-aligned on line 0 alongside the current working directory and git branch, consuming zero dedicated widget lines below the editor.
+- 1-minute cadence with precision targeting: updates the countdown every 60 seconds (rendering as `${m}m`, e.g. `5m`, `4m`, `3m`, `2m`), switching to seconds when under 1 minute (`50s`, `30s`), and dynamically scheduling ticks so the exact critical alert boundary and 0m expiration deadline are hit precisely.
 - Configurable cache TTL: resolves TTL from `settings.json` (`cacheTtl`, `cacheTtlMinutes`, or `cacheTtlMs`), supporting provider-level (`"openai-codex": "10m"`) or model-level overrides (`"openai-codex/gpt-5.6-terra": "15m"`), with built-in defaults:
   - Anthropic: 5 minutes (`300_000` ms)
   - OpenAI Codex (`openai-codex`): 10 minutes (`600_000` ms)
@@ -191,17 +193,46 @@ Local Pi extension that acts as a passive Cache Guardian for prompt-caching prov
   - Anthropic: uses provider-reported `cacheRead + cacheWrite`
   - OpenAI / Codex: uses provider-reported `cacheRead`; on Turn 1 cold start, automatically detects cached prompt prefix when `usage.input >= 1024` tokens
 - Absolute window tracking: computes deadline from provider request start (`startedAt + totalTtlMs`), accurately accounting for model generation time, tool runs, and sleep/wake jumps
-- Proportional below-editor sensory widget:
-  - Calm (> 30% remaining): muted text `4:12 TTL [████████░░] 182.6k cached` (or `9:45 TTL ...` on 10m)
-  - Warning (≤ 30% remaining): yellow warning tint with `⚠️ 1:15 TTL [██░░░░░░░░] 182.6k cached` (or `⚠️ 2:30 TTL ...` on 10m)
-  - Critical (≤ 10% remaining): red error tint with `🚨 0:25 TTL [░░░░░░░░░░] 182.6k cached` (or `🚨 0:50 TTL ...` on 10m)
-  - Elapsed (0:00): Claude Code styled call-to-action `new task? /clear to save 182.6k tokens` with `/clear` and token count highlighted in accent color
+- Proportional footer sensory states:
+  - Calm (> 30% remaining): muted text `5m TTL [█████] 182.6k cached` (or `10m TTL ...` on 10m)
+  - Warning (≤ 30% remaining): yellow warning tint with `⚠️ 1m TTL [█░░░░] 182.6k cached` (or `⚠️ 3m TTL ...` on 10m)
+  - Critical (≤ 10% remaining): red error tint with `🚨 30s TTL [░░░░░] 182.6k cached` (or `🚨 60s TTL ...` on 10m)
+  - Elapsed (0m): Claude Code styled call-to-action `new task? /clear to save 182.6k tokens` with `/clear` and token count highlighted in accent color
 - Dual notifications: triggers one terminal toast (`ctx.ui.notify`) and one macOS desktop notification (`pi.exec` via `/usr/bin/osascript`, with terminal bell fallback) once at the critical ≤ 10% boundary (e.g. 30s for 5m TTL, 60s for 10m TTL)
-- Safe lifecycle invalidation: automatically clears timers, advances epochs, and removes the widget on user input, session switch, compaction, tree navigation, model change, or thinking level change
+- Safe lifecycle invalidation: automatically clears timers, advances epochs, and clears active footer state on user input, session switch, compaction, tree navigation, model change, or thinking level change
 - Passive operation: makes zero background provider completions and registers no keep-alive commands
 
 ## 🟠⋯ Setup & Verification
 - Configuration (optional): add `"cacheTtl": { "anthropic": "5m", "openai-codex": "10m" }` to `~/.pi/agent/settings.json`
-- Local verification: launch `pi -e ./extensions/rbf-cache-guardian.ts`, run a prompt against Anthropic or Codex, and observe the live countdown below the editor
+- Local verification: launch `pi -e ./extensions/rbf-cache-guardian.ts`, run a prompt against Anthropic or Codex, and observe the live countdown inline and right-aligned on footer line 0
 - Global installation: `cp ./extensions/rbf-cache-guardian.ts ~/.pi/agent/extensions/rbf-cache-guardian.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-cache-guardian.ts`
+
+---
+
+# 🔵⋯ rbf-status-line
+
+## 🟠⋯ Overview
+Local Pi extension that brings parity with Claude Code's status line to Line 1 of Pi's interactive terminal footer: displays directory name, repository root, Jujutsu workspace or Git worktree identity, cross-worktree agent divergence warnings, nearest ancestor bookmarks, and parent change ID (`📁 <dir_name> | 📦 <repo_name> | <tree_label> [| 🌴 <agent_tree>] [| 🏷️  <branch>] @<commit> [• <session_name>]`), while preserving Pi's native Line 2 token/cache/cost metrics and Line 3 extension statuses.
+
+## 🟠⋯ Capabilities & Behavior
+- Formatted status line: replaces Line 1 (`pwdLine`) with Claude Code status line components:
+  - `📁 <dir_name>`: current working directory basename
+  - `📦 <repo_name>`: repository root name (via `jj root` or `git rev-parse --show-toplevel`)
+  - `<tree_label>`: ` main` for default workspace, ` wt:<name>` for secondary worktrees/workspaces, plus ` ⚠stale` if the Jujutsu workspace is stale
+  - `🌴 <agent_tree>`: reads `~/.claude/agent_tree.state`; if modified within 30 minutes and writing outside the current repository root (excluding `rb-drive`), flags divergence
+  - `🏷️  <branch>`: nearest ancestor bookmark from `jj log -r 'latest(ancestors(@) & bookmarks())' -T 'bookmarks'` (or git branch)
+  - `@<commit>`: shortest parent change ID from `jj log -r @- -T 'change_id.shortest()'` (or git commit)
+  - `• <session_name>`: preserves session name if set via `/name`
+- Preserves native metrics: keeps Pi's Line 2 (cumulative tokens, cache reads/writes, cost, context percentage, model, thinking level) and Line 3 (extension statuses) completely untouched
+- Seamless Cache Guardian integration: coordinates with `rbf-cache-guardian` to right-align the passive cache guardian countdown on Line 0 alongside the status line
+- Sub-millisecond TUI rendering: in-memory caching with 2-second TTL ensures zero subprocess latency during typing or streaming responses, invalidating reactively on session, turn, and bash events
+- Zero external dependencies: pure TypeScript extension utilizing standard Node built-ins (`node:child_process`, `node:fs`, `node:path`, `node:os`), `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui`
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-status-line.ts` and inspect Line 1 of the footer (e.g. `📁 pi-rbf | 📦 pi-rbf |  main | 🌴 .claude @mm`)
+- Subdirectory check: `cd extensions` and observe `📁 extensions | 📦 pi-rbf |  main | 🌴 .claude @mm`
+- Global installation: `cp ./extensions/rbf-status-line.ts ~/.pi/agent/extensions/rbf-status-line.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-status-line.ts`
+
+

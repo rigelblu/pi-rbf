@@ -4,6 +4,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-status-line`](extensions/rbf-status-line.ts) (v0.10.0) — See on my status line what I see in Claude Code (workspace, repository, worktree, agent divergence, branch, commit).
 - [`rbf-cache-guardian`](extensions/rbf-cache-guardian.ts) (v0.9.0) — See when prompt cache reuse is no longer guaranteed with countdown, 10% critical alerts, and Claude Code styled /clear CTA.
 - [`rbf-skill-loaded-blended`](extensions/rbf-skill-loaded-blended.ts) (v0.8.0) — Routine loaded skills blend transparently into terminal background matching Claude Code.
 - [`rbf-clear`](extensions/rbf-clear.ts) (v0.7.0) — Use `/clear` to start a new chat session cleanly, matching native `/new`.
