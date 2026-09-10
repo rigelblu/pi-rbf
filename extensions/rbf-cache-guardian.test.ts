@@ -14,12 +14,16 @@ import rbfCacheGuardian, {
 	type AfterProviderResponseEvent,
 	CRITICAL_THRESHOLD,
 	DEFAULT_ANTHROPIC_TTL_MS,
+	DEFAULT_CODEX_TTL_MS,
 	formatCountdown,
+	formatNotificationTime,
 	formatTokens,
 	getGuardianThreshold,
 	isSupportedProvider,
+	parseTtlValue,
 	renderGuardianWidgetContent,
 	renderProgressBar,
+	resolveCacheTtlMs,
 	WARNING_THRESHOLD,
 	WIDGET_KEY,
 } from "./rbf-cache-guardian.ts";
@@ -156,14 +160,55 @@ describe("rbfCacheGuardian pure helpers", () => {
 		expect(getGuardianThreshold(-5_000, 300_000)).toBe("elapsed");
 	});
 
-	it("isSupportedProvider verifies direct Anthropic and respects PI_CACHE_RETENTION", () => {
+	it("parseTtlValue parses duration strings and numeric values correctly", () => {
+		expect(parseTtlValue(5)).toBe(300_000); // 5 minutes
+		expect(parseTtlValue(10)).toBe(600_000); // 10 minutes
+		expect(parseTtlValue(300_000)).toBe(300_000); // ms
+		expect(parseTtlValue("5m")).toBe(300_000);
+		expect(parseTtlValue("10m")).toBe(600_000);
+		expect(parseTtlValue("300s")).toBe(300_000);
+		expect(parseTtlValue("600000ms")).toBe(600_000);
+		expect(parseTtlValue("1h")).toBe(3_600_000);
+		expect(parseTtlValue("invalid")).toBeNull();
+		expect(parseTtlValue(undefined)).toBeNull();
+	});
+
+	it("formatNotificationTime formats critical alert duration accurately", () => {
+		expect(formatNotificationTime(30_000)).toBe("30s");
+		expect(formatNotificationTime(60_000)).toBe("60s");
+		expect(formatNotificationTime(120_000)).toBe("2m");
+	});
+
+	it("resolveCacheTtlMs and isSupportedProvider support Anthropic (5m), Codex (10m), and settings overrides", () => {
+		// Defaults
+		expect(resolveCacheTtlMs("anthropic", "claude-3-7-sonnet")).toBe(DEFAULT_ANTHROPIC_TTL_MS);
+		expect(resolveCacheTtlMs("openai-codex", "gpt-5.6-terra")).toBe(DEFAULT_CODEX_TTL_MS);
+		expect(resolveCacheTtlMs("openai", "gpt-4o")).toBe(DEFAULT_CODEX_TTL_MS);
+		expect(resolveCacheTtlMs("google", "gemini-2.5-pro")).toBeNull();
+
+		// isSupportedProvider defaults
 		expect(isSupportedProvider("anthropic", {})).toBe(true);
 		expect(isSupportedProvider("anthropic", { PI_CACHE_RETENTION: "short" })).toBe(true);
 		expect(isSupportedProvider("anthropic", { PI_CACHE_RETENTION: "long" })).toBe(false);
-		expect(isSupportedProvider("openai-codex", {})).toBe(false);
-		expect(isSupportedProvider("openai", {})).toBe(false);
+		expect(isSupportedProvider("openai-codex", {})).toBe(true);
+		expect(isSupportedProvider("openai", {})).toBe(true);
 		expect(isSupportedProvider("google", {})).toBe(false);
 		expect(isSupportedProvider(undefined, {})).toBe(false);
+
+		// Settings overrides via cacheTtl
+		const customSettings = {
+			cacheTtl: {
+				anthropic: "7m",
+				"openai-codex": "15m",
+				google: "5m",
+				"openai-codex/gpt-5.6-terra": "20m",
+			},
+		};
+		expect(resolveCacheTtlMs("anthropic", "claude-3-7-sonnet", customSettings)).toBe(420_000);
+		expect(resolveCacheTtlMs("openai-codex", "gpt-5.6-sol", customSettings)).toBe(900_000);
+		expect(resolveCacheTtlMs("openai-codex", "gpt-5.6-terra", customSettings)).toBe(1_200_000);
+		expect(resolveCacheTtlMs("google", "gemini-2.5-pro", customSettings)).toBe(300_000);
+		expect(isSupportedProvider("google", {}, customSettings)).toBe(true);
 	});
 
 	it("renderGuardianWidgetContent renders calm state in muted color", () => {
@@ -266,10 +311,107 @@ describe("rbfCacheGuardian extension lifecycle", () => {
 		);
 	});
 
-	it("remains quiet when provider is not direct Anthropic", async () => {
+	it("activates 10m countdown widget for openai-codex on turn 1 when input >= 1024 tokens", async () => {
 		const mockAPI = createMockExtensionAPI();
 		rbfCacheGuardian(mockAPI.api);
 		const mockCtx = createMockExtensionContext({ provider: "openai-codex" });
+
+		const t0 = 1_000_000;
+		setTime(t0);
+
+		await mockAPI.emit("agent_start", {}, mockCtx.ctx);
+		await mockAPI.emit("turn_start", { turnIndex: 0, timestamp: t0 });
+		await mockAPI.emit("before_provider_request", { payload: {} });
+		await mockAPI.emit("after_provider_response", { status: 200, headers: {} });
+
+		// On turn 1, OpenAI reports input tokens but 0 cacheRead/cacheWrite
+		const assistantMessage = {
+			role: "assistant",
+			usage: { input: 28_400, output: 200, cacheRead: 0, cacheWrite: 0 },
+		} as AgentMessage;
+
+		await mockAPI.emit("turn_end", { turnIndex: 0, message: assistantMessage, toolResults: [] }, mockCtx.ctx);
+		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
+
+		expect(mockCtx.setWidgetMock).toHaveBeenCalledWith(
+			WIDGET_KEY,
+			expect.arrayContaining([expect.stringContaining("10:00 TTL [██████████] 28.4k cached")]),
+			{ placement: "belowEditor" },
+		);
+	});
+
+	it("remains quiet for openai-codex on turn 1 when input is below 1024 tokens", async () => {
+		const mockAPI = createMockExtensionAPI();
+		rbfCacheGuardian(mockAPI.api);
+		const mockCtx = createMockExtensionContext({ provider: "openai-codex" });
+
+		const t0 = 1_000_000;
+		setTime(t0);
+
+		await mockAPI.emit("agent_start", {}, mockCtx.ctx);
+		await mockAPI.emit("turn_start", { turnIndex: 0, timestamp: t0 });
+		await mockAPI.emit("before_provider_request", { payload: {} });
+		await mockAPI.emit("after_provider_response", { status: 200, headers: {} });
+
+		const assistantMessage = {
+			role: "assistant",
+			usage: { input: 500, output: 50, cacheRead: 0, cacheWrite: 0 },
+		} as AgentMessage;
+
+		await mockAPI.emit("turn_end", { turnIndex: 0, message: assistantMessage, toolResults: [] }, mockCtx.ctx);
+		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
+
+		expect(mockCtx.setWidgetMock).not.toHaveBeenCalledWith(
+			WIDGET_KEY,
+			expect.any(Array),
+			expect.any(Object),
+		);
+	});
+
+	it("transitions through 30% and 10% thresholds with 60s alert for 10m Codex TTL", async () => {
+		const mockAPI = createMockExtensionAPI();
+		rbfCacheGuardian(mockAPI.api);
+		const mockCtx = createMockExtensionContext({ provider: "openai-codex" });
+
+		const t0 = 1_000_000;
+		setTime(t0);
+
+		await mockAPI.emit("agent_start", {}, mockCtx.ctx);
+		await mockAPI.emit("turn_start", { turnIndex: 0, timestamp: t0 });
+		await mockAPI.emit("before_provider_request", { payload: {} });
+		await mockAPI.emit("after_provider_response", { status: 200, headers: {} });
+
+		const assistantMessage = {
+			role: "assistant",
+			usage: { input: 100, output: 200, cacheRead: 28_400, cacheWrite: 0 },
+		} as AgentMessage;
+
+		await mockAPI.emit("turn_end", { turnIndex: 0, message: assistantMessage, toolResults: [] }, mockCtx.ctx);
+		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
+
+		// Initial render at T0 (10:00 TTL): Calm state
+		expect(mockCtx.theme.fg).toHaveBeenCalledWith("muted", "10:00 TTL [██████████] 28.4k cached");
+
+		// Advance to 450s after T0 (150s remaining = 2:30, which is <= 30% / 3:00): Warning state
+		advanceTime(450_000);
+		expect(mockCtx.theme.fg).toHaveBeenCalledWith("warning", "⚠️ 2:30 TTL [██░░░░░░░░] 28.4k cached");
+		expect(mockCtx.notifyMock).not.toHaveBeenCalled();
+
+		// Advance to 550s after T0 (50s remaining = 0:50, which is <= 10% / 1:00): Critical state
+		advanceTime(100_000);
+		expect(mockCtx.theme.fg).toHaveBeenCalledWith("error", "🚨 0:50 TTL [░░░░░░░░░░] 28.4k cached");
+		expect(mockCtx.notifyMock).toHaveBeenCalledTimes(1);
+		expect(mockCtx.notifyMock).toHaveBeenCalledWith("Prompt cache guarantee ends in 60s · 28.4k cached", "warning");
+		expect(mockAPI.execMock).toHaveBeenCalledWith(
+			"/usr/bin/osascript",
+			["-e", expect.stringContaining("Prompt cache guarantee ends in 60s · 28.4k cached")],
+		);
+	});
+
+	it("remains quiet when provider is unconfigured", async () => {
+		const mockAPI = createMockExtensionAPI();
+		rbfCacheGuardian(mockAPI.api);
+		const mockCtx = createMockExtensionContext({ provider: "google" });
 
 		const t0 = 1_000_000;
 		setTime(t0);
