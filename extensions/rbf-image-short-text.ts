@@ -1,4 +1,3 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,7 +6,8 @@ import type {
 	InputEvent,
 	InputEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { Editor } from "@earendil-works/pi-tui";
 
 export interface ImageContent {
 	type: "image";
@@ -16,7 +16,10 @@ export interface ImageContent {
 }
 
 export const PATCHED_SYMBOL = Symbol.for("rbf.imageShortText.patched");
+export const EDITOR_PATCHED_SYMBOL = Symbol.for("rbf.imageShortText.editorPatched");
 export const ACTIVE_MANAGER_SYMBOL = Symbol.for("rbf.imageShortText.activeManager");
+export const ORIGINAL_PASTE_KEY = Symbol.for("rbf.imageShortText.originalHandlePaste");
+export const ORIGINAL_INSERT_KEY = Symbol.for("rbf.imageShortText.originalInsertTextAtCursor");
 
 export interface ImageEntry {
 	chip: string;
@@ -25,24 +28,75 @@ export interface ImageEntry {
 	data: string; // base64
 }
 
+export function normalizePastedPath(input: string): string {
+	if (typeof input !== "string") {
+		return "";
+	}
+	let s = input.trim();
+	// Strip surrounding double or single quotes
+	if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+		s = s.slice(1, -1).trim();
+	}
+	// Strip file:// scheme if present
+	if (s.startsWith("file://")) {
+		try {
+			s = decodeURIComponent(new URL(s).pathname);
+		} catch {
+			s = decodeURIComponent(s.slice(7));
+		}
+	}
+	// Unescape terminal-escaped spaces (e.g. "/path/to/my\ image.png")
+	s = s.replace(/\\ /g, " ");
+	return s;
+}
+
 export function isClipboardImageFile(filePath: string): boolean {
-	if (typeof filePath !== "string" || !filePath) {
+	if (typeof filePath !== "string" || !filePath.trim()) {
 		return false;
 	}
-	const fileName = path.basename(filePath);
-	if (!fileName.startsWith("pi-clipboard-")) {
+	// Reject multi-line text (pasting text or code blocks that mention paths)
+	if (filePath.includes("\n") || filePath.includes("\r")) {
 		return false;
 	}
-	if (!/\.(png|jpe?g|webp|gif)$/i.test(fileName)) {
+	const cleaned = normalizePastedPath(filePath);
+	if (!cleaned) {
 		return false;
 	}
-	const tmpDir = os.tmpdir();
-	const dir = path.dirname(filePath);
-	if (path.resolve(dir) !== path.resolve(tmpDir)) {
+	const fileName = path.basename(cleaned);
+	if (!fileName.startsWith("clipboard-") && !fileName.startsWith("pi-clipboard-")) {
 		return false;
 	}
+	const ext = path.extname(cleaned).toLowerCase();
+	if (![".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext)) {
+		return false;
+	}
+
+	const resolvedPath = path.resolve(cleaned);
+	const resolvedTmp = path.resolve(os.tmpdir());
+	const dir = path.dirname(resolvedPath);
+
+	const isInTempDir =
+		dir === resolvedTmp ||
+		resolvedPath.startsWith(resolvedTmp + path.sep) ||
+		resolvedPath.startsWith("/tmp/") ||
+		resolvedPath.startsWith("/private/tmp/") ||
+		resolvedPath.startsWith("/var/tmp/") ||
+		resolvedPath.startsWith("/var/folders/");
+
+	if (!isInTempDir) {
+		return false;
+	}
+
 	try {
-		return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+		const stat = fs.statSync(cleaned);
+		if (!stat.isFile() || stat.size === 0) {
+			return false;
+		}
+		// Max file size: 25MB to prevent Node OOM
+		if (stat.size > 25 * 1024 * 1024) {
+			return false;
+		}
+		return true;
 	} catch {
 		return false;
 	}
@@ -100,22 +154,29 @@ export class ImageShortTextManager {
 		this.activeImages.clear();
 	}
 
-	public handlePaste(insertedPath: string, currentEditorText: string): { chip: string; entry: ImageEntry } | null {
-		if (!isClipboardImageFile(insertedPath)) {
+	public handlePaste(pastedText: string, currentText: string): { chip: string; entry: ImageEntry } | null {
+		if (!isClipboardImageFile(pastedText)) {
 			return null;
 		}
-
+		const filePath = normalizePastedPath(pastedText);
+		const chip = allocateNextChip(currentText);
+		const mimeType = extractMimeType(filePath);
+		let data: string;
 		try {
-			const bytes = fs.readFileSync(insertedPath);
-			const mimeType = extractMimeType(insertedPath);
-			const data = bytes.toString("base64");
-			const chip = allocateNextChip(currentEditorText);
-			const entry: ImageEntry = { chip, filePath: insertedPath, mimeType, data };
-			this.activeImages.set(chip, entry);
-			return { chip, entry };
+			const buffer = fs.readFileSync(filePath);
+			data = buffer.toString("base64");
 		} catch {
 			return null;
 		}
+
+		const entry: ImageEntry = {
+			chip,
+			filePath,
+			mimeType,
+			data,
+		};
+		this.registerImage(chip, entry);
+		return { chip, entry };
 	}
 
 	public transformInput(text: string): { action: "transform"; text: string; images: ImageContent[] } | null {
@@ -154,16 +215,103 @@ export class ImageShortTextManager {
 }
 
 export function setActiveManager(manager: ImageShortTextManager | undefined): void {
-	if (typeof InteractiveMode !== "undefined") {
-		(InteractiveMode as any)[ACTIVE_MANAGER_SYMBOL] = manager;
-	}
+	(globalThis as any)[ACTIVE_MANAGER_SYMBOL] = manager;
 }
 
 export function getActiveManager(): ImageShortTextManager | undefined {
-	if (typeof InteractiveMode !== "undefined") {
-		return (InteractiveMode as any)[ACTIVE_MANAGER_SYMBOL];
+	return (globalThis as any)[ACTIVE_MANAGER_SYMBOL];
+}
+
+export function patchEditorPaste(): void {
+	const protos: any[] = [];
+	if (typeof Editor !== "undefined" && Editor?.prototype) {
+		protos.push(Editor.prototype);
 	}
-	return undefined;
+	if (typeof CustomEditor !== "undefined" && CustomEditor?.prototype) {
+		protos.push(CustomEditor.prototype);
+	}
+
+	for (const proto of protos) {
+		if (proto[EDITOR_PATCHED_SYMBOL]) {
+			continue;
+		}
+		proto[EDITOR_PATCHED_SYMBOL] = true;
+
+		const originalHandlePaste = proto.handlePaste;
+		if (typeof originalHandlePaste === "function") {
+			proto[ORIGINAL_PASTE_KEY] = originalHandlePaste;
+			proto.handlePaste = function (this: any, pastedText: string): void {
+				const manager = getActiveManager();
+				if (!manager || typeof pastedText !== "string") {
+					return originalHandlePaste.call(this, pastedText);
+				}
+
+				const currentText = typeof this.getText === "function" ? this.getText() : "";
+				const result = manager.handlePaste(pastedText, currentText);
+				if (result) {
+					// Check if a space is needed before the chip
+					const currentLine = this.state?.lines?.[this.state.cursorLine] ?? "";
+					const charBeforeCursor = this.state?.cursorCol > 0 ? currentLine[this.state.cursorCol - 1] : "";
+					let chipToInsert = result.chip;
+					if (charBeforeCursor && /\w/.test(charBeforeCursor)) {
+						chipToInsert = ` ${chipToInsert}`;
+					}
+					return originalHandlePaste.call(this, chipToInsert);
+				}
+
+				return originalHandlePaste.call(this, pastedText);
+			};
+		}
+
+		const originalInsertTextAtCursor = proto.insertTextAtCursor;
+		if (typeof originalInsertTextAtCursor === "function") {
+			proto[ORIGINAL_INSERT_KEY] = originalInsertTextAtCursor;
+			proto.insertTextAtCursor = function (this: any, text: string): void {
+				const manager = getActiveManager();
+				if (!manager || typeof text !== "string") {
+					return originalInsertTextAtCursor.call(this, text);
+				}
+
+				const currentText = typeof this.getText === "function" ? this.getText() : "";
+				const result = manager.handlePaste(text, currentText);
+				if (result) {
+					const currentLine = this.state?.lines?.[this.state.cursorLine] ?? "";
+					const charBeforeCursor = this.state?.cursorCol > 0 ? currentLine[this.state.cursorCol - 1] : "";
+					let chipToInsert = result.chip;
+					if (charBeforeCursor && /\w/.test(charBeforeCursor)) {
+						chipToInsert = ` ${chipToInsert}`;
+					}
+					return originalInsertTextAtCursor.call(this, chipToInsert);
+				}
+
+				return originalInsertTextAtCursor.call(this, text);
+			};
+		}
+	}
+}
+
+export function unpatchEditorPaste(): void {
+	const protos: any[] = [];
+	if (typeof Editor !== "undefined" && Editor?.prototype) {
+		protos.push(Editor.prototype);
+	}
+	if (typeof CustomEditor !== "undefined" && CustomEditor?.prototype) {
+		protos.push(CustomEditor.prototype);
+	}
+
+	for (const proto of protos) {
+		const origPaste = proto[ORIGINAL_PASTE_KEY];
+		if (origPaste) {
+			proto.handlePaste = origPaste;
+			delete proto[ORIGINAL_PASTE_KEY];
+		}
+		const origInsert = proto[ORIGINAL_INSERT_KEY];
+		if (origInsert) {
+			proto.insertTextAtCursor = origInsert;
+			delete proto[ORIGINAL_INSERT_KEY];
+		}
+		delete proto[EDITOR_PATCHED_SYMBOL];
+	}
 }
 
 export function patchInteractiveModePaste(): void {
@@ -180,6 +328,7 @@ export function patchInteractiveModePaste(): void {
 	}
 
 	(InteractiveMode.prototype as any)[PATCHED_SYMBOL] = true;
+	(InteractiveMode.prototype as any)[Symbol.for("rbf.imageShortText.origInteractivePaste")] = originalHandleClipboardPaste;
 
 	(InteractiveMode.prototype as any).handleClipboardPaste = async function (this: any) {
 		const manager = getActiveManager();
@@ -212,10 +361,23 @@ export function patchInteractiveModePaste(): void {
 	};
 }
 
+export function unpatchInteractiveModePaste(): void {
+	if (typeof InteractiveMode === "undefined" || !InteractiveMode || !InteractiveMode.prototype) {
+		return;
+	}
+	const orig = (InteractiveMode.prototype as any)[Symbol.for("rbf.imageShortText.origInteractivePaste")];
+	if (orig) {
+		(InteractiveMode.prototype as any).handleClipboardPaste = orig;
+		delete (InteractiveMode.prototype as any)[Symbol.for("rbf.imageShortText.origInteractivePaste")];
+	}
+	delete (InteractiveMode.prototype as any)[PATCHED_SYMBOL];
+}
+
 export default function rbfImageShortText(pi: ExtensionAPI): void {
 	const manager = new ImageShortTextManager();
 	setActiveManager(manager);
 	patchInteractiveModePaste();
+	patchEditorPaste();
 
 	pi.on("input", async (event: InputEvent): Promise<InputEventResult> => {
 		const result = manager.transformInput(event.text);
@@ -245,6 +407,7 @@ export default function rbfImageShortText(pi: ExtensionAPI): void {
 	pi.on("session_start", () => {
 		manager.clear();
 		setActiveManager(manager);
+		patchEditorPaste();
 	});
 
 	pi.on("session_shutdown", () => {

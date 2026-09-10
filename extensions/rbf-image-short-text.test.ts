@@ -8,18 +8,24 @@ import type {
 	InputEvent,
 	InputEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { Editor } from "@earendil-works/pi-tui";
 import rbfImageShortText, {
 	ACTIVE_MANAGER_SYMBOL,
 	allocateNextChip,
+	EDITOR_PATCHED_SYMBOL,
 	extractMimeType,
 	getActiveManager,
 	type ImageContent,
 	ImageShortTextManager,
 	isClipboardImageFile,
+	normalizePastedPath,
 	PATCHED_SYMBOL,
+	patchEditorPaste,
 	patchInteractiveModePaste,
 	setActiveManager,
+	unpatchEditorPaste,
+	unpatchInteractiveModePaste,
 } from "./rbf-image-short-text.ts";
 
 function createMockExtensionAPI() {
@@ -126,6 +132,18 @@ describe("Pure helpers", () => {
 			expect(isClipboardImageFile(localPath)).toBe(false);
 		});
 
+		it("returns true for terminal-generated clipboard-YYYY-MM-DD image in tmpdir", () => {
+			const fileName = `clipboard-2026-09-09-232826-${crypto.randomUUID().slice(0, 8)}.png`;
+			const filePath = path.join(os.tmpdir(), fileName);
+			fs.writeFileSync(filePath, Buffer.from("fake png data"));
+			tmpFiles.push(filePath);
+
+			expect(isClipboardImageFile(filePath)).toBe(true);
+			// Also accepts wrapped in quotes
+			expect(isClipboardImageFile(`"${filePath}"`)).toBe(true);
+			expect(isClipboardImageFile(`'${filePath}'`)).toBe(true);
+		});
+
 		it("returns false for non-clipboard filenames in tmpdir", () => {
 			const regularFile = path.join(os.tmpdir(), `regular-image-${crypto.randomUUID()}.png`);
 			fs.writeFileSync(regularFile, Buffer.from("data"));
@@ -142,10 +160,38 @@ describe("Pure helpers", () => {
 			expect(isClipboardImageFile(txtFile)).toBe(false);
 		});
 
+		it("returns false for multi-line inputs", () => {
+			const filePath = path.join(os.tmpdir(), `pi-clipboard-${crypto.randomUUID()}.png`);
+			fs.writeFileSync(filePath, Buffer.from("fake png data"));
+			tmpFiles.push(filePath);
+
+			expect(isClipboardImageFile(`Here is some text\n${filePath}`)).toBe(false);
+		});
+
 		it("returns false for invalid inputs", () => {
 			expect(isClipboardImageFile("")).toBe(false);
 			expect(isClipboardImageFile(null as any)).toBe(false);
 			expect(isClipboardImageFile(undefined as any)).toBe(false);
+		});
+	});
+
+	describe("normalizePastedPath", () => {
+		it("strips double and single quotes", () => {
+			expect(normalizePastedPath('"/tmp/image.png"')).toBe("/tmp/image.png");
+			expect(normalizePastedPath("'/tmp/image.png'")).toBe("/tmp/image.png");
+		});
+
+		it("strips file:// schema and decodes URI", () => {
+			expect(normalizePastedPath("file:///tmp/image.png")).toBe("/tmp/image.png");
+			expect(normalizePastedPath("file:///tmp/my%20image.png")).toBe("/tmp/my image.png");
+		});
+
+		it("unescapes terminal-escaped spaces", () => {
+			expect(normalizePastedPath("/tmp/my\\ image.png")).toBe("/tmp/my image.png");
+		});
+
+		it("trims surrounding whitespace", () => {
+			expect(normalizePastedPath("  /tmp/image.png  ")).toBe("/tmp/image.png");
 		});
 	});
 });
@@ -507,5 +553,150 @@ describe("InteractiveMode monkey-patching", () => {
 
 		await simulateTextPaste("Plain text from clipboard");
 		expect(insertedValue).toBe("Plain text from clipboard");
+	});
+});
+
+describe("Editor & CustomEditor monkey-patching", () => {
+	const tmpFiles: string[] = [];
+
+	beforeEach(() => {
+		unpatchEditorPaste();
+	});
+
+	afterEach(() => {
+		unpatchEditorPaste();
+		setActiveManager(undefined);
+		for (const f of tmpFiles) {
+			try {
+				if (fs.existsSync(f)) {
+					fs.unlinkSync(f);
+				}
+			} catch {}
+		}
+		tmpFiles.length = 0;
+	});
+
+	it("patches Editor and CustomEditor prototype handlePaste and insertTextAtCursor", () => {
+		patchEditorPaste();
+		expect((Editor.prototype as any)[EDITOR_PATCHED_SYMBOL]).toBe(true);
+		expect((CustomEditor.prototype as any)[EDITOR_PATCHED_SYMBOL]).toBe(true);
+
+		unpatchEditorPaste();
+		expect((Editor.prototype as any)[EDITOR_PATCHED_SYMBOL]).toBeUndefined();
+	});
+
+	it("intercepts terminal paste of clipboard image and inserts [Image #1] chip", () => {
+		const manager = new ImageShortTextManager();
+		setActiveManager(manager);
+		patchEditorPaste();
+
+		const clipboardFile = path.join(os.tmpdir(), `clipboard-2026-09-09-232826-${crypto.randomUUID().slice(0, 8)}.png`);
+		fs.writeFileSync(clipboardFile, Buffer.from("image bytes"));
+		tmpFiles.push(clipboardFile);
+
+		let inserted: string | undefined;
+		const fakeEditor = {
+			getText: vi.fn(() => ""),
+			state: { lines: [""], cursorLine: 0, cursorCol: 0 },
+			cancelAutocomplete: vi.fn(),
+			exitHistoryBrowsing: vi.fn(),
+			pushUndoSnapshot: vi.fn(),
+			lastAction: null,
+			normalizeText: vi.fn((t: string) => t),
+			insertTextAtCursorInternal: vi.fn((t: string) => {
+				inserted = t;
+			}),
+			handlePaste: (Editor.prototype as any).handlePaste,
+		};
+
+		fakeEditor.handlePaste(clipboardFile);
+
+		expect(inserted).toBe("[Image #1]");
+		expect(manager.getActiveEntries()).toHaveLength(1);
+		expect(manager.getActiveEntries()[0].chip).toBe("[Image #1]");
+	});
+
+	it("prepends a space when character before cursor is a word character", () => {
+		const manager = new ImageShortTextManager();
+		setActiveManager(manager);
+		patchEditorPaste();
+
+		const clipboardFile = path.join(os.tmpdir(), `clipboard-2026-09-09-232826-${crypto.randomUUID().slice(0, 8)}.png`);
+		fs.writeFileSync(clipboardFile, Buffer.from("image bytes"));
+		tmpFiles.push(clipboardFile);
+
+		let inserted: string | undefined;
+		const fakeEditor = {
+			getText: vi.fn(() => "Look at"),
+			state: { lines: ["Look at"], cursorLine: 0, cursorCol: 7 },
+			cancelAutocomplete: vi.fn(),
+			exitHistoryBrowsing: vi.fn(),
+			pushUndoSnapshot: vi.fn(),
+			lastAction: null,
+			normalizeText: vi.fn((t: string) => t),
+			insertTextAtCursorInternal: vi.fn((t: string) => {
+				inserted = t;
+			}),
+			handlePaste: (Editor.prototype as any).handlePaste,
+		};
+
+		fakeEditor.handlePaste(clipboardFile);
+
+		expect(inserted).toBe(" [Image #1]");
+	});
+
+	it("passes plain text through handlePaste untouched", () => {
+		const manager = new ImageShortTextManager();
+		setActiveManager(manager);
+		patchEditorPaste();
+
+		let inserted: string | undefined;
+		const fakeEditor = {
+			getText: vi.fn(() => ""),
+			state: { lines: [""], cursorLine: 0, cursorCol: 0 },
+			cancelAutocomplete: vi.fn(),
+			exitHistoryBrowsing: vi.fn(),
+			pushUndoSnapshot: vi.fn(),
+			lastAction: null,
+			normalizeText: vi.fn((t: string) => t),
+			insertTextAtCursorInternal: vi.fn((t: string) => {
+				inserted = t;
+			}),
+			handlePaste: (Editor.prototype as any).handlePaste,
+		};
+
+		fakeEditor.handlePaste("console.log('hello world');");
+
+		expect(inserted).toBe("console.log('hello world');");
+		expect(manager.getActiveEntries()).toHaveLength(0);
+	});
+
+	it("intercepts insertTextAtCursor when clipboard image is passed", () => {
+		const manager = new ImageShortTextManager();
+		setActiveManager(manager);
+		patchEditorPaste();
+
+		const clipboardFile = path.join(os.tmpdir(), `pi-clipboard-${crypto.randomUUID()}.png`);
+		fs.writeFileSync(clipboardFile, Buffer.from("png data"));
+		tmpFiles.push(clipboardFile);
+
+		let inserted: string | undefined;
+		const fakeEditor = {
+			getText: vi.fn(() => ""),
+			state: { lines: [""], cursorLine: 0, cursorCol: 0 },
+			cancelAutocomplete: vi.fn(),
+			exitHistoryBrowsing: vi.fn(),
+			pushUndoSnapshot: vi.fn(),
+			lastAction: null,
+			insertTextAtCursorInternal: vi.fn((t: string) => {
+				inserted = t;
+			}),
+			insertTextAtCursor: (Editor.prototype as any).insertTextAtCursor,
+		};
+
+		fakeEditor.insertTextAtCursor(clipboardFile);
+
+		expect(inserted).toBe("[Image #1]");
+		expect(manager.getActiveEntries()).toHaveLength(1);
 	});
 });
