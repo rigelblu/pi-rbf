@@ -196,9 +196,9 @@ describe("buildSubmissionText", () => {
 		expect(buildSubmissionText(optChip, "   ")).toBe("1. First choice");
 	});
 
-	it("appends 'Add notes to selection:' when notes are provided", () => {
+	it("appends notes directly without prefix when notes are provided", () => {
 		const result = buildSubmissionText(optChip, "make sure tests pass");
-		expect(result).toBe("1. First choice\n\nAdd notes to selection: make sure tests pass");
+		expect(result).toBe("1. First choice\n\nmake sure tests pass");
 	});
 
 	it("handles write-in option", () => {
@@ -209,7 +209,7 @@ describe("buildSubmissionText", () => {
 	it("handles canned reply with and without notes", () => {
 		expect(buildSubmissionText(cannedChip, "")).toBe("/skill:convo-is-very-best");
 		expect(buildSubmissionText(cannedChip, "focus on edge cases")).toBe(
-			"/skill:convo-is-very-best\n\nAdd notes to selection: focus on edge cases",
+			"/skill:convo-is-very-best\n\nfocus on edge cases",
 		);
 	});
 });
@@ -217,12 +217,18 @@ describe("buildSubmissionText", () => {
 // ─── renderQuestionFormLines ────────────────────────────────────────────────
 
 describe("renderQuestionFormLines", () => {
-	const mockTheme: any = {
+	const mockThemeWithAnsi: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+		getFgAnsi: (color: string) => (color === "borderAccent" ? "\x1b[38;2;86;148;159m" : "\x1b[38;2;40;105;131m"),
+	};
+
+	const mockThemeFallback: any = {
 		fg: (_color: string, text: string) => text,
 		bold: (text: string) => text,
 	};
 
-	it("renders dark background and light text for active selection", () => {
+	it("renders theme borderAccent background and light text for active selection", () => {
 		const chips = [
 			{ key: "1", type: "option" as const, label: "1" },
 			{ key: "2", type: "option" as const, label: "2" },
@@ -234,20 +240,38 @@ describe("renderQuestionFormLines", () => {
 				focus: "options",
 				notesText: "",
 				notesCursorPos: 0,
-				theme: mockTheme,
+				theme: mockThemeWithAnsi,
 			},
 			80,
 		);
 
 		const joined = lines.join("\n");
-		// Active chip 1 has dark background ANSI code
-		expect(joined).toContain("\x1b[48;5;236m\x1b[1;38;5;255m 1 \x1b[0m");
+		// Active chip 1 has theme borderAccent background ANSI code (converted to 48;)
+		expect(joined).toContain("\x1b[48;2;86;148;159m\x1b[1;38;5;255m 1 \x1b[0m");
 		// Unselected chip 2 has brackets
 		expect(joined).toContain("[ 2 ]");
 		// Top border has Select Answer
 		expect(joined).toContain("Select Answer");
 		// Has notes label
 		expect(joined).toContain("Add notes to selection:");
+	});
+
+	it("falls back to inverse when theme lacks getFgAnsi", () => {
+		const chips = [{ key: "1", type: "option" as const, label: "1" }];
+		const lines = renderQuestionFormLines(
+			{
+				chips,
+				selectedChipIndex: 0,
+				focus: "options",
+				notesText: "",
+				notesCursorPos: 0,
+				theme: mockThemeFallback,
+			},
+			80,
+		);
+
+		const joined = lines.join("\n");
+		expect(joined).toContain("\x1b[7m\x1b[1m 1 \x1b[0m");
 	});
 
 	it("renders cursor and typed notes when focus is on notes", () => {
@@ -259,7 +283,7 @@ describe("renderQuestionFormLines", () => {
 				focus: "notes",
 				notesText: "hello",
 				notesCursorPos: 5,
-				theme: mockTheme,
+				theme: mockThemeWithAnsi,
 			},
 			80,
 		);
@@ -315,7 +339,7 @@ describe("createQuestionFormComponent input handling", () => {
 		// Submit with Enter
 		comp.handleInput("\r");
 
-		expect(done).toHaveBeenCalledWith("1. Alpha\n\nAdd notes to selection: hi");
+		expect(done).toHaveBeenCalledWith("1. Alpha\n\nhi");
 	});
 
 	it("clears notes on Esc first, then dismisses on second Esc", () => {
@@ -495,7 +519,7 @@ describe("rbfQuestionForm extension integration & commands", () => {
 		await answerPromise;
 
 		expect(mockAPI.sendUserMessageMock).toHaveBeenCalledWith(
-			"1. Fast strategy ← recommended\n\nAdd notes to selection: urgent",
+			"1. Fast strategy ← recommended\n\nurgent",
 		);
 	});
 

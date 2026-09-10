@@ -184,7 +184,7 @@ export function buildSubmissionText(chip: QuestionChip, notes: string): string {
 	if (chip.type === "canned") {
 		const cmd = chip.cannedCommand ?? "/skill:convo-is-very-best";
 		if (!trimmedNotes) return cmd;
-		return `${cmd}\n\nAdd notes to selection: ${trimmedNotes}`;
+		return `${cmd}\n\n${trimmedNotes}`;
 	}
 
 	if (chip.type === "write-in") {
@@ -194,14 +194,69 @@ export function buildSubmissionText(chip: QuestionChip, notes: string): string {
 
 	const baseText = chip.fullText ?? chip.label;
 	if (!trimmedNotes) return baseText;
-	return `${baseText}\n\nAdd notes to selection: ${trimmedNotes}`;
+	return `${baseText}\n\n${trimmedNotes}`;
 }
 
-const BLUE_BORDER = "\x1b[38;5;75m";
-const RESET_COLOR = "\x1b[0m";
+/**
+ * Retrieve active theme from Pi's global symbol registration or package export.
+ */
+export function getActiveTheme(): any {
+	if (typeof globalThis !== "undefined") {
+		const globalTheme =
+			(globalThis as any)[Symbol.for("@earendil-works/pi-coding-agent:theme")] ??
+			(globalThis as any)[Symbol.for("@mariozechner/pi-coding-agent:theme")];
+		if (globalTheme) return globalTheme;
+	}
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		const { theme } = require("@earendil-works/pi-coding-agent");
+		if (theme) return theme;
+	} catch {
+		// ignore
+	}
+	return undefined;
+}
 
-function styleBlue(text: string): string {
-	return `${BLUE_BORDER}${text}${RESET_COLOR}`;
+/**
+ * Style borders and labels using the active theme's border color.
+ */
+export function styleBorder(theme: any, text: string): string {
+	const activeTheme = theme ?? getActiveTheme();
+	if (typeof activeTheme?.fg === "function") {
+		try {
+			return activeTheme.fg("border", text);
+		} catch {
+			// fallback
+		}
+	}
+	return `\x1b[38;5;75m${text}\x1b[0m`;
+}
+
+/**
+ * Render active chip using theme colors.
+ * Converts borderAccent (foam in rose-pine-dawn, #56949f) into a pill background with light text.
+ */
+export function renderActiveChip(theme: any, label: string): string {
+	const activeTheme = theme ?? getActiveTheme();
+	if (typeof activeTheme?.getFgAnsi === "function") {
+		try {
+			const fgAnsi = activeTheme.getFgAnsi("borderAccent");
+			if (fgAnsi) {
+				const bgAnsi = fgAnsi.replace("[38;", "[48;");
+				return `${bgAnsi}\x1b[1;38;5;255m ${label} \x1b[0m`;
+			}
+		} catch {
+			// fallback
+		}
+	}
+	if (typeof activeTheme?.bg === "function") {
+		try {
+			return activeTheme.bg("selectedBg", ` ${label} `);
+		} catch {
+			// fallback
+		}
+	}
+	return `\x1b[7m\x1b[1m ${label} \x1b[0m`;
 }
 
 // ─── Component Rendering ────────────────────────────────────────────────────
@@ -211,19 +266,18 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	const renderWidth = Math.max(20, width);
 	const lines: string[] = [];
 
-	// Top border (neutral blue)
+	// Top border (theme border color)
 	const title = " Select Answer ";
 	const borderDashCount = Math.max(0, renderWidth - title.length - 1);
-	lines.push(styleBlue("─" + title + "─".repeat(borderDashCount)));
+	lines.push(styleBorder(theme, "─" + title + "─".repeat(borderDashCount)));
 
 	// Chips row
 	const chipRenders = chips.map((chip, idx) => {
 		const isSelected = idx === selectedChipIndex;
 		if (isSelected) {
-			// Dark background and light text for active selection
-			return `\x1b[48;5;236m\x1b[1;38;5;255m ${chip.label} \x1b[0m`;
+			return renderActiveChip(theme, chip.label);
 		}
-		return theme.fg("muted", `[ ${chip.label} ]`);
+		return theme?.fg ? theme.fg("muted", `[ ${chip.label} ]`) : `[ ${chip.label} ]`;
 	});
 	lines.push(`  ${chipRenders.join("   ")}`);
 	lines.push("");
@@ -235,20 +289,22 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 		const atCursor = notesText.slice(notesCursorPos, notesCursorPos + 1) || " ";
 		const afterCursor = notesText.slice(notesCursorPos + 1);
 		const cursorChar = `\x1b[7m${atCursor}\x1b[0m`;
-		lines.push(styleBlue(notesLabel) + beforeCursor + cursorChar + afterCursor);
+		lines.push(styleBorder(theme, notesLabel) + beforeCursor + cursorChar + afterCursor);
 	} else {
-		const displayNotes = notesText ? theme.fg("text", notesText) : theme.fg("dim", "(optional, press Tab or ↓ to type)");
-		lines.push(styleBlue(notesLabel) + displayNotes);
+		const displayNotes = notesText
+			? (theme?.fg ? theme.fg("text", notesText) : notesText)
+			: (theme?.fg ? theme.fg("dim", "(optional, press Tab or ↓ to type)") : "(optional, press Tab or ↓ to type)");
+		lines.push(styleBorder(theme, notesLabel) + displayNotes);
 	}
 
 	lines.push("");
 
 	// Hint line
 	const hint = "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
-	lines.push(theme.fg("dim", hint));
+	lines.push(theme?.fg ? theme.fg("dim", hint) : hint);
 
-	// Bottom border (neutral blue)
-	lines.push(styleBlue("─".repeat(renderWidth)));
+	// Bottom border (theme border color)
+	lines.push(styleBorder(theme, "─".repeat(renderWidth)));
 
 	return lines;
 }
