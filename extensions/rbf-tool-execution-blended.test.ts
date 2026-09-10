@@ -5,7 +5,6 @@ import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-age
 import { Box, Text } from "@earendil-works/pi-tui";
 import rbfToolExecutionBlended, {
 	applyToolExecutionBlended,
-	getBaseBgFn,
 	restoreToolExecutionBlended,
 	TOOL_EXECUTION_BLENDED_KEY,
 } from "./rbf-tool-execution-blended.ts";
@@ -75,7 +74,7 @@ describe("rbf-tool-execution-blended extension", () => {
 		expect(lines[1]).not.toMatch(/\x1b\[4\d/);
 	});
 
-	it("applyToolExecutionBlended() applies Rose Pine base background and paddingY = 0 to file tools (read, edit, write) in collapsed mode", () => {
+	it("applyToolExecutionBlended() makes file tools (read, edit, write) transparent with paddingY = 0 in collapsed mode", () => {
 		applyToolExecutionBlended();
 
 		for (const toolName of ["read", "edit", "write"]) {
@@ -91,13 +90,12 @@ describe("rbf-tool-execution-blended extension", () => {
 
 			const contentBox = (comp as any).contentBox as any;
 			expect(contentBox.paddingY).toBe(0);
-			expect(contentBox.bgFn).toBeDefined();
+			expect(contentBox.bgFn).toBeUndefined();
 
-			// Compact 2 lines (1 spacer + 1 content line) with base background
+			// Compact 2 lines (1 spacer + 1 content line) with transparent background
 			const lines = comp.render(80);
 			expect(lines.length).toBe(2);
-			// Content line contains background ANSI code
-			expect(lines[1]).toMatch(/\x1b\[4/);
+			expect(lines[1]).not.toMatch(/\x1b\[4/);
 		}
 	});
 
@@ -283,19 +281,7 @@ describe("rbf-tool-execution-blended extension", () => {
 			"/cwd",
 		);
 		expect(((compRead as any).contentBox as any).paddingY).toBe(0);
-		expect(((compRead as any).contentBox as any).bgFn).toBeDefined();
-	});
-
-	it("getBaseBgFn returns correct Rosé Pine base color ANSI codes", () => {
-		const dawnTheme = { name: "rose-pine-dawn", getColorMode: () => "truecolor" };
-		const moonTheme = { name: "rose-pine-moon", getColorMode: () => "truecolor" };
-		const mainTheme = { name: "rose-pine", getColorMode: () => "truecolor" };
-		const dawn256 = { name: "rose-pine-dawn", getColorMode: () => "256color" };
-
-		expect(getBaseBgFn(dawnTheme)("text")).toContain("250;244;237m");
-		expect(getBaseBgFn(moonTheme)("text")).toContain("35;33;54m");
-		expect(getBaseBgFn(mainTheme)("text")).toContain("25;23;36m");
-		expect(getBaseBgFn(dawn256)("text")).toContain("48;5;255m");
+		expect(((compRead as any).contentBox as any).bgFn).toBeUndefined();
 	});
 
 	it("source code contains no unauthorized sinks or network/child_process imports", () => {

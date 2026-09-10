@@ -10,7 +10,6 @@ import rbfEditGlance, {
 	EDIT_GLANCE_PATCHED_KEY,
 	formatEditSummaryLine,
 	formatGlanceDiff,
-	getBaseBgFn,
 	getDiffBgAnsi,
 	isLightTheme,
 	parseDiffLine,
@@ -279,7 +278,7 @@ describe("rbf-edit-glance ToolExecutionComponent patching", () => {
 		restoreEditGlance();
 	});
 
-	it("applyEditGlance() sets callComponent padding to 0 and unsets bgFn", () => {
+	it("applyEditGlance() keeps the edit container transparent with zero padding", () => {
 		applyEditGlance();
 
 		const diff = [
@@ -303,7 +302,7 @@ describe("rbf-edit-glance ToolExecutionComponent patching", () => {
 		expect(callComp).toBeDefined();
 		expect(callComp.paddingY).toBe(0);
 		expect(callComp.paddingX).toBe(0);
-		expect(callComp.bgFn).toBeDefined();
+		expect(callComp.bgFn).toBeUndefined();
 
 		const rendered = comp.render(80);
 		const fullText = stripAnsi(rendered.join("\n"));
@@ -403,18 +402,6 @@ describe("rbf-edit-glance ToolExecutionComponent patching", () => {
 	it("default export rbfEditGlance applies the patch", () => {
 		rbfEditGlance();
 		expect((ToolExecutionComponent.prototype as any)[EDIT_GLANCE_PATCHED_KEY]).toBe(true);
-	});
-
-	it("getBaseBgFn returns correct Rosé Pine base color ANSI codes", () => {
-		const dawnTheme = { name: "rose-pine-dawn", getColorMode: () => "truecolor" };
-		const moonTheme = { name: "rose-pine-moon", getColorMode: () => "truecolor" };
-		const mainTheme = { name: "rose-pine", getColorMode: () => "truecolor" };
-		const dawn256 = { name: "rose-pine-dawn", getColorMode: () => "256color" };
-
-		expect(getBaseBgFn(dawnTheme)("text")).toContain("250;244;237m");
-		expect(getBaseBgFn(moonTheme)("text")).toContain("35;33;54m");
-		expect(getBaseBgFn(mainTheme)("text")).toContain("25;23;36m");
-		expect(getBaseBgFn(dawn256)("text")).toContain("48;5;255m");
 	});
 
 	it("source code contains no unauthorized sinks or network/child_process imports", () => {
