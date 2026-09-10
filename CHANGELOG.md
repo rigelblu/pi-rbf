@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.10.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see on my status line what I see in claude code (#pi-17)
+
+---
+
 # 🔵⋯ v0.9.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat | see when prompt cache reuse is no longer guaranteed (#pi-15.1)
