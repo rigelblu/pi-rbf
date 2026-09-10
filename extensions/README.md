@@ -298,3 +298,37 @@ Local Pi extension that provides inline syntax highlighting for registered slash
 - Global installation: `cp ./extensions/rbf-standout-commands.ts ~/.pi/agent/extensions/rbf-standout-commands.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-standout-commands.ts`
 
+---
+
+# 🔵⋯ rbf-vim
+
+## 🟠⋯ Overview
+Local Pi extension that adds familiar Vim modal navigation and editing in Pi's prompt input, toggleable via `/vim`, with zero external dependencies, persistent settings, bottom-border mode badge, and strict double-`Esc` safety.
+
+## 🟠⋯ Capabilities & Behavior
+- Modal State Machine: Starts in `insert` mode by default for standard typing. Pressing `Esc` transitions to `normal` mode.
+- Strict Double-`Esc` Safety: Swallows `Esc` in `normal` mode, clearing pending operators/counts without ever calling `super.handleInput` or triggering `app.interrupt` (preventing accidental agent aborts). When autocomplete dropdown is open, `Esc` dismisses autocomplete first.
+- Direct Enter Submission: Pressing `Enter` in either `insert` or `normal` mode immediately submits the prompt.
+- Full Motion Vocabulary:
+  - Character navigation: `h`, `j`, `k`, `l` (plus arrow keys)
+  - Word motions: `w` (forward word start), `b` (backward word start), `e` (word end)
+  - Line boundaries: `0` (column 0), `^` (first non-blank), `$` (end of line)
+  - Buffer boundaries: `gg` (first line), `G` (last line)
+  - Character find: `f<char>` (find forward), `F<char>` (find backward), `;` (repeat find), `,` (reverse find)
+- Full Operator & Verb Vocabulary:
+  - Deletion: `x` (char under cursor), `X` (backspace), `dd` (delete line), `dw` / `de` (delete word forward), `db` (delete word backward), `D` / `d$` (delete to line end), `d0` / `d^` (delete to line start)
+  - Change: `cc` (clear line & enter insert), `cw` / `ce` (change word), `cb` (change word backward), `C` / `c$` (change to line end), `c0` / `c^` (change to line start)
+  - Replacement: `r<char>` (replace character under cursor and remain in normal mode)
+  - Undo: `u` (undo last change via editor's undo stack)
+  - Yank & Paste: `yy` (yank line), `yw` (yank word), `y$` (yank to line end), `p` (paste below/after), `P` (paste above/before)
+  - Insertion Entry Points: `i` (insert before cursor), `I` (insert at first non-blank), `a` (append after cursor), `A` (append at end of line), `o` (open newline below), `O` (open newline above)
+  - Count Multipliers: Numerical prefixes (`2w`, `3dd`, `5x`, `2j`) repeat motions and verbs.
+- Bottom Border Mode Badge: Overrides `renderBottomBorder(width, hiddenLineCount)` to embed ` NORMAL ` (yellow) or ` INSERT ` (dim) directly into the bottom frame without layout shifts or colliding with autocomplete popups.
+- Runtime Toggle & Persistence: `/vim` command toggles modal editing on/off (`/vim`, `/vim on`, `/vim off`), persisting `"editorMode": "vim"` directly to `~/.pi/agent/settings.json`.
+- Zero External Dependencies: Built purely using Node standard modules (`node:fs`, `node:path`, `node:os`) and `@earendil-works/*`.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-vim.ts`, type `/vim on` or press `Esc`, and navigate the prompt box using standard vim motions.
+- Global installation: `cp ./extensions/rbf-vim.ts ~/.pi/agent/extensions/rbf-vim.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-vim.ts`
+

@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.14.0 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat (ux) | use vim motions in input box (#pi-18)
+
+---
+
 # 🔵⋯ v0.13.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat (ux) | see skills and slash commands standout in prompt as I type (#pi-14)
