@@ -309,15 +309,19 @@ export default function rbfCacheGuardian(pi: ExtensionAPI): void {
 		const candidate = pendingRequest;
 		pendingRequest = null;
 
-		if (
-			candidate.responseStatus === null ||
-			candidate.responseStatus < 200 ||
-			candidate.responseStatus >= 300
-		) {
+		if (event.message.role !== "assistant") {
 			return;
 		}
 
-		if (event.message.role !== "assistant") {
+		// When using HTTP SSE, responseStatus is populated via after_provider_response.
+		// When using WebSocket transport (e.g. openai-codex), after_provider_response is not emitted,
+		// leaving responseStatus as null. In that case, we rely on the assistant message stopReason.
+		if (
+			(candidate.responseStatus !== null &&
+				(candidate.responseStatus < 200 || candidate.responseStatus >= 300)) ||
+			event.message.stopReason === "error" ||
+			event.message.stopReason === "aborted"
+		) {
 			return;
 		}
 

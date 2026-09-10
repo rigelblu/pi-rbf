@@ -340,6 +340,64 @@ describe("rbfCacheGuardian extension lifecycle", () => {
 		);
 	});
 
+	it("activates 10m countdown widget for openai-codex over WebSocket transport without after_provider_response", async () => {
+		const mockAPI = createMockExtensionAPI();
+		rbfCacheGuardian(mockAPI.api);
+		const mockCtx = createMockExtensionContext({ provider: "openai-codex" });
+
+		const t0 = 1_000_000;
+		setTime(t0);
+
+		await mockAPI.emit("agent_start", {}, mockCtx.ctx);
+		await mockAPI.emit("turn_start", { turnIndex: 0, timestamp: t0 });
+		await mockAPI.emit("before_provider_request", { payload: {} });
+		// Note: WebSocket transport does NOT emit after_provider_response
+
+		const assistantMessage = {
+			role: "assistant",
+			stopReason: "stop",
+			usage: { input: 28_400, output: 200, cacheRead: 0, cacheWrite: 0 },
+		} as AgentMessage;
+
+		await mockAPI.emit("turn_end", { turnIndex: 0, message: assistantMessage, toolResults: [] }, mockCtx.ctx);
+		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
+
+		expect(mockCtx.setWidgetMock).toHaveBeenCalledWith(
+			WIDGET_KEY,
+			expect.arrayContaining([expect.stringContaining("10:00 TTL [██████████] 28.4k cached")]),
+			{ placement: "belowEditor" },
+		);
+	});
+
+	it("discards candidate on WebSocket transport when assistant message stopReason is error or aborted", async () => {
+		const mockAPI = createMockExtensionAPI();
+		rbfCacheGuardian(mockAPI.api);
+		const mockCtx = createMockExtensionContext({ provider: "openai-codex" });
+
+		const t0 = 1_000_000;
+		setTime(t0);
+
+		await mockAPI.emit("agent_start", {}, mockCtx.ctx);
+		await mockAPI.emit("turn_start", { turnIndex: 0, timestamp: t0 });
+		await mockAPI.emit("before_provider_request", { payload: {} });
+		// No after_provider_response
+
+		const assistantMessage = {
+			role: "assistant",
+			stopReason: "error",
+			usage: { input: 28_400, output: 200, cacheRead: 0, cacheWrite: 0 },
+		} as AgentMessage;
+
+		await mockAPI.emit("turn_end", { turnIndex: 0, message: assistantMessage, toolResults: [] }, mockCtx.ctx);
+		await mockAPI.emit("agent_settled", {}, mockCtx.ctx);
+
+		expect(mockCtx.setWidgetMock).not.toHaveBeenCalledWith(
+			WIDGET_KEY,
+			expect.any(Array),
+			expect.any(Object),
+		);
+	});
+
 	it("remains quiet for openai-codex on turn 1 when input is below 1024 tokens", async () => {
 		const mockAPI = createMockExtensionAPI();
 		rbfCacheGuardian(mockAPI.api);
