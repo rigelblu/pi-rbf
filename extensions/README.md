@@ -276,3 +276,25 @@ Local Pi extension that places the prompt cursor exactly where clicked with the 
 - Local verification: launch `pi -e ./extensions/rbf-click-cursor.ts`, type a multiline prompt, and click anywhere in the text to reposition the cursor.
 - Global installation: `cp ./extensions/rbf-click-cursor.ts ~/.pi/agent/extensions/rbf-click-cursor.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-click-cursor.ts`
+
+---
+
+# 🔵⋯ rbf-standout-commands
+
+## 🟠⋯ Overview
+Local Pi extension that provides inline syntax highlighting for registered slash commands (`/clear`, `/model`) and skills (`/skill:<name>`) in the prompt editor as you type, matching Claude Code's visual polish while maintaining strict registry validation and zero shift to prompt borders or cursor mechanics.
+
+## 🟠⋯ Capabilities & Behavior
+- Inline Token Highlighting: recognized slash commands (e.g. `/model`, `/clear`, `/exit`) and `/skill:<name>` tokens highlight in theme link/keyword blue (`mdLink` / `foam` / `pine`) as you type, whether starting a line or appearing inline within a prompt sentence.
+- Strict Registry Validation: only tokens matching explicitly registered built-in slash commands, extension commands, prompt templates, or installed skills are highlighted. Unrecognized tokens (`/not-a-command`) or partial typos remain unstyled plain text.
+- File Path Protection: filesystem paths containing multiple slashes (e.g. `/usr/local/bin`, `/tmp/file.txt`, `src/index.ts`) are never highlighted as commands.
+- Cursor & ANSI Safety: ANSI color codes are applied strictly within visual display strings without altering `visibleWidth` or line padding. Cursors landing inside, before, or after highlighted tokens retain crisp inverse styling (`\x1b[7m...\x1b[0m`) and zero ANSI color leakage.
+- Pi `/skill:` Convention: respects Pi's skill naming convention (`/skill:<name>` and `skill:<name>`).
+- Subclass Inheritance: patches `Editor.prototype.render`, automatically covering both standard `Editor` and `CustomEditor`.
+- Idempotent Lifecycle: provides `applyStandoutCommands()` and `restoreStandoutCommands()` functions keyed with unique symbols for safe loading and unpatching.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-standout-commands.ts`, type `run this /skill:convo-one-at-a-time after` or `/model gpt-5.6-luna`, and observe the vivid blue syntax highlighting.
+- Global installation: `cp ./extensions/rbf-standout-commands.ts ~/.pi/agent/extensions/rbf-standout-commands.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-standout-commands.ts`
+

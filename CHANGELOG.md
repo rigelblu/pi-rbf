@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.13.0 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat (ux) | see skills and slash commands standout in prompt as I type (#pi-14)
+
+---
+
 # 🔵⋯ v0.12.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat (ux) | place the prompt cursor where I click in the prompt editor (#pi-7)

@@ -4,6 +4,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-standout-commands`](extensions/rbf-standout-commands.ts) (v0.13.0) — See skills and slash commands standout in prompt as I type with vivid theme link blue highlighting and strict registry validation.
 - [`rbf-click-cursor`](extensions/rbf-click-cursor.ts) (v0.12.0) — Place the prompt cursor where I click in fullscreen TUI mode with immediate screen repaint and selection prevention.
 - [`rbf-image-short-text`](extensions/rbf-image-short-text.ts) (v0.11.1) — See short text (i.e. `[Image #1]`, `[Image #2]`) for pasted images instead of verbose temp file paths, delivering images natively as multimodal attachments.
 - [`rbf-status-line`](extensions/rbf-status-line.ts) (v0.10.0) — See on my status line what I see in Claude Code (workspace, repository, worktree, agent divergence, branch, commit).
