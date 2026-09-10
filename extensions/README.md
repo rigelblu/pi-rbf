@@ -180,21 +180,28 @@ Local Pi extension that blends skill invocations directly into the terminal back
 # 🔵⋯ rbf-cache-guardian
 
 ## 🟠⋯ Overview
-Local Pi extension that acts as a passive Cache Guardian for prompt-caching providers (starting with Pi's direct-Anthropic path): tracks the documented 5-minute cache window from provider request start, renders a live 1-second countdown below the editor with a 10-pip right-to-left draining battery progress bar, alerts at ≤ 10% remaining (30s), and prompts to `/clear` stale history at 0:00 with Claude Code styled accent text.
+Local Pi extension that acts as a passive Cache Guardian for prompt-caching providers (Anthropic, OpenAI Codex, OpenAI): tracks the cache window from provider request start, renders a live 1-second countdown below the editor with a 10-pip right-to-left draining battery progress bar, alerts at ≤ 10% remaining, and prompts to `/clear` stale history at 0:00 with Claude Code styled accent text.
 
 ## 🟠⋯ Capabilities & Behavior
-- Absolute window tracking: computes deadline from provider request start (`startedAt + 300_000`), accurately accounting for model generation time, tool runs, and sleep/wake jumps
-- Conservative support boundary: supports direct Anthropic short-retention path only; stays quiet when `PI_CACHE_RETENTION=long`, on Codex, or when turns report zero cached tokens
-- Monospace below-editor widget:
-  - Calm (> 30% remaining): muted text `4:12 TTL [████████░░] 182.6k cached`
-  - Warning (≤ 30% remaining, 1:30): yellow warning tint with `⚠️ 1:15 TTL [██░░░░░░░░] 182.6k cached`
-  - Critical (≤ 10% remaining, 0:30): red error tint with `🚨 0:25 TTL [░░░░░░░░░░] 182.6k cached`
+- Configurable cache TTL: resolves TTL from `settings.json` (`cacheTtl`, `cacheTtlMinutes`, or `cacheTtlMs`), supporting provider-level (`"openai-codex": "10m"`) or model-level overrides (`"openai-codex/gpt-5.6-terra": "15m"`), with built-in defaults:
+  - Anthropic: 5 minutes (`300_000` ms)
+  - OpenAI Codex (`openai-codex`): 10 minutes (`600_000` ms)
+  - OpenAI (`openai`): 10 minutes (`600_000` ms)
+- Multi-provider cache accounting:
+  - Anthropic: uses provider-reported `cacheRead + cacheWrite`
+  - OpenAI / Codex: uses provider-reported `cacheRead`; on Turn 1 cold start, automatically detects cached prompt prefix when `usage.input >= 1024` tokens
+- Absolute window tracking: computes deadline from provider request start (`startedAt + totalTtlMs`), accurately accounting for model generation time, tool runs, and sleep/wake jumps
+- Proportional below-editor sensory widget:
+  - Calm (> 30% remaining): muted text `4:12 TTL [████████░░] 182.6k cached` (or `9:45 TTL ...` on 10m)
+  - Warning (≤ 30% remaining): yellow warning tint with `⚠️ 1:15 TTL [██░░░░░░░░] 182.6k cached` (or `⚠️ 2:30 TTL ...` on 10m)
+  - Critical (≤ 10% remaining): red error tint with `🚨 0:25 TTL [░░░░░░░░░░] 182.6k cached` (or `🚨 0:50 TTL ...` on 10m)
   - Elapsed (0:00): Claude Code styled call-to-action `new task? /clear to save 182.6k tokens` with `/clear` and token count highlighted in accent color
-- Dual notifications: triggers one terminal toast (`ctx.ui.notify`) and one macOS desktop notification (`pi.exec` via `/usr/bin/osascript`, with terminal bell fallback) once at the critical ≤ 10% boundary
+- Dual notifications: triggers one terminal toast (`ctx.ui.notify`) and one macOS desktop notification (`pi.exec` via `/usr/bin/osascript`, with terminal bell fallback) once at the critical ≤ 10% boundary (e.g. 30s for 5m TTL, 60s for 10m TTL)
 - Safe lifecycle invalidation: automatically clears timers, advances epochs, and removes the widget on user input, session switch, compaction, tree navigation, model change, or thinking level change
 - Passive operation: makes zero background provider completions and registers no keep-alive commands
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi -e ./extensions/rbf-cache-guardian.ts`, run a prompt against Anthropic, and observe the live countdown below the editor
+- Configuration (optional): add `"cacheTtl": { "anthropic": "5m", "openai-codex": "10m" }` to `~/.pi/agent/settings.json`
+- Local verification: launch `pi -e ./extensions/rbf-cache-guardian.ts`, run a prompt against Anthropic or Codex, and observe the live countdown below the editor
 - Global installation: `cp ./extensions/rbf-cache-guardian.ts ~/.pi/agent/extensions/rbf-cache-guardian.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-cache-guardian.ts`
