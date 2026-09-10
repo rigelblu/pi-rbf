@@ -65,7 +65,7 @@ export function extractMimeType(filePath: string): string {
 }
 
 export function allocateNextChip(currentText: string): string {
-	const regex = /\[Image\s+(\d+)\]/gi;
+	const regex = /\[Image\s+#?(\d+)\]/gi;
 	const usedNumbers = new Set<number>();
 	let match: RegExpExecArray | null;
 	while ((match = regex.exec(currentText)) !== null) {
@@ -78,7 +78,7 @@ export function allocateNextChip(currentText: string): string {
 	while (usedNumbers.has(candidate)) {
 		candidate++;
 	}
-	return `[Image ${candidate}]`;
+	return `[Image #${candidate}]`;
 }
 
 export class ImageShortTextManager {
@@ -119,17 +119,19 @@ export class ImageShortTextManager {
 	}
 
 	public transformInput(text: string): { action: "transform"; text: string; images: ImageContent[] } | null {
-		const regex = /\[Image\s+(\d+)\]/gi;
-		const foundChips = new Set<string>();
+		const regex = /\[Image\s+#?(\d+)\]/gi;
+		const foundNumbers = new Set<number>();
 		let match: RegExpExecArray | null;
 		while ((match = regex.exec(text)) !== null) {
-			const normalizedChip = `[Image ${match[1]}]`;
-			foundChips.add(normalizedChip);
+			const num = parseInt(match[1], 10);
+			if (!Number.isNaN(num) && num > 0) {
+				foundNumbers.add(num);
+			}
 		}
 
 		const images: ImageContent[] = [];
-		for (const chip of foundChips) {
-			const entry = this.activeImages.get(chip);
+		for (const num of foundNumbers) {
+			const entry = this.activeImages.get(`[Image #${num}]`) ?? this.activeImages.get(`[Image ${num}]`);
 			if (entry) {
 				images.push({
 					type: "image",

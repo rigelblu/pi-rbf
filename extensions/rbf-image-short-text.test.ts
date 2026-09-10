@@ -52,28 +52,30 @@ function createMockExtensionAPI() {
 
 describe("Pure helpers", () => {
 	describe("allocateNextChip", () => {
-		it("allocates [Image 1] when current text has no image chips", () => {
-			expect(allocateNextChip("")).toBe("[Image 1]");
-			expect(allocateNextChip("Hello world")).toBe("[Image 1]");
+		it("allocates [Image #1] when current text has no image chips", () => {
+			expect(allocateNextChip("")).toBe("[Image #1]");
+			expect(allocateNextChip("Hello world")).toBe("[Image #1]");
 		});
 
-		it("allocates [Image 2] when [Image 1] is already present", () => {
-			expect(allocateNextChip("Please check [Image 1]")).toBe("[Image 2]");
+		it("allocates [Image #2] when [Image #1] is already present", () => {
+			expect(allocateNextChip("Please check [Image #1]")).toBe("[Image #2]");
+			// Also accepts [Image 1] without hash
+			expect(allocateNextChip("Please check [Image 1]")).toBe("[Image #2]");
 		});
 
-		it("allocates [Image 3] when [Image 1] and [Image 2] are present", () => {
-			expect(allocateNextChip("Look at [Image 1] and [Image 2] closely")).toBe("[Image 3]");
+		it("allocates [Image #3] when [Image #1] and [Image #2] are present", () => {
+			expect(allocateNextChip("Look at [Image #1] and [Image #2] closely")).toBe("[Image #3]");
 		});
 
 		it("fills gaps by allocating the lowest unused integer", () => {
-			// User deleted [Image 1], keeping [Image 2]
-			expect(allocateNextChip("Look at [Image 2]")).toBe("[Image 1]");
+			// User deleted [Image #1], keeping [Image #2]
+			expect(allocateNextChip("Look at [Image #2]")).toBe("[Image #1]");
 			// Gaps between 1 and 3
-			expect(allocateNextChip("Look at [Image 1] and [Image 3]")).toBe("[Image 2]");
+			expect(allocateNextChip("Look at [Image #1] and [Image #3]")).toBe("[Image #2]");
 		});
 
 		it("handles multiple mentions of the same chip gracefully", () => {
-			expect(allocateNextChip("[Image 1] is here and [Image 1] again")).toBe("[Image 2]");
+			expect(allocateNextChip("[Image #1] is here and [Image #1] again")).toBe("[Image #2]");
 		});
 	});
 
@@ -175,19 +177,19 @@ describe("ImageShortTextManager", () => {
 
 		const result1 = manager.handlePaste(file1, "");
 		expect(result1).not.toBeNull();
-		expect(result1?.chip).toBe("[Image 1]");
+		expect(result1?.chip).toBe("[Image #1]");
 		expect(result1?.entry.mimeType).toBe("image/png");
 		expect(result1?.entry.data).toBe(rawBytes.toString("base64"));
 		expect(result1?.entry.filePath).toBe(file1);
 
-		// Second paste with [Image 1] in editor
+		// Second paste with [Image #1] in editor
 		const file2 = path.join(os.tmpdir(), `pi-clipboard-${crypto.randomUUID()}.jpg`);
 		fs.writeFileSync(file2, Buffer.from("fake jpg content"));
 		tmpFiles.push(file2);
 
-		const result2 = manager.handlePaste(file2, "Here is [Image 1]");
+		const result2 = manager.handlePaste(file2, "Here is [Image #1]");
 		expect(result2).not.toBeNull();
-		expect(result2?.chip).toBe("[Image 2]");
+		expect(result2?.chip).toBe("[Image #2]");
 		expect(result2?.entry.mimeType).toBe("image/jpeg");
 	});
 
@@ -204,10 +206,10 @@ describe("ImageShortTextManager", () => {
 
 		manager.handlePaste(file1, "");
 
-		const transformResult = manager.transformInput("What is in [Image 1]?");
+		const transformResult = manager.transformInput("What is in [Image #1]?");
 		expect(transformResult).not.toBeNull();
 		expect(transformResult?.action).toBe("transform");
-		expect(transformResult?.text).toBe("What is in [Image 1]?");
+		expect(transformResult?.text).toBe("What is in [Image #1]?");
 		expect(transformResult?.images).toHaveLength(1);
 		expect(transformResult?.images[0]).toEqual({
 			type: "image",
@@ -224,19 +226,35 @@ describe("ImageShortTextManager", () => {
 		tmpFiles.push(file1, file2);
 
 		manager.handlePaste(file1, "");
-		manager.handlePaste(file2, "[Image 1]");
+		manager.handlePaste(file2, "[Image #1]");
 
-		// User deleted [Image 1], submitting only with [Image 2]
-		const transformResult = manager.transformInput("Only look at [Image 2]");
+		// User deleted [Image #1], submitting only with [Image #2]
+		const transformResult = manager.transformInput("Only look at [Image #2]");
 		expect(transformResult).not.toBeNull();
 		expect(transformResult?.images).toHaveLength(1);
 		expect(transformResult?.images[0].data).toBe(Buffer.from("img2").toString("base64"));
 	});
 
 	it("returns null if no registered chips exist in the submitted text", () => {
-		// User types literal [Image 1] without pasting
-		const result = manager.transformInput("Look at [Image 1]");
+		// User types literal [Image #1] without pasting
+		const result = manager.transformInput("Look at [Image #1]");
 		expect(result).toBeNull();
+	});
+
+	it("recognizes chips with or without hash symbol for tolerance", () => {
+		const rawBytes = Buffer.from("tolerance image");
+		const file = path.join(os.tmpdir(), `pi-clipboard-${crypto.randomUUID()}.png`);
+		fs.writeFileSync(file, rawBytes);
+		tmpFiles.push(file);
+
+		manager.handlePaste(file, "");
+
+		// Should match both "[Image #1]" and "[Image 1]"
+		const resWithHash = manager.transformInput("Check [Image #1]");
+		expect(resWithHash?.images).toHaveLength(1);
+
+		const resWithoutHash = manager.transformInput("Check [Image 1]");
+		expect(resWithoutHash?.images).toHaveLength(1);
 	});
 
 	it("clear() empties active images", () => {
@@ -294,14 +312,14 @@ describe("Extension lifecycle & integration", () => {
 
 		const event: InputEvent = {
 			type: "input",
-			text: "Explain [Image 1]",
+			text: "Explain [Image #1]",
 			source: "interactive",
 		};
 
 		const result = (await mock.emit("input", event)) as InputEventResult;
 		expect(result).toEqual({
 			action: "transform",
-			text: "Explain [Image 1]",
+			text: "Explain [Image #1]",
 			images: [
 				{
 					type: "image",
@@ -334,7 +352,7 @@ describe("Extension lifecycle & integration", () => {
 
 		const event: InputEvent = {
 			type: "input",
-			text: "Compare images [Image 1]",
+			text: "Compare images [Image #1]",
 			images: [existingImage],
 			source: "interactive",
 		};
@@ -449,7 +467,7 @@ describe("InteractiveMode monkey-patching", () => {
 
 		await simulateCall();
 
-		expect(insertedValue).toBe("[Image 1]");
+		expect(insertedValue).toBe("[Image #1]");
 		expect(mockInteractiveInstance.ui.requestRender).toHaveBeenCalled();
 		expect(manager.getActiveEntries()).toHaveLength(1);
 	});
