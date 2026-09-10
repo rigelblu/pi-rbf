@@ -383,4 +383,23 @@ Local Pi extension registering `/rewind` as a first-class alias for Pi's session
 - Global installation: `cp ./extensions/rbf-rewind.ts ~/.pi/agent/extensions/rbf-rewind.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-rewind.ts`
 
+---
+
+# 🔵⋯ rbf-rename
+
+## 🟠⋯ Overview
+Local Pi extension registering `/rename <name>` as a familiar alias for Pi's native `/name <name>` session naming.
+
+## 🟠⋯ Capabilities & Behavior
+- Name or rename: `/rename <name>` sets or replaces the current session name through Pi's public session-name API.
+- Native persistence and display: Pi stores the name in session metadata and shows it in the footer, terminal title, `/session`, and `/resume` selector.
+- Bare command: `/rename` shows `Session name: <name>` when named, or `Usage: /rename <name>` when unnamed.
+- Native normalization: surrounding whitespace is trimmed; Pi replaces embedded line breaks with spaces and the extension reports the stored value.
+- Compatibility: native `/name` remains unchanged; the extension uses no prototype patches or external dependencies.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-rename.ts`, run `/rename first-name`, then `/rename second-name`, and inspect the footer and `/session`.
+- Global installation: `cp ./extensions/rbf-rename.ts ~/.pi/agent/extensions/rbf-rename.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-rename.ts`
+
 

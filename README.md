@@ -4,6 +4,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-rename`](extensions/rbf-rename.ts) (v0.17.0) — Use `/rename` to name or rename the current Pi session while preserving native `/name`.
 - [`rbf-rewind`](extensions/rbf-rewind.ts) (v0.16.0) — Use `/rewind` as a first-class alias for `/tree` to navigate session branches and checkpoints.
 - [`rbf-question-form`](extensions/rbf-question-form.ts) (v0.15.0) — Select answer to agent questions using an inline, non-modal quick-pick form with compact number chips, additional notes input, and write-in support.
 - [`rbf-vim`](extensions/rbf-vim.ts) (v0.14.1) — Use vim motions and text objects (ciw, diw, caw, daw, yiw, quotes, brackets) in input box with modal state machine, bottom-border mode badge, /vim toggle, and double-Esc safety.

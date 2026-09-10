@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.17.0 (2026-09-10)
+## 🟠⋯ Added for End Users
+- 2026-09-10 - feat | use /rename to name or rename the current Pi session (#pi-27)
+
+---
+
 # 🔵⋯ v0.16.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat (ux) | use /rewind as an alias for /tree to navigate session branches (#pi-20)
