@@ -333,3 +333,29 @@ Local Pi extension that adds familiar Vim modal navigation and editing in Pi's p
 - Global installation: `cp ./extensions/rbf-vim.ts ~/.pi/agent/extensions/rbf-vim.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-vim.ts`
 
+---
+
+# 🔵⋯ rbf-question-form
+
+## 🟠⋯ Overview
+Local Pi extension providing an inline, non-modal selector at the prompt line for agent questions with numbered options. Keeps recommendation and framing context in the transcript above as readable markdown, letting users pick an option with single number keys (`1`–`9`), arrow or vim keys (`j`/`k`), or `Enter`.
+
+## 🟠⋯ Capabilities & Behavior
+- Transcript Separation: The agent's full question, recommendation text, user need framing, and context paragraphs stay in the transcript as regular markdown. Only the numbered options appear in the compact interactive form below the editor.
+- Non-Modal Inline Quick-Pick: Renders as a lightweight widget below the editor rather than a blocking modal dialog, allowing users to scroll and read the transcript context while deciding.
+- Direct & Instant Submission: Pressing `1`–`9` immediately submits the chosen option. Full option text is submitted (e.g. `1. Codex retries internally — one execution owner...`), ensuring self-documenting transcripts.
+- Keyboard Navigation:
+  - `1`–`9`: Instant select & submit.
+  - `↑` / `↓` or `j` / `k`: Move highlight.
+  - `Enter`: Confirm and submit highlighted option.
+  - `Esc`: Dismiss selector without submitting (restores normal prompt).
+  - Any printable character: Dismisses selector and passes the character directly to the editor for freeform typing.
+- Dual Tool Registration: Exposes both `question` and `ask_question` tools accepting string options or structured `{ label, description }` objects.
+- Text Detection Heuristic: Automatically activates the selector on `agent_settled` when assistant messages end with numbered options following `Recommendation:`, `User Need Framing:`, preceding `?`, or containing `← recommended` / `(recommended)` tags. Regular tutorial lists are never misidentified.
+- Safe Lifecycle: Automatically dismisses when an agent turn begins (`agent_start`) or when the user begins freeform typing.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-question-form.ts`, ask a question with options, and select using numbers or arrow keys.
+- Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
+
