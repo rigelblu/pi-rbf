@@ -197,6 +197,13 @@ export function buildSubmissionText(chip: QuestionChip, notes: string): string {
 	return `${baseText}\n\nAdd notes to selection: ${trimmedNotes}`;
 }
 
+const BLUE_BORDER = "\x1b[38;5;75m";
+const RESET_COLOR = "\x1b[0m";
+
+function styleBlue(text: string): string {
+	return `${BLUE_BORDER}${text}${RESET_COLOR}`;
+}
+
 // ─── Component Rendering ────────────────────────────────────────────────────
 
 export function renderQuestionFormLines(state: QuestionFormState, width: number): string[] {
@@ -204,10 +211,10 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	const renderWidth = Math.max(20, width);
 	const lines: string[] = [];
 
-	// Top border
+	// Top border (neutral blue)
 	const title = " Select Answer ";
 	const borderDashCount = Math.max(0, renderWidth - title.length - 1);
-	lines.push(theme.fg("accent", "─" + title + "─".repeat(borderDashCount)));
+	lines.push(styleBlue("─" + title + "─".repeat(borderDashCount)));
 
 	// Chips row
 	const chipRenders = chips.map((chip, idx) => {
@@ -228,10 +235,10 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 		const atCursor = notesText.slice(notesCursorPos, notesCursorPos + 1) || " ";
 		const afterCursor = notesText.slice(notesCursorPos + 1);
 		const cursorChar = `\x1b[7m${atCursor}\x1b[0m`;
-		lines.push(theme.fg("accent", notesLabel) + beforeCursor + cursorChar + afterCursor);
+		lines.push(styleBlue(notesLabel) + beforeCursor + cursorChar + afterCursor);
 	} else {
 		const displayNotes = notesText ? theme.fg("text", notesText) : theme.fg("dim", "(optional, press Tab or ↓ to type)");
-		lines.push(theme.fg("muted", notesLabel) + displayNotes);
+		lines.push(styleBlue(notesLabel) + displayNotes);
 	}
 
 	lines.push("");
@@ -240,8 +247,8 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	const hint = "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
 	lines.push(theme.fg("dim", hint));
 
-	// Bottom border
-	lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+	// Bottom border (neutral blue)
+	lines.push(styleBlue("─".repeat(renderWidth)));
 
 	return lines;
 }

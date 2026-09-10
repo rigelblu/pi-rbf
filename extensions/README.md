@@ -341,21 +341,26 @@ Local Pi extension that adds familiar Vim modal navigation and editing in Pi's p
 Local Pi extension providing an inline, non-modal selector at the prompt line for agent questions with numbered options. Keeps recommendation and framing context in the transcript above as readable markdown, letting users pick an option with single number keys (`1`–`9`), arrow or vim keys (`j`/`k`), or `Enter`.
 
 ## 🟠⋯ Capabilities & Behavior
-- Transcript Separation: The agent's full question, recommendation text, user need framing, and context paragraphs stay in the transcript as regular markdown. Only the numbered options appear in the compact interactive form below the editor.
-- Non-Modal Inline Quick-Pick: Renders as a lightweight widget below the editor rather than a blocking modal dialog, allowing users to scroll and read the transcript context while deciding.
-- Direct & Instant Submission: Pressing `1`–`9` immediately submits the chosen option. Full option text is submitted (e.g. `1. Codex retries internally — one execution owner...`), ensuring self-documenting transcripts.
+- Transcript Separation: The agent's full question, recommendation text, user need framing, and context paragraphs stay in the transcript as regular markdown. Only the numbered options appear in the compact interactive form.
+- Input Box Overlap: Uses `ctx.ui.custom()` to temporarily occupy the input box area directly, eliminating double borders and visual separation.
+- Compact Number Selection: Renders compact number chips (`[ 1 ]`, `[ 2 ]`, `[ 3 ]`, `[ 4. Write-in ]`, `[ C. /convo-is-very-best ]`) without repeating the full text that already sits right above in the transcript.
+- Dark Background & Light Text: The active selection chip is highlighted with a prominent dark background and bold bright white text.
+- Additional Notes Input: Embedded `Add notes to selection:` field allows typing extra instructions or modifications to append to the chosen option before submitting.
+- Write-in Option: Dedicated write-in option as the last numbered option (`N+1`). Selecting it auto-focuses the notes field so any custom text can be submitted directly.
+- Canned Reply: Quick chip `[ C. /convo-is-very-best ]` (or pressing `c` / `C`) immediately selects `/skill:convo-is-very-best` (with optional notes).
+- Accidental ESC Recovery: If dismissed with `Esc`, the options are cached. Typing `/pick` or `/question`, or pressing `Ctrl+Q`, re-opens the selector instantly.
 - Keyboard Navigation:
-  - `1`–`9`: Instant select & submit.
-  - `↑` / `↓` or `j` / `k`: Move highlight.
-  - `Enter`: Confirm and submit highlighted option.
-  - `Esc`: Dismiss selector without submitting (restores normal prompt).
-  - Any printable character: Dismisses selector and passes the character directly to the editor for freeform typing.
+  - `1`–`9` / `c`: Jump directly to option chip
+  - `←` / `→` or `h` / `l`: Move selection between chips
+  - `Tab` or `↓` / `j`: Move focus down to `Add notes to selection:`
+  - `Shift+Tab` or `↑` / `k`: Move focus back up to options row
+  - `Enter`: Confirm and submit highlighted option + notes
+  - `Esc`: Clear notes or dismiss selector without submitting
 - Dual Tool Registration: Exposes both `question` and `ask_question` tools accepting string options or structured `{ label, description }` objects.
 - Text Detection Heuristic: Automatically activates the selector on `agent_settled` when assistant messages end with numbered options following `Recommendation:`, `User Need Framing:`, preceding `?`, or containing `← recommended` / `(recommended)` tags. Regular tutorial lists are never misidentified.
-- Safe Lifecycle: Automatically dismisses when an agent turn begins (`agent_start`) or when the user begins freeform typing.
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi -e ./extensions/rbf-question-form.ts`, ask a question with options, and select using numbers or arrow keys.
+- Local verification: launch `pi -e ./extensions/rbf-question-form.ts`, ask a question with options, select using numbers or arrows, add optional notes, or run `/pick`.
 - Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
 
