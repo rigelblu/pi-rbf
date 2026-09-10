@@ -433,16 +433,15 @@ describe("rbfQuestionForm extension integration & commands", () => {
 		};
 	}
 
-	it("registers /pick and /question commands and ctrl+q shortcut", () => {
+	it("registers /answer-question command and ctrl+q shortcut", () => {
 		const mockAPI = createMockExtensionAPI();
 		rbfQuestionForm(mockAPI.api as any);
 
-		expect(mockAPI.registeredCommands.has("pick")).toBe(true);
-		expect(mockAPI.registeredCommands.has("question")).toBe(true);
+		expect(mockAPI.registeredCommands.has("answer-question")).toBe(true);
 		expect(mockAPI.registeredShortcuts.has("ctrl+q")).toBe(true);
 	});
 
-	it("opens form on agent_settled and allows /pick after Esc to re-open", async () => {
+	it("opens form on agent_settled and allows /answer-question after Esc to re-open", async () => {
 		const mockAPI = createMockExtensionAPI();
 		const mockCtx = createMockExtensionContext("tui");
 		rbfQuestionForm(mockAPI.api as any);
@@ -476,9 +475,9 @@ describe("rbfQuestionForm extension integration & commands", () => {
 		// No message submitted
 		expect(mockAPI.sendUserMessageMock).not.toHaveBeenCalled();
 
-		// 4. User runs /pick to restore the question form!
-		const pickCmd = mockAPI.registeredCommands.get("pick");
-		const pickPromise = pickCmd.handler("", mockCtx.ctx);
+		// 4. User runs /answer-question to restore the question form!
+		const answerCmd = mockAPI.registeredCommands.get("answer-question");
+		const answerPromise = answerCmd.handler("", mockCtx.ctx);
 
 		expect(mockCtx.customComponent).toBeDefined();
 
@@ -493,7 +492,7 @@ describe("rbfQuestionForm extension integration & commands", () => {
 		mockCtx.customComponent.handleInput("t");
 		mockCtx.customComponent.handleInput("\r");
 
-		await pickPromise;
+		await answerPromise;
 
 		expect(mockAPI.sendUserMessageMock).toHaveBeenCalledWith(
 			"1. Fast strategy ← recommended\n\nAdd notes to selection: urgent",

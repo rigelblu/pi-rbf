@@ -492,18 +492,7 @@ export default function rbfQuestionForm(pi: ExtensionAPI): void {
 
 	// ─── Slash Commands & Shortcut to re-open after ESC ───────────────────────
 
-	pi.registerCommand("pick", {
-		description: "Re-open the selection form for the last agent question",
-		handler: async (_args, ctx) => {
-			if (!lastDetectedOptions || lastDetectedOptions.length === 0) {
-				ctx.ui.notify("No recent question options to pick from", "warning");
-				return;
-			}
-			await openQuestionForm(lastDetectedOptions, ctx);
-		},
-	});
-
-	pi.registerCommand("question", {
+	pi.registerCommand("answer-question", {
 		description: "Re-open the selection form for the last agent question",
 		handler: async (_args, ctx) => {
 			if (!lastDetectedOptions || lastDetectedOptions.length === 0) {
