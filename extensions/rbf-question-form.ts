@@ -188,7 +188,7 @@ export function buildSubmissionText(chip: QuestionChip, notes: string): string {
 	}
 
 	if (chip.type === "write-in") {
-		if (!trimmedNotes) return "Write-in";
+		if (!trimmedNotes) return "";
 		return trimmedNotes;
 	}
 
@@ -283,24 +283,29 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	lines.push("");
 
 	// Notes field
-	const notesLabel = "  Add notes to selection: ";
+	const isWriteIn = chips[selectedChipIndex]?.type === "write-in";
+	const notesLabel = isWriteIn ? "  Write in your answer: " : "  Add notes to selection: ";
 	if (focus === "notes") {
 		const beforeCursor = notesText.slice(0, notesCursorPos);
 		const atCursor = notesText.slice(notesCursorPos, notesCursorPos + 1) || " ";
 		const afterCursor = notesText.slice(notesCursorPos + 1);
 		const cursorChar = `\x1b[7m${atCursor}\x1b[0m`;
-		lines.push(styleBorder(theme, notesLabel) + beforeCursor + cursorChar + afterCursor);
+		const requiredHint = isWriteIn && !notesText ? (theme?.fg ? theme.fg("dim", " (required)") : " (required)") : "";
+		lines.push(styleBorder(theme, notesLabel) + beforeCursor + cursorChar + afterCursor + requiredHint);
 	} else {
+		const placeholder = isWriteIn ? "(required, press Tab or ↓ to type)" : "(optional, press Tab or ↓ to type)";
 		const displayNotes = notesText
 			? (theme?.fg ? theme.fg("text", notesText) : notesText)
-			: (theme?.fg ? theme.fg("dim", "(optional, press Tab or ↓ to type)") : "(optional, press Tab or ↓ to type)");
+			: (theme?.fg ? theme.fg("dim", placeholder) : placeholder);
 		lines.push(styleBorder(theme, notesLabel) + displayNotes);
 	}
 
 	lines.push("");
 
 	// Hint line
-	const hint = "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
+	const hint = isWriteIn
+		? "  [Type answer] · [Enter] submit · [Esc] dismiss · [Tab/↑] back to options"
+		: "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
 	lines.push(theme?.fg ? theme.fg("dim", hint) : hint);
 
 	// Bottom border (theme border color)
@@ -344,6 +349,11 @@ export function createQuestionFormComponent(
 		// Enter: submit
 		if (data === "\r" || data === "\n" || matchesKey(data, Key.enter)) {
 			const selectedChip = state.chips[state.selectedChipIndex];
+			if (selectedChip.type === "write-in" && !state.notesText.trim()) {
+				state.focus = "notes";
+				tui.requestRender();
+				return;
+			}
 			const result = buildSubmissionText(selectedChip, state.notesText);
 			done(result);
 			return;
@@ -377,6 +387,9 @@ export function createQuestionFormComponent(
 			// Left / h
 			if (data === "h" || data === "\x1b[D" || matchesKey(data, Key.left)) {
 				state.selectedChipIndex = Math.max(0, state.selectedChipIndex - 1);
+				if (state.chips[state.selectedChipIndex].type === "write-in") {
+					state.focus = "notes";
+				}
 				tui.requestRender();
 				return;
 			}
@@ -384,6 +397,9 @@ export function createQuestionFormComponent(
 			// Right / l
 			if (data === "l" || data === "\x1b[C" || matchesKey(data, Key.right)) {
 				state.selectedChipIndex = Math.min(state.chips.length - 1, state.selectedChipIndex + 1);
+				if (state.chips[state.selectedChipIndex].type === "write-in") {
+					state.focus = "notes";
+				}
 				tui.requestRender();
 				return;
 			}

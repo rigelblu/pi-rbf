@@ -202,7 +202,7 @@ describe("buildSubmissionText", () => {
 	});
 
 	it("handles write-in option", () => {
-		expect(buildSubmissionText(writeInChip, "")).toBe("Write-in");
+		expect(buildSubmissionText(writeInChip, "")).toBe("");
 		expect(buildSubmissionText(writeInChip, "my custom answer")).toBe("my custom answer");
 	});
 
@@ -272,6 +272,28 @@ describe("renderQuestionFormLines", () => {
 
 		const joined = lines.join("\n");
 		expect(joined).toContain("\x1b[7m\x1b[1m 1 \x1b[0m");
+	});
+
+	it("renders required indicator and write in label when write-in is selected", () => {
+		const chips = [
+			{ key: "1", type: "option" as const, label: "1" },
+			{ key: "2", type: "write-in" as const, label: "2. Write-in" },
+		];
+		const lines = renderQuestionFormLines(
+			{
+				chips,
+				selectedChipIndex: 1,
+				focus: "notes",
+				notesText: "",
+				notesCursorPos: 0,
+				theme: mockThemeWithAnsi,
+			},
+			80,
+		);
+
+		const joined = lines.join("\n");
+		expect(joined).toContain("Write in your answer:");
+		expect(joined).toContain("(required)");
 	});
 
 	it("renders cursor and typed notes when focus is on notes", () => {
@@ -379,6 +401,24 @@ describe("createQuestionFormComponent input handling", () => {
 		comp.handleInput("\r");
 
 		expect(done).toHaveBeenCalledWith("My");
+	});
+
+	it("blocks Enter submission when write-in notes are empty and requires text", () => {
+		const { comp, done } = createComponent();
+
+		// 3 is Write-in
+		comp.handleInput("3");
+		// Hit Enter immediately while notes are empty
+		comp.handleInput("\r");
+		expect(done).not.toHaveBeenCalled();
+
+		// Type custom text and hit Enter
+		comp.handleInput("W");
+		comp.handleInput("o");
+		comp.handleInput("r");
+		comp.handleInput("k");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("Work");
 	});
 });
 
