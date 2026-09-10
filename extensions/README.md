@@ -255,5 +255,24 @@ Local Pi extension that shows clean, numbered short text chips (e.g. `[Image #1]
 - Global installation: `cp ./extensions/rbf-image-short-text.ts ~/.pi/agent/extensions/rbf-image-short-text.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-image-short-text.ts`
 
+---
 
+# 🔵⋯ rbf-click-cursor
 
+## 🟠⋯ Overview
+Local Pi extension that places the prompt cursor exactly where clicked with the mouse in fullscreen TUI mode (`tuiMode: "fullscreen"`), repaints the terminal screen immediately without waiting for a subsequent keypress, and prevents stray text selection highlight boxes from appearing on simple clicks.
+
+## 🟠⋯ Capabilities & Behavior
+- Instant Click Placement: clicking anywhere within single-line or multiline prompt text immediately repositions the text insertion cursor to the clicked line and column.
+- Immediate Screen Repaint: returns `{ handled: true, focus: true, render: true }` and calls `tui.requestRender()` so the cursor marker visibly jumps instantly on mouse down (`press`) without requiring an extra keypress.
+- Stray Selection Prevention: intercepts mouse `"press"` events on the editor so `TuiAltScreen` does not fall through to global screen-level text selection during normal click navigation.
+- Boundary & Padding Aware: properly accounts for horizontal editor padding (`paddingX`), snaps clicks past the line end to the line length, and clamps clicks before the first character to column 0.
+- Unicode & Emoji Support: accurately tracks multi-column grapheme boundaries (`visibleWidth`) so clicking on or around fullwidth emojis and wide characters positions the cursor cleanly.
+- Autocomplete Compatibility: forwards clicks on active autocomplete dropdown menus directly to `autocompleteList.handleMouse`, ensuring slash command and file completions remain fully clickable.
+- Broad Subclass Inheritance: patches base `Editor.prototype.handleMouse`, allowing custom editors (such as `CustomEditor` and future modal/vim editors) to inherit mouse cursor placement automatically.
+- Idempotent Lifecycle: provides `applyClickCursor()` and `restoreClickCursor()` functions keyed with unique symbols to ensure safe loading and unpatching.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-click-cursor.ts`, type a multiline prompt, and click anywhere in the text to reposition the cursor.
+- Global installation: `cp ./extensions/rbf-click-cursor.ts ~/.pi/agent/extensions/rbf-click-cursor.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-click-cursor.ts`
