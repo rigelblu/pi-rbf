@@ -348,7 +348,7 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 - Additional Notes Input: Embedded `Add notes to selection:` field allows typing extra instructions or modifications to append to the chosen option before submitting.
 - Write-in Option: Dedicated write-in option as the last numbered option (`N+1`). Selecting it auto-focuses the notes field so any custom text can be submitted directly.
 - Canned Reply: Quick chip `[ C. /convo-is-very-best ]` (or pressing `c` / `C`) immediately selects `/skill:convo-is-very-best` (with optional notes).
-- Accidental ESC Recovery: If dismissed with `Esc`, the options are cached. Typing `/pick` or `/question`, or pressing `Ctrl+Q`, re-opens the selector instantly.
+- Accidental ESC Recovery: If dismissed with `Esc`, the options are cached. Typing `/answer-question`, or pressing `Ctrl+Q`, re-opens the selector instantly.
 - Keyboard Navigation:
   - `1`–`9` / `c`: Jump directly to option chip
   - `←` / `→` or `h` / `l`: Move selection between chips
@@ -360,7 +360,7 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 - Text Detection Heuristic: Automatically activates the selector on `agent_settled` when assistant messages end with numbered options following `Recommendation:`, `User Need Framing:`, preceding `?`, or containing `← recommended` / `(recommended)` tags. Regular tutorial lists are never misidentified.
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi -e ./extensions/rbf-question-form.ts`, ask a question with options, select using numbers or arrows, add optional notes, or run `/pick`.
+- Local verification: launch `pi -e ./extensions/rbf-question-form.ts`, ask a question with options, select using numbers or arrows, add optional notes, or run `/answer-question`.
 - Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
 
