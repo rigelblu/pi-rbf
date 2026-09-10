@@ -4,6 +4,11 @@ title: Changelog
 
 # 🔵⋯ [Unreleased]
 ## 🟠⋯ Added for End Users
+
+---
+
+# 🔵⋯ v0.11.1 (2026-09-10)
+## 🟠⋯ Added for End Users
 - 2026-09-10 - fix (ux) | support CleanShot screenshot clipboard pastes with [Image #1] chip and multimodal delivery (#pi-3.1)
 
 ---
