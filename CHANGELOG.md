@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.11.0 (2026-09-09)
+## 🟠⋯ Added for End Users
+- 2026-09-09 - feat (ux) | see short text (i.e. "Image 1") for pasted images instead of image path (#pi-3)
+
+---
+
 # 🔵⋯ v0.10.0 (2026-09-09)
 ## 🟠⋯ Added for End Users
 - 2026-09-09 - feat (ux) | see on my status line what I see in claude code (#pi-17)

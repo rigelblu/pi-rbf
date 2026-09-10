@@ -235,4 +235,25 @@ Local Pi extension that brings parity with Claude Code's status line to Line 1 o
 - Global installation: `cp ./extensions/rbf-status-line.ts ~/.pi/agent/extensions/rbf-status-line.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-status-line.ts`
 
+---
+
+# 🔵⋯ rbf-image-short-text
+
+## 🟠⋯ Overview
+Local Pi extension that shows clean, numbered short text chips (e.g. `[Image 1]`, `[Image 2]`) in the prompt editor when pasting images from the clipboard instead of verbose temporary filesystem paths (`/tmp/pi-clipboard-...png`), and delivers images natively as multimodal attachments (`ImageContent`) upon prompt submission.
+
+## 🟠⋯ Capabilities & Behavior
+- Compact Image Chips: clipboard image pastes (`Cmd+V` / `Ctrl+V`) insert `[Image 1]` at the cursor, keeping the editor concise, readable, and free of noisy temporary path clutter.
+- Sequential Turn-Local Numbering: consecutive pastes in the same prompt allocate sequential integers (`[Image 1]`, `[Image 2]`). If a chip is deleted, the lowest unused integer is reused. Counter and active memory reset per prompt turn.
+- Native Multimodal Delivery: on prompt submission, the extension intercepts the `input` event, finds all `[Image N]` tokens in the prompt text, attaches their base64 image data as native multimodal `ImageContent` to the user message, and leaves the `[Image N]` label in the prompt text. The model sees the visual image directly without needing an intermediate `read` tool call.
+- Deletion Resilience: if the user deletes `[Image 1]` from the prompt text before submitting, only images whose chips remain present in the text are attached to the turn.
+- Strictly Scoped to Clipboard Images: only temporary clipboard files created by native paste (`pi-clipboard-*` in `os.tmpdir()`) are intercepted. Explicitly typed or pasted file paths and plain text pastes remain completely untouched.
+- Zero External Dependencies: implemented purely using Node standard modules (`node:fs`, `node:path`, `node:os`, `node:crypto`) and `@earendil-works/pi-coding-agent`.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-image-short-text.ts`, copy an image to the clipboard, press `Cmd+V` or `Ctrl+V`, and verify `[Image 1]` appears.
+- Global installation: `cp ./extensions/rbf-image-short-text.ts ~/.pi/agent/extensions/rbf-image-short-text.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-image-short-text.ts`
+
+
 
