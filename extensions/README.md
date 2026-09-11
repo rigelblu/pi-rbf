@@ -467,10 +467,10 @@ Local Pi extension tracking session progress with an agent-callable `todo` check
   - `toggle`: `{ id: number }` cycles item status (`pending` -> `in_progress` -> `completed` -> `pending`).
   - `list`: returns formatted list of current items and completion counts.
   - `clear`: removes all items and resets the checklist.
-- Above-Editor Boxed Widget:
+- Above-Editor Open Widget:
   - Displays directly above the input box via `ctx.ui.setWidget("todos", ...)` with placement `aboveEditor`.
-  - Monospace grid border rendering with exact column width calculation, resilient against terminal resizing and ANSI escape sequences.
-  - Status symbols: completed `✓` in success color with dimmed text, in-progress `⠸` in accent color with bold ID, pending `○` in muted color.
+  - Clean open layout with top and bottom horizontal borders, resilient against terminal resizing and ANSI escape sequences.
+  - Status symbols: completed `✓` in greenish success color, in-progress `⋮` in started color (`#7A81FF`), pending `○` in muted color with dark font for top unstarted item and muted light grey for queued items below.
   - Capped at 5 visible items with a clean `… and N more (type /todos to view all)` overflow notice to prevent viewport compression.
 - TUI Shortcut `Alt+T`:
   - Toggles visibility of the above-editor checklist widget without affecting prompt input.
