@@ -63,6 +63,21 @@ const FALLBACK_THEME = {
 	inverse: (str: string) => str,
 };
 
+export const ROSE_PINE_GOLD = "#f6c177";
+export const ROSE_PINE_GOLD_ANSI = "\x1b[38;2;246;193;119m";
+export const ANSI_RESET_FG = "\x1b[39m";
+
+export function formatGold(theme: Theme | undefined, text: string): string {
+	if (!theme) return text;
+	if (typeof (theme as any).getFgAnsi !== "function" && typeof theme.fg === "function") {
+		return theme.fg("warning" as any, text);
+	}
+	if (typeof (theme as any).getColorMode === "function" && (theme as any).getColorMode() === "256color") {
+		return `\x1b[38;5;216m${text}${ANSI_RESET_FG}`;
+	}
+	return `${ROSE_PINE_GOLD_ANSI}${text}${ANSI_RESET_FG}`;
+}
+
 export function getActiveTheme(): any {
 	return (
 		(typeof globalThis !== "undefined"
@@ -631,22 +646,26 @@ export class TodoManager {
 
 		// Up to MAX_VISIBLE_WIDGET_ITEMS
 		const visibleSlice = this.todos.slice(0, MAX_VISIBLE_WIDGET_ITEMS);
+		const hasStarted = visibleSlice.some((t) => t.status === "in_progress");
+		const firstPendingIdx = !hasStarted ? visibleSlice.findIndex((t) => t.status === "pending") : -1;
 
-		for (const item of visibleSlice) {
+		for (let i = 0; i < visibleSlice.length; i++) {
+			const item = visibleSlice[i];
 			let statusStyled = "";
 			if (item.status === "completed") {
 				if (theme) {
 					const styledIcon = theme.fg("success", "✓");
-					const styledText = theme.fg("dim", `#${item.id} ${item.text}`);
-					statusStyled = `${styledIcon} ${styledText}`;
+					const styledId = theme.fg("success", `#${item.id}`);
+					const styledText = theme.fg("success", item.text);
+					statusStyled = `${styledIcon} ${styledId} ${styledText}`;
 				} else {
 					statusStyled = `✓ #${item.id} ${item.text}`;
 				}
 			} else if (item.status === "in_progress") {
 				if (theme) {
-					const styledIcon = theme.bold(theme.fg("borderAccent", "⋮"));
-					const styledId = theme.bold(theme.fg("borderAccent", `#${item.id}`));
-					const styledText = theme.fg("borderAccent", item.text);
+					const styledIcon = theme.bold(formatGold(theme, "⋮"));
+					const styledId = theme.bold(formatGold(theme, `#${item.id}`));
+					const styledText = formatGold(theme, item.text);
 					statusStyled = `${styledIcon} ${styledId} ${styledText}`;
 				} else {
 					statusStyled = `⋮ #${item.id} ${item.text}`;
@@ -656,7 +675,11 @@ export class TodoManager {
 				if (theme) {
 					const styledIcon = theme.fg("muted", "○");
 					const styledId = theme.fg("muted", `#${item.id}`);
-					statusStyled = `${styledIcon} ${styledId} ${item.text}`;
+					// Top unstarted task uses current dark font (unstyled item.text);
+					// All items below the top one use the same light grey (muted).
+					const isTopUnstarted = i === firstPendingIdx;
+					const styledText = isTopUnstarted ? item.text : theme.fg("muted", item.text);
+					statusStyled = `${styledIcon} ${styledId} ${styledText}`;
 				} else {
 					statusStyled = `○ #${item.id} ${item.text}`;
 				}
@@ -794,6 +817,8 @@ export function createTodoListModalComponent(
 		}
 
 		const visibleSlice = todos.slice(scrollOffset, scrollOffset + visibleLines);
+		const hasStarted = todos.some((t) => t.status === "in_progress");
+		const firstPendingIdx = !hasStarted ? todos.findIndex((t) => t.status === "pending") : -1;
 
 		for (let i = 0; i < visibleSlice.length; i++) {
 			const itemIndex = scrollOffset + i;
@@ -808,16 +833,33 @@ export function createTodoListModalComponent(
 				statusColor = "success";
 			} else if (item.status === "in_progress") {
 				statusIcon = "⋮";
-				statusColor = "borderAccent";
+				statusColor = "warning";
 			}
 
-			const iconStr = theme.fg(statusColor as any, statusIcon);
-			const idStr = isSelected ? theme.bold(`#${item.id}`) : theme.fg("muted", `#${item.id}`);
+			const iconStr =
+				item.status === "in_progress"
+					? formatGold(theme, statusIcon)
+					: theme.fg(statusColor as any, statusIcon);
+
+			let idStr = `#${item.id}`;
+			if (isSelected) {
+				idStr = theme.bold(idStr);
+			} else if (item.status === "completed") {
+				idStr = theme.fg("success", idStr);
+			} else if (item.status === "in_progress") {
+				idStr = formatGold(theme, idStr);
+			} else {
+				idStr = theme.fg("muted", idStr);
+			}
+
 			let textStr = item.text;
 			if (item.status === "completed") {
-				textStr = theme.fg("dim", item.text);
+				textStr = theme.fg("success", item.text);
 			} else if (item.status === "in_progress") {
-				textStr = theme.fg("borderAccent", item.text);
+				textStr = formatGold(theme, item.text);
+			} else {
+				const isTopUnstarted = itemIndex === firstPendingIdx;
+				textStr = isTopUnstarted ? item.text : theme.fg("muted", item.text);
 			}
 
 			const rowText = `${cursor}${iconStr} ${idStr} ${textStr}`;
@@ -1208,15 +1250,24 @@ export function createTodoToolDefinition(
 				let color = "success";
 				if (details.item.status === "in_progress") {
 					icon = "⋮ ";
-					color = "borderAccent";
+					color = "warning";
 				} else if (details.item.status === "pending") {
 					icon = "○ ";
 					color = "muted";
 				}
-				const styledIcon = theme.fg(color as any, icon);
+				const styledIcon =
+					details.item.status === "in_progress"
+						? formatGold(theme, icon)
+						: theme.fg(color as any, icon);
+				const styledDescText =
+					details.item.status === "completed"
+						? theme.fg("success", details.item.text)
+						: details.item.status === "in_progress"
+						? formatGold(theme, details.item.text)
+						: theme.fg("muted", details.item.text);
 				const desc =
 					theme.fg("text", `Todo #${details.item.id} [${details.item.status}]: `) +
-					theme.fg("muted", details.item.text);
+					styledDescText;
 				return new Text(styledIcon + desc, 0, 0);
 			}
 

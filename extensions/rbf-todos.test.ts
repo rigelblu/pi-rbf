@@ -394,16 +394,43 @@ describe("TodoManager pure logic", () => {
 			expect(lines![2]).toContain("⋮ #2 Second step");
 		});
 
-		it("formats in_progress item using borderAccent matching the border", () => {
+		it("formats in_progress item using Rose Pine gold", () => {
 			const mgr = new TodoManager();
 			mgr.add("Active task");
 			mgr.update(1, { status: "in_progress" });
 			const theme = createMockTheme();
 			const lines = mgr.formatWidgetLines(theme, 70);
 			expect(lines).toBeDefined();
-			expect(theme.fg).toHaveBeenCalledWith("borderAccent", "⋮");
-			expect(theme.fg).toHaveBeenCalledWith("borderAccent", "#1");
-			expect(theme.fg).toHaveBeenCalledWith("borderAccent", "Active task");
+			expect(theme.fg).toHaveBeenCalledWith("warning", "⋮");
+			expect(theme.fg).toHaveBeenCalledWith("warning", "#1");
+			expect(theme.fg).toHaveBeenCalledWith("warning", "Active task");
+		});
+
+		it("formats pending items: top unstarted in dark font, items below in muted light grey", () => {
+			const mgr = new TodoManager();
+			mgr.add("Task 1");
+			mgr.add("Task 2");
+			mgr.add("Task 3");
+			const theme = createMockTheme();
+			const lines = mgr.formatWidgetLines(theme, 70);
+			expect(lines).toBeDefined();
+			// Top unstarted task description is unstyled (dark font)
+			expect(theme.fg).not.toHaveBeenCalledWith("muted", "Task 1");
+			// Items below top one use muted light grey
+			expect(theme.fg).toHaveBeenCalledWith("muted", "Task 2");
+			expect(theme.fg).toHaveBeenCalledWith("muted", "Task 3");
+		});
+
+		it("formats completed items with success greenish", () => {
+			const mgr = new TodoManager();
+			mgr.add("Done task");
+			mgr.update(1, { status: "completed" });
+			const theme = createMockTheme();
+			const lines = mgr.formatWidgetLines(theme, 70);
+			expect(lines).toBeDefined();
+			expect(theme.fg).toHaveBeenCalledWith("success", "✓");
+			expect(theme.fg).toHaveBeenCalledWith("success", "#1");
+			expect(theme.fg).toHaveBeenCalledWith("success", "Done task");
 		});
 
 		it(`caps visible items at ${MAX_VISIBLE_WIDGET_ITEMS} and displays overflow notice`, () => {
@@ -661,7 +688,7 @@ describe("createTodoListModalComponent", () => {
 		expect(mgr.getTodos()[0].text).toBe("Beta");
 	});
 
-	it("renders in_progress items with vertical ellipsis and borderAccent color", () => {
+	it("renders in_progress items with vertical ellipsis and gold color", () => {
 		const mgr = new TodoManager();
 		mgr.add("Active task");
 		mgr.update(1, { status: "in_progress" });
@@ -672,8 +699,8 @@ describe("createTodoListModalComponent", () => {
 		const modal = createTodoListModalComponent(mgr, tui, theme, done);
 		const lines = modal.render(80);
 		expect(lines.some((l) => l.includes("⋮"))).toBe(true);
-		expect(theme.fg).toHaveBeenCalledWith("borderAccent", "⋮");
-		expect(theme.fg).toHaveBeenCalledWith("borderAccent", "Active task");
+		expect(theme.fg).toHaveBeenCalledWith("warning", "⋮");
+		expect(theme.fg).toHaveBeenCalledWith("warning", "Active task");
 	});
 });
 
