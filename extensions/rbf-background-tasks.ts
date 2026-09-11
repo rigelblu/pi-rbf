@@ -655,118 +655,178 @@ export function formatStatsLineWithTasks(
 	return truncateToWidth(newLeft, width, "");
 }
 
+const FOOTER_PI_RBF_REGISTRY_KEY = Symbol.for("@earendil-works/pi-rbf:footer-registry");
+
+export interface FooterExtensionHook {
+	id: string;
+	render: (this: any, lines: string[], width: number) => string[];
+	handleMouse: (this: any, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
+}
+
+export interface FooterRegistry {
+	hooks: Map<string, FooterExtensionHook>;
+	originalRender: (width: number) => string[];
+	originalHandleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
+	isHandlingMouse?: boolean;
+}
+
+export function getOrCreateFooterRegistry(): FooterRegistry | null {
+	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
+		return null;
+	}
+	let registry: FooterRegistry = (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
+	if (!registry) {
+		const originalRender = FooterComponent.prototype.render;
+		const originalHandleMouse = (FooterComponent.prototype as any).handleMouse;
+		registry = {
+			hooks: new Map(),
+			originalRender,
+			originalHandleMouse,
+			isHandlingMouse: false,
+		};
+		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
+
+		FooterComponent.prototype.render = function (this: any, width: number): string[] {
+			let lines = registry.originalRender.call(this, width);
+			for (const hook of registry.hooks.values()) {
+				try {
+					lines = hook.render.call(this, lines, width);
+				} catch {
+					// Guard against hook render error
+				}
+			}
+			return lines;
+		};
+
+		(FooterComponent.prototype as any).handleMouse = function (
+			this: any,
+			event: TuiMouseEvent,
+		): TuiMouseEventResult | undefined {
+			if (registry.isHandlingMouse) {
+				return undefined;
+			}
+			registry.isHandlingMouse = true;
+			try {
+				const origResult = registry.originalHandleMouse
+					? registry.originalHandleMouse.call(this, event)
+					: undefined;
+				if (origResult?.handled) {
+					return origResult;
+				}
+				for (const hook of registry.hooks.values()) {
+					try {
+						const result = hook.handleMouse.call(this, event);
+						if (result?.handled) {
+							return result;
+						}
+					} catch {
+						// Guard against hook mouse error
+					}
+				}
+				return origResult;
+			} finally {
+				registry.isHandlingMouse = false;
+			}
+		};
+	}
+	return registry;
+}
+
 export function patchFooterComponent(
 	taskManager?: TaskManager,
 	getIsSelected?: () => boolean,
 	getIsHovered?: () => boolean,
 	onBadgeClick?: () => void,
 ): boolean {
-	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
+	const registry = getOrCreateFooterRegistry();
+	if (!registry) {
 		return false;
 	}
 	if (onBadgeClick) {
 		onBadgeClickHandler = onBadgeClick;
 	}
-	if ((FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY]) {
-		return true;
-	}
 
-	const originalRender = FooterComponent.prototype.render;
-	(FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY] = originalRender;
-	const originalHandleMouse = (FooterComponent.prototype as any).handleMouse;
-	if (originalHandleMouse) {
-		(FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY] = originalHandleMouse;
-	}
-	(FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY] = true;
-
-	FooterComponent.prototype.render = function (this: any, width: number): string[] {
-		const lines = originalRender.call(this, width);
-		if (!lines || lines.length < 2) {
-			currentBadgeBounds = null;
-			return lines;
-		}
-
-		const tm = taskManager ?? activeTaskManager;
-		if (!tm) {
-			currentBadgeBounds = null;
-			return lines;
-		}
-
-		const runningCount = tm.getRunningTasks().length;
-		if (runningCount <= 0) {
-			currentBadgeBounds = null;
-			return lines;
-		}
-
-		const theme = this.session?.theme ?? getActiveTheme();
-		const selected = getIsSelected ? getIsSelected() : isFooterSelected;
-		const hovered = getIsHovered ? getIsHovered() : isBadgeHovered;
-		const highlighted = selected || hovered;
-
-		currentBadgeBounds = calculateBadgeBounds(lines[1], runningCount, width);
-		lines[1] = formatStatsLineWithTasks(lines[1], runningCount, highlighted, width, theme);
-
-		return lines;
-	};
-
-	(FooterComponent.prototype as any).handleMouse = function (
-		this: any,
-		event: TuiMouseEvent,
-	): TuiMouseEventResult | undefined {
-		const orig = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
-		const origResult = orig ? orig.call(this, event) : undefined;
-		if (origResult?.handled) {
-			return origResult;
-		}
-
-		const tm = taskManager ?? activeTaskManager;
-		if (!tm || tm.getRunningTasks().length === 0) {
-			if (isBadgeHovered) {
-				isBadgeHovered = false;
-				return { handled: true, render: true };
+	registry.hooks.set("tasks", {
+		id: "tasks",
+		render(this: any, lines: string[], width: number): string[] {
+			if (!lines || lines.length < 2) {
+				currentBadgeBounds = null;
+				return lines;
 			}
-			return origResult;
-		}
 
-		const bounds = currentBadgeBounds;
-		if (!bounds) {
-			return origResult;
-		}
-
-		if (typeof event.screenY === "number" && typeof event.y === "number") {
-			lastFooterScreenY = event.screenY - event.y;
-		}
-
-		const inBounds =
-			event.y === bounds.y &&
-			event.x >= bounds.startX &&
-			event.x <= bounds.endX;
-
-		if (event.type === "move") {
-			if (inBounds !== isBadgeHovered) {
-				isBadgeHovered = inBounds;
-				return { handled: true, render: true };
+			const tm = taskManager ?? activeTaskManager;
+			if (!tm) {
+				currentBadgeBounds = null;
+				return lines;
 			}
-			if (inBounds) {
+
+			const runningCount = tm.getRunningTasks().length;
+			if (runningCount <= 0) {
+				currentBadgeBounds = null;
+				return lines;
+			}
+
+			const theme = this.session?.theme ?? getActiveTheme();
+			const selected = getIsSelected ? getIsSelected() : isFooterSelected;
+			const hovered = getIsHovered ? getIsHovered() : isBadgeHovered;
+			const highlighted = selected || hovered;
+
+			currentBadgeBounds = calculateBadgeBounds(lines[1], runningCount, width);
+			lines[1] = formatStatsLineWithTasks(lines[1], runningCount, highlighted, width, theme);
+
+			return lines;
+		},
+		handleMouse(this: any, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+			const tm = taskManager ?? activeTaskManager;
+			if (!tm || tm.getRunningTasks().length === 0) {
+				if (isBadgeHovered) {
+					isBadgeHovered = false;
+					return { handled: true, render: true };
+				}
+				return undefined;
+			}
+
+			const bounds = currentBadgeBounds;
+			if (!bounds) {
+				return undefined;
+			}
+
+			if (typeof event.screenY === "number" && typeof event.y === "number") {
+				lastFooterScreenY = event.screenY - event.y;
+			}
+
+			const inBounds =
+				event.y === bounds.y &&
+				event.x >= bounds.startX &&
+				event.x <= bounds.endX;
+
+			if (event.type === "move") {
+				if (inBounds !== isBadgeHovered) {
+					isBadgeHovered = inBounds;
+					return { handled: true, render: true };
+				}
+				if (inBounds) {
+					return { handled: true };
+				}
+				return undefined;
+			}
+
+			if (event.type === "press" && inBounds && event.button === "left") {
 				return { handled: true };
 			}
-			return origResult;
-		}
 
-		if (event.type === "press" && inBounds && event.button === "left") {
-			return { handled: true };
-		}
-
-		if (event.type === "click" && inBounds && event.button === "left") {
-			if (onBadgeClickHandler) {
-				onBadgeClickHandler();
+			if (event.type === "click" && inBounds && event.button === "left") {
+				if (onBadgeClickHandler) {
+					onBadgeClickHandler();
+				}
+				return { handled: true, render: true };
 			}
-			return { handled: true, render: true };
-		}
 
-		return origResult;
-	};
+			return undefined;
+		},
+	});
 
+	(FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY] = true;
 	return true;
 }
 
@@ -774,21 +834,22 @@ export function unpatchFooterComponent(): void {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return;
 	}
-	if ((FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY]) {
-		const originalRender = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
-		if (originalRender) {
-			FooterComponent.prototype.render = originalRender;
+	const registry: FooterRegistry | undefined = (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
+	if (registry) {
+		registry.hooks.delete("tasks");
+		if (registry.hooks.size === 0) {
+			FooterComponent.prototype.render = registry.originalRender;
+			if (registry.originalHandleMouse) {
+				(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
+			} else {
+				delete (FooterComponent.prototype as any).handleMouse;
+			}
+			delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 		}
-		const originalHandleMouse = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
-		if (originalHandleMouse) {
-			(FooterComponent.prototype as any).handleMouse = originalHandleMouse;
-		} else {
-			delete (FooterComponent.prototype as any).handleMouse;
-		}
-		delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
-		delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
-		delete (FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY];
 	}
+	delete (FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY];
+	delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
+	delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
 	isBadgeHovered = false;
 	currentBadgeBounds = null;
 	lastFooterScreenY = null;
