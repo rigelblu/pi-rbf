@@ -8,6 +8,7 @@ import {
 	FooterComponent,
 	getShellConfig,
 	keyText,
+	ToolExecutionComponent,
 	type BashOperations,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
@@ -36,9 +37,11 @@ export const TASK_ID_LENGTH = 8;
 
 export const BASH_EXECUTION_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.bashExecutionPatched");
 export const LOADER_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.loaderPatched");
+export const TOOL_EXECUTION_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.toolExecutionPatched");
 const ORIG_LOADER_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origLoaderUpdateDisplay");
 const ORIG_LOADER_SET_MESSAGE = Symbol.for("rbf.backgroundTasks.origLoaderSetMessage");
 const ORIG_BASH_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origBashUpdateDisplay");
+const ORIG_TOOL_EXECUTION_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origToolExecutionUpdateDisplay");
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -277,23 +280,93 @@ export class TaskManager {
 	}
 }
 
-export function formatBackgroundHintMessage(msg: string): string {
-	if (typeof msg !== "string" || !msg.includes("Running...")) {
+export function formatBackgroundHintMessage(
+	msg: string,
+	hasActiveForeground?: boolean,
+): string {
+	if (typeof msg !== "string") {
 		return msg;
 	}
 
 	// Remove /ctrl+c or ctrl+c/ from cancel hint (e.g. "escape/ctrl+c to cancel" -> "escape to cancel")
 	let updated = msg.replace(/\/ctrl\+c/gi, "").replace(/ctrl\+c\//gi, "");
 
-	if (!updated.includes("ctrl+b")) {
-		if (updated.includes("(")) {
-			updated = updated.replace(/Running\.\.\.\s*\(/, "Running... (ctrl+b to run in background · ");
-		} else {
-			updated = updated.replace("Running...", "Running... (ctrl+b to run in background)");
+	if (updated.includes("Running...")) {
+		if (!updated.includes("ctrl+b")) {
+			if (updated.includes("(")) {
+				updated = updated.replace(
+					/Running\.\.\.\s*\(/,
+					"Running... (ctrl+b to run in background · ",
+				);
+			} else {
+				updated = updated.replace(
+					"Running...",
+					"Running... (ctrl+b to run in background)",
+				);
+			}
 		}
+		return updated;
+	}
+
+	if (updated.startsWith("Working") || updated.includes("Working")) {
+		const shouldShow =
+			hasActiveForeground ??
+			(getActiveTaskManager()?.getActiveForeground() !== null &&
+				getActiveTaskManager()?.getActiveForeground() !== undefined);
+
+		if (shouldShow) {
+			if (!updated.includes("ctrl+b")) {
+				if (updated.includes("(")) {
+					updated = updated.replace(
+						/\s*\(.*?\)/,
+						" (ctrl+b to run in background · Esc to cancel)",
+					);
+				} else {
+					updated = `${updated} (ctrl+b to run in background · Esc to cancel)`;
+				}
+			}
+		} else {
+			updated = updated
+				.replace(/\s*\(ctrl\+b to run in background[^)]*\)/gi, "")
+				.trim();
+		}
+		return updated;
 	}
 
 	return updated;
+}
+
+/**
+ * Recursively search a component tree and append the background hint to any Text node
+ * displaying elapsed execution time (e.g. "Elapsed 8.0s").
+ */
+export function applyElapsedHint(node: any, theme?: any): boolean {
+	if (!node) return false;
+
+	if (typeof node.setText === "function" && typeof node.text === "string") {
+		const currentText = node.text;
+		if (currentText.includes("Elapsed") && !currentText.includes("ctrl+b")) {
+			const cleaned = currentText.replace(/\/ctrl\+c/gi, "").replace(/ctrl\+c\//gi, "");
+			const fg = theme?.fg ? theme.fg.bind(theme) : (_c: string, t: string) => t;
+			node.setText(cleaned + fg("muted", " · (ctrl+b to run in background · Esc to cancel)"));
+			return true;
+		}
+	}
+
+	let found = false;
+	if (node.child && applyElapsedHint(node.child, theme)) {
+		found = true;
+	}
+
+	if (Array.isArray(node.children)) {
+		for (const child of node.children) {
+			if (applyElapsedHint(child, theme)) {
+				found = true;
+			}
+		}
+	}
+
+	return found;
 }
 
 /**
@@ -360,6 +433,32 @@ export function patchBashExecutionComponent(): void {
 
 		bashProto[BASH_EXECUTION_PATCHED_KEY] = true;
 	}
+
+	// 3. Patch ToolExecutionComponent.prototype.updateDisplay for agent bash tools
+	const toolProto = (ToolExecutionComponent as any)?.prototype;
+	if (toolProto && !toolProto[TOOL_EXECUTION_PATCHED_KEY]) {
+		const origToolUpdateDisplay = toolProto.updateDisplay;
+		toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY] = origToolUpdateDisplay;
+
+		toolProto.updateDisplay = function () {
+			if (typeof origToolUpdateDisplay === "function") {
+				try {
+					origToolUpdateDisplay.call(this);
+				} catch {}
+			}
+			if (this.isPartial && (this.toolName === "bash" || !this.toolName)) {
+				const renderContainer =
+					typeof this.getRenderShell === "function" && this.getRenderShell() === "self"
+						? this.selfRenderContainer
+						: this.contentBox;
+				if (renderContainer) {
+					applyElapsedHint(renderContainer, (this as any).theme);
+				}
+			}
+		};
+
+		toolProto[TOOL_EXECUTION_PATCHED_KEY] = true;
+	}
 }
 
 export function unpatchBashExecutionComponent(): void {
@@ -383,6 +482,15 @@ export function unpatchBashExecutionComponent(): void {
 			delete bashProto[ORIG_BASH_UPDATE_DISPLAY];
 		}
 		delete bashProto[BASH_EXECUTION_PATCHED_KEY];
+	}
+
+	const toolProto = (ToolExecutionComponent as any)?.prototype;
+	if (toolProto && toolProto[TOOL_EXECUTION_PATCHED_KEY]) {
+		if (toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY]) {
+			toolProto.updateDisplay = toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+			delete toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+		}
+		delete toolProto[TOOL_EXECUTION_PATCHED_KEY];
 	}
 }
 
@@ -814,9 +922,10 @@ export function createBackgroundableOperations(
 
 					// Update footer
 					updateFooterBadge(ctx, taskManager);
+					(ctx?.ui as any)?.requestRender?.();
 
-					// Emit detachment notice to chat row
-					const notice = `\nCommand was manually backgrounded by user with ID: ${task.id}. Output is being written to:\n  ${task.logPath}\n`;
+					// Emit detachment notice to chat row and agent context
+					const notice = `\nCommand was manually backgrounded by user with ID: ${task.id}. Output is being written to:\n  ${task.logPath}\n\n[Process running in background]\nTask ID: ${task.id}\nCommand: ${task.command}\nStatus: actively running in background\nNotice: This command was moved to the background by the user and is still executing. Inform the user that it is running in the background and do not state that it has completed.\n`;
 					options.onData(Buffer.from(notice));
 
 					// Resolve foreground execution cleanly so chat row completes
@@ -833,6 +942,7 @@ export function createBackgroundableOperations(
 					task.status = "stopped";
 					task.endTime = Date.now();
 					taskManager.clearActiveForeground();
+					(ctx?.ui as any)?.requestRender?.();
 					if (task.pid) {
 						terminateProcessTree(task.pid);
 					}
@@ -844,6 +954,7 @@ export function createBackgroundableOperations(
 				};
 
 				taskManager.setActiveForeground({ task, detach, abort });
+				(ctx?.ui as any)?.requestRender?.();
 
 				child.stdout?.on("data", (chunk: Buffer) => {
 					appendLog(chunk);
@@ -888,6 +999,7 @@ export function createBackgroundableOperations(
 						updateFooterBadge(ctx, taskManager);
 					} else {
 						taskManager.clearActiveForeground();
+						(ctx?.ui as any)?.requestRender?.();
 						try {
 							logStream.end(() => {
 								finishAndResolve(code);
@@ -921,6 +1033,7 @@ export function createBackgroundableOperations(
 						updateFooterBadge(ctx, taskManager);
 					} else {
 						taskManager.clearActiveForeground();
+						(ctx?.ui as any)?.requestRender?.();
 						try {
 							logStream.end(() => {
 								finishAndResolve(1);
@@ -1338,6 +1451,10 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 	if (typeof pi.registerTool === "function") {
 		pi.registerTool({
 			...baseBashTool,
+			promptGuidelines: [
+				...(baseBashTool.promptGuidelines || []),
+				"When a command is backgrounded by the user, it is actively running in the background. Inform the user that the command is running in the background with its Task ID, and do not state that it has finished.",
+			],
 			async execute(id, params, signal, onUpdate, ctx) {
 				if (ctx) {
 					currentSessionCtx = ctx;
@@ -1352,16 +1469,8 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 			renderResult(result, options, theme, context) {
 				const safeContext = context ? ((context as any).state ? context : { ...context, state: {} }) : ({ state: {} } as any);
 				const comp = baseBashTool.renderResult!(result as any, options, theme, safeContext);
-				if (options.isPartial && comp && Array.isArray((comp as any).children)) {
-					const children = (comp as any).children;
-					const lastChild = children[children.length - 1];
-					if (lastChild && typeof lastChild.setText === "function" && typeof (lastChild as any).text === "string") {
-						const currentText = (lastChild as any).text;
-						if (currentText.includes("Elapsed") && !currentText.includes("ctrl+b")) {
-							const fg = theme?.fg ? theme.fg.bind(theme) : (_c: string, t: string) => t;
-							lastChild.setText(currentText + fg("muted", " · (ctrl+b to run in background · Esc to cancel)"));
-						}
-					}
+				if (options.isPartial && comp) {
+					applyElapsedHint(comp, theme);
 				}
 				return comp;
 			},

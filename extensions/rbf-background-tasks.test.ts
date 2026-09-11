@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	applyElapsedHint,
 	BASH_EXECUTION_PATCHED_KEY,
 	BACKGROUND_TASKS_STATUS_KEY,
 	calculateBadgeBounds,
@@ -15,6 +16,7 @@ import {
 	formatRuntime,
 	formatStatsLineWithTasks,
 	generateTaskId,
+	getActiveTaskManager,
 	getBadgeBounds,
 	getIsBadgeHovered,
 	getIsFooterSelected,
@@ -25,17 +27,19 @@ import {
 	patchBashExecutionComponent,
 	patchFooterComponent,
 	rbfBackgroundTasks,
+	setActiveTaskManager,
 	setIsBadgeHovered,
 	setIsFooterSelected,
 	setOnBadgeClick,
 	TaskManager,
 	terminateProcessTree,
+	TOOL_EXECUTION_PATCHED_KEY,
 	unpatchBashExecutionComponent,
 	unpatchFooterComponent,
 	updateFooterBadge,
 	type BackgroundTask,
 } from "./rbf-background-tasks.ts";
-import { BashExecutionComponent, FooterComponent, initTheme } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, FooterComponent, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 
 describe("rbf-background-tasks", () => {
@@ -65,6 +69,7 @@ describe("rbf-background-tasks", () => {
 
 	afterEach(() => {
 		unpatchBashExecutionComponent();
+		setActiveTaskManager(null);
 		try {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		} catch {}
@@ -393,9 +398,114 @@ describe("rbf-background-tasks", () => {
 			patchBashExecutionComponent();
 			expect((BashExecutionComponent.prototype as any)[BASH_EXECUTION_PATCHED_KEY]).toBe(true);
 			expect((Loader.prototype as any)[LOADER_PATCHED_KEY]).toBe(true);
+			expect((ToolExecutionComponent.prototype as any)[TOOL_EXECUTION_PATCHED_KEY]).toBe(true);
 			unpatchBashExecutionComponent();
 			expect((BashExecutionComponent.prototype as any)[BASH_EXECUTION_PATCHED_KEY]).toBeUndefined();
 			expect((Loader.prototype as any)[LOADER_PATCHED_KEY]).toBeUndefined();
+			expect((ToolExecutionComponent.prototype as any)[TOOL_EXECUTION_PATCHED_KEY]).toBeUndefined();
+		});
+
+		it("formats agent Working status message with ctrl+b hint when active foreground exists", () => {
+			expect(formatBackgroundHintMessage("Working", true)).toBe(
+				"Working (ctrl+b to run in background · Esc to cancel)",
+			);
+			expect(formatBackgroundHintMessage("Working (Esc to interrupt)", true)).toBe(
+				"Working (ctrl+b to run in background · Esc to cancel)",
+			);
+			expect(
+				formatBackgroundHintMessage(
+					"Working (ctrl+b to run in background · Esc to cancel)",
+					false,
+				),
+			).toBe("Working");
+			expect(formatBackgroundHintMessage("Working", false)).toBe("Working");
+
+			// Dynamically respects activeTaskManager foreground execution
+			const tm = new TaskManager();
+			setActiveTaskManager(tm);
+
+			expect(formatBackgroundHintMessage("Working")).toBe("Working");
+
+			tm.setActiveForeground({
+				task: { id: "test" } as any,
+				detach: () => {},
+				abort: () => {},
+			});
+			expect(formatBackgroundHintMessage("Working")).toBe(
+				"Working (ctrl+b to run in background · Esc to cancel)",
+			);
+
+			tm.clearActiveForeground();
+			expect(
+				formatBackgroundHintMessage(
+					"Working (ctrl+b to run in background · Esc to cancel)",
+				),
+			).toBe("Working");
+		});
+
+		it("applyElapsedHint appends background hint to Text components displaying elapsed time", () => {
+			const mockTextNode = {
+				text: "Elapsed 5.2s",
+				setText: vi.fn(function (val: string) {
+					mockTextNode.text = val;
+				}),
+			};
+
+			const modified = applyElapsedHint(mockTextNode);
+			expect(modified).toBe(true);
+			expect(mockTextNode.text).toBe(
+				"Elapsed 5.2s · (ctrl+b to run in background · Esc to cancel)",
+			);
+			expect(mockTextNode.setText).toHaveBeenCalled();
+
+			// Calling again is idempotent (does not duplicate)
+			const modifiedAgain = applyElapsedHint(mockTextNode);
+			expect(modifiedAgain).toBe(false);
+			expect(mockTextNode.text).toBe(
+				"Elapsed 5.2s · (ctrl+b to run in background · Esc to cancel)",
+			);
+
+			// Traverses nested structure: Container -> MouseRegion -> Text
+			const nestedText = {
+				text: "Elapsed 12.0s",
+				setText: vi.fn(function (val: string) {
+					nestedText.text = val;
+				}),
+			};
+			const mouseRegion = { child: nestedText };
+			const container = { children: [mouseRegion] };
+
+			const nestedModified = applyElapsedHint(container);
+			expect(nestedModified).toBe(true);
+			expect(nestedText.text).toBe(
+				"Elapsed 12.0s · (ctrl+b to run in background · Esc to cancel)",
+			);
+		});
+
+		it("patches ToolExecutionComponent.prototype.updateDisplay and restores on unpatch", () => {
+			patchBashExecutionComponent();
+			expect((ToolExecutionComponent.prototype as any)[TOOL_EXECUTION_PATCHED_KEY]).toBe(true);
+
+			const mockElapsedText = {
+				text: "Elapsed 3.4s",
+				setText: vi.fn(function (t: string) {
+					mockElapsedText.text = t;
+				}),
+			};
+
+			const mockToolInstance = Object.create(ToolExecutionComponent.prototype);
+			mockToolInstance.isPartial = true;
+			mockToolInstance.toolName = "bash";
+			mockToolInstance.getRenderShell = () => "self";
+			mockToolInstance.selfRenderContainer = {
+				children: [{ child: mockElapsedText }],
+			};
+
+			mockToolInstance.updateDisplay();
+			expect(mockElapsedText.text).toContain("ctrl+b to run in background · Esc to cancel");
+
+			unpatchBashExecutionComponent();
+			expect((ToolExecutionComponent.prototype as any)[TOOL_EXECUTION_PATCHED_KEY]).toBeUndefined();
 		});
 	});
 
@@ -910,6 +1020,96 @@ describe("rbf-background-tasks", () => {
 			await shutdownHandler!();
 		});
 
+		it("wires agent bash tool registration so agent commands can be backgrounded via Ctrl+B", async () => {
+			const eventHandlers = new Map<string, Function>();
+			let registeredBashTool: any = null;
+			const mockPi: any = {
+				on: vi.fn((event: string, handler: Function) => {
+					eventHandlers.set(event, handler);
+				}),
+				registerCommand: vi.fn(),
+				registerTool: vi.fn((tool: any) => {
+					if (tool.name === "bash") {
+						registeredBashTool = tool;
+					}
+				}),
+			};
+
+			rbfBackgroundTasks(mockPi);
+
+			expect(registeredBashTool).not.toBeNull();
+			expect(typeof registeredBashTool.execute).toBe("function");
+
+			let terminalInputListener: ((data: string) => any) | null = null;
+			const mockCtx: any = {
+				hasUI: true,
+				ui: {
+					onTerminalInput: vi.fn((cb: any) => {
+						terminalInputListener = cb;
+					}),
+					notify: vi.fn(),
+					setStatus: vi.fn(),
+					setWorkingMessage: vi.fn(),
+					requestRender: vi.fn(),
+				},
+				sessionManager: {
+					getSessionId: () => "sess-agent-1",
+					getSessionFile: () => "/tmp/sess-agent-1.json",
+				},
+			};
+
+			const sessionStartHandler = eventHandlers.get("session_start");
+			await sessionStartHandler!({}, mockCtx);
+
+			// Start an agent bash command execution
+			const execPromise = registeredBashTool.execute(
+				"tool-call-1",
+				{ command: "sleep 10" },
+				new AbortController().signal,
+				vi.fn(),
+				mockCtx,
+			);
+
+			await new Promise((r) => setTimeout(r, 100));
+
+			// Verify active foreground is detected and working message formats with hint
+			expect(getActiveTaskManager()?.getActiveForeground()).not.toBeNull();
+			expect(formatBackgroundHintMessage("Working")).toBe(
+				"Working (ctrl+b to run in background · Esc to cancel)",
+			);
+
+			// Verify renderResult appends hint
+			const partialResult = registeredBashTool.renderResult(
+				{ content: [] },
+				{ isPartial: true },
+				undefined,
+				{ state: { startedAt: Date.now() - 5000 }, invalidate: () => {} },
+			);
+			expect(partialResult).toBeDefined();
+
+			// Detach via Ctrl+B keystroke
+			const res = terminalInputListener!("\x02");
+			expect(res).toEqual({ consume: true });
+
+			const execRes = await execPromise;
+			expect(execRes).toBeDefined();
+
+			// Output contains background notice
+			const textBlock = execRes.content?.find((c: any) => typeof c.text === "string");
+			expect(textBlock?.text).toContain("Command was manually backgrounded by user with ID:");
+
+			// Active foreground cleared and status reverts
+			expect(getActiveTaskManager()?.getActiveForeground()).toBeNull();
+			expect(
+				formatBackgroundHintMessage(
+					"Working (ctrl+b to run in background · Esc to cancel)",
+				),
+			).toBe("Working");
+
+			const shutdownHandler = eventHandlers.get("session_shutdown");
+			await shutdownHandler!();
+		});
+
 		it("session_start handles Down arrow to select footer badge and Enter to open /tasks", async () => {
 			const eventHandlers = new Map<string, any>();
 			const commands = new Map<string, any>();
@@ -1192,6 +1392,9 @@ describe("rbf-background-tasks", () => {
 			expect(registeredTool.name).toBe("bash");
 			expect(typeof registeredTool.execute).toBe("function");
 			expect(typeof registeredTool.renderResult).toBe("function");
+			expect(registeredTool.promptGuidelines).toEqual(
+				expect.arrayContaining([expect.stringContaining("running in the background")]),
+			);
 		});
 
 		it("appends background hint to renderResult elapsed line when isPartial is true", () => {
