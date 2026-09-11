@@ -1,19 +1,30 @@
-import { describe, expect, it, vi } from "vitest";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	Theme,
+import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
+import {
+	FooterComponent,
+	initTheme,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import rbfTodos, {
+	calculateBadgeBounds,
 	createTodoListModalComponent,
 	createTodoToolDefinition,
+	formatStatsLineWithTodos,
+	getBadgeBounds,
+	getIsBadgeHovered,
+	getLastFooterScreenY,
 	MAX_VISIBLE_WIDGET_ITEMS,
+	patchFooterComponent,
 	SESSION_CUSTOM_TYPE,
+	setIsBadgeHovered,
+	setLastFooterScreenY,
 	SHORTCUT_KEY,
 	STATUS_KEY,
 	TodoManager,
+	unpatchFooterComponent,
 	updateExtensionUI,
 	WIDGET_KEY,
 } from "./rbf-todos.ts";
@@ -23,6 +34,7 @@ function createMockTheme(): Theme {
 		fg: vi.fn((_color: string, text: string) => `[${text}]`),
 		bold: vi.fn((text: string) => `*${text}*`),
 		dim: vi.fn((text: string) => `~${text}~`),
+		inverse: vi.fn((text: string) => `!${text}!`),
 		strikethrough: vi.fn((text: string) => `-${text}-`),
 	} as unknown as Theme;
 }
@@ -31,6 +43,10 @@ function getText(result: any): string {
 	const first = result?.content?.[0];
 	return first && typeof first === "object" && "text" in first ? first.text : "";
 }
+
+afterEach(() => {
+	unpatchFooterComponent();
+});
 
 function createMockContext(entries: any[] = []) {
 	let widgetContent: string[] | undefined;
@@ -422,7 +438,8 @@ describe("todo tool definition", () => {
 		expect(result.details?.item?.text).toBe("New feature");
 		expect(mock.appendedCustomEntries).toHaveLength(1);
 		expect(mock.widgetContent).toBeDefined();
-		expect(mock.statusText).toContain("📋 0/1");
+		expect(mock.statusText).toBeUndefined();
+		expect(mgr.formatFooterStatus()).toContain("📋 0/1");
 	});
 
 	it("returns error on 'add' action without text", async () => {
@@ -459,7 +476,8 @@ describe("todo tool definition", () => {
 		expect(getText(result)).toContain("Updated todo #1 [completed]");
 		expect(result.details?.item?.text).toBe("Renamed & done");
 		expect(result.details?.item?.status).toBe("completed");
-		expect(mock.statusText).toContain("📋 1/1");
+		expect(mock.statusText).toBeUndefined();
+		expect(mgr.formatFooterStatus()).toContain("📋 1/1");
 	});
 
 	it("returns error on 'update' action when id is missing or not found", async () => {
@@ -707,7 +725,7 @@ describe("rbfTodos extension lifecycle", () => {
 			// Trigger shortcut to hide
 			shortcut.handler(mock.ctx);
 			expect(mock.widgetContent).toBeUndefined();
-			expect(mock.notifyMessage).toBe("Todos widget hidden");
+			expect(mock.notifyMessage).toBeUndefined();
 
 			// Immediate second invocation within debounce window is ignored
 			shortcut.handler(mock.ctx);
@@ -719,7 +737,7 @@ describe("rbfTodos extension lifecycle", () => {
 			// Trigger shortcut to show
 			shortcut.handler(mock.ctx);
 			expect(mock.widgetContent).toBeDefined();
-			expect(mock.notifyMessage).toBe("Todos widget shown");
+			expect(mock.notifyMessage).toBeUndefined();
 		} finally {
 			vi.useRealTimers();
 		}
@@ -740,8 +758,8 @@ describe("rbfTodos extension lifecycle", () => {
 		// User submits prompt -> before_agent_start fires -> widget collapses
 		await mockAPI.emit("before_agent_start", { type: "before_agent_start" }, mock.ctx);
 		expect(mock.widgetContent).toBeUndefined();
-		// Status badge in footer remains visible
-		expect(mock.statusText).toContain("📋 1/1");
+		// Line 3 footer status is cleared (badge lives on line 1 stats)
+		expect(mock.statusText).toBeUndefined();
 	});
 
 	it("reconstructs branch state on session_tree and session_start", async () => {
@@ -767,11 +785,11 @@ describe("rbfTodos extension lifecycle", () => {
 		const mock = createMockContext(branchEntries);
 
 		await mockAPI.emit("session_start", { type: "session_start", reason: "startup" }, mock.ctx);
-		expect(mock.statusText).toContain("📋 1/2");
+		expect(mock.statusText).toBeUndefined();
 		expect(mock.widgetContent).toBeDefined();
 
 		await mockAPI.emit("session_tree", { type: "session_tree" }, mock.ctx);
-		expect(mock.statusText).toContain("📋 1/2");
+		expect(mock.statusText).toBeUndefined();
 	});
 
 	it("executes /todos command opening modal in TUI mode or notify in non-TUI", async () => {
@@ -814,7 +832,7 @@ describe("rbfTodos extension lifecycle", () => {
 			const res1 = mock.terminalInputListener!("\x1b[116;3:1u");
 			expect(res1).toEqual({ consume: true });
 			expect(mock.widgetContent).toBeUndefined();
-			expect(mock.notifyMessage).toBe("Todos widget hidden");
+			expect(mock.notifyMessage).toBeUndefined();
 
 			// 2. Key release event (\x1b[116;3:3u) must be consumed and NOT toggle back
 			const resRelease = mock.terminalInputListener!("\x1b[116;3:3u");
@@ -833,9 +851,174 @@ describe("rbfTodos extension lifecycle", () => {
 			const res2 = mock.terminalInputListener!("†");
 			expect(res2).toEqual({ consume: true });
 			expect(mock.widgetContent).toBeDefined();
-			expect(mock.notifyMessage).toBe("Todos widget shown");
+			expect(mock.notifyMessage).toBeUndefined();
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("handles SGR mouse move events outside badge bounds to reset hover", async () => {
+		const mockAPI = createMockExtensionAPI();
+		rbfTodos(mockAPI.api);
+		const mock = createMockContext();
+
+		await mockAPI.emit("session_start", { type: "session_start" }, mock.ctx);
+		expect(mock.terminalInputListener).toBeDefined();
+
+		setIsBadgeHovered(true);
+		expect(getIsBadgeHovered()).toBe(true);
+
+		// SGR move at screen coordinates (x=10, y=10)
+		mock.terminalInputListener!("\x1b[<35;10;10M");
+		expect(getIsBadgeHovered()).toBe(false);
+	});
+});
+
+describe("formatStatsLineWithTodos & calculateBadgeBounds", () => {
+	const theme = {
+		fg: vi.fn((_color: string, text: string) => `[${text}]`),
+		bold: vi.fn((text: string) => `*${text}*`),
+		inverse: vi.fn((text: string) => `!${text}!`),
+	};
+
+	it("returns original statsLine when totalCount is 0", () => {
+		const line = "↑109k ↓195 (auto)          (anthropic) claude-3-5-sonnet";
+		expect(formatStatsLineWithTodos(line, 0, 0, false, 80, theme)).toBe(line);
+		expect(calculateBadgeBounds(line, 0, 0, 80)).toBeNull();
+	});
+
+	it("injects resting badge with accent font and dim bullet into stats line", () => {
+		const line = "↑109k ↓195 (auto)          (anthropic) claude-3-5-sonnet";
+		const formatted = formatStatsLineWithTodos(line, 0, 3, false, 80, theme);
+		expect(formatted).toContain("· ");
+		expect(formatted).toContain("📋 0/3");
+		expect(formatted).toContain("(anthropic) claude-3-5-sonnet");
+	});
+
+	it("injects hovered badge with inverse styling when isSelected is true", () => {
+		const line = "↑109k ↓195 (auto)          (anthropic) claude-3-5-sonnet";
+		const formatted = formatStatsLineWithTodos(line, 1, 3, true, 80, theme);
+		expect(formatted).toContain("! 📋 1/3 !");
+	});
+
+	it("calculates accurate badge bounds", () => {
+		const line = "↑109k ↓195 (auto)          (anthropic) claude-3-5-sonnet";
+		const bounds = calculateBadgeBounds(line, 0, 3, 80);
+		expect(bounds).not.toBeNull();
+		expect(bounds?.y).toBe(1);
+		expect(bounds?.startX).toBeGreaterThan(0);
+		expect(bounds?.endX).toBeGreaterThan(bounds!.startX);
+	});
+});
+
+describe("patchFooterComponent & unpatchFooterComponent", () => {
+	beforeAll(() => {
+		initTheme();
+	});
+
+	afterEach(() => {
+		unpatchFooterComponent();
+	});
+
+	it("patches FooterComponent and renders todo badge on lines[1] without creating line 3", () => {
+		const tm = new TodoManager();
+		let hovered = false;
+		const patched = patchFooterComponent(tm, () => hovered);
+		expect(patched).toBe(true);
+
+		const mockSession = {
+			sessionManager: { getCwd: () => "/test", getSessionName: () => undefined, getEntries: () => [] },
+			state: { model: { id: "claude-3-5-sonnet", provider: "anthropic" } },
+			modelRuntime: { isUsingSubscription: () => true },
+			getContextUsage: () => ({ percent: 0.1, contextWindow: 272000 }),
+		};
+		const mockFooterData = {
+			getGitBranch: () => "main",
+			getAvailableProviderCount: () => 1,
+			getExtensionStatuses: () => new Map(),
+		};
+		const footer = new (FooterComponent as any)(mockSession, mockFooterData);
+
+		// With 0 todos: only 2 lines, no clipboard badge
+		const lines0 = footer.render(100);
+		expect(lines0.length).toBe(2);
+		expect(lines0[1]).not.toContain("📋");
+
+		// Add a todo
+		tm.add("Write tests");
+
+		// With 1 todo: lines[1] contains "📋 0/1"
+		const lines1 = footer.render(100);
+		expect(lines1.length).toBe(2);
+		expect(lines1[1]).toContain("📋 0/1");
+
+		// Unpatch restores original
+		unpatchFooterComponent();
+		const linesUnpatched = footer.render(100);
+		expect(linesUnpatched[1]).not.toContain("📋");
+	});
+
+	it("handles mouse hover and click interactions on todo badge", () => {
+		const tm = new TodoManager();
+		tm.add("Write tests");
+		let hovered = false;
+		const onBadgeClick = vi.fn();
+
+		patchFooterComponent(
+			tm,
+			() => hovered,
+			onBadgeClick,
+		);
+
+		const mockSession = {
+			sessionManager: { getCwd: () => "/test", getSessionName: () => undefined, getEntries: () => [] },
+			state: { model: { id: "claude-3-5-sonnet", provider: "anthropic" } },
+			modelRuntime: { isUsingSubscription: () => true },
+			getContextUsage: () => ({ percent: 0.1, contextWindow: 272000 }),
+		};
+		const mockFooterData = {
+			getGitBranch: () => "main",
+			getAvailableProviderCount: () => 1,
+			getExtensionStatuses: () => new Map(),
+		};
+		const footer = new (FooterComponent as any)(mockSession, mockFooterData);
+
+		// Render to populate currentBadgeBounds
+		footer.render(100);
+		const bounds = getBadgeBounds();
+		expect(bounds).not.toBeNull();
+
+		// Mouse move outside badge
+		const moveOut = footer.handleMouse({
+			type: "move",
+			x: 0,
+			y: 0,
+			screenX: 0,
+			screenY: 0,
+		});
+		expect(moveOut).toBeUndefined();
+
+		// Mouse move inside badge
+		const moveIn = footer.handleMouse({
+			type: "move",
+			x: bounds!.startX + 2,
+			y: bounds!.y,
+			screenX: bounds!.startX + 2,
+			screenY: 20,
+		});
+		expect(moveIn?.handled).toBe(true);
+		expect(getIsBadgeHovered()).toBe(true);
+
+		// Mouse click inside badge triggers handler
+		const clickResult = footer.handleMouse({
+			type: "click",
+			button: "left",
+			x: bounds!.startX + 2,
+			y: bounds!.y,
+			screenX: bounds!.startX + 2,
+			screenY: 20,
+		});
+		expect(clickResult?.handled).toBe(true);
+		expect(onBadgeClick).toHaveBeenCalled();
 	});
 });

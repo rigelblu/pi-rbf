@@ -1,9 +1,10 @@
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	Theme,
-	ToolDefinition,
+import {
+	FooterComponent,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type Theme,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
 	isKeyRelease,
@@ -15,6 +16,8 @@ import {
 	visibleWidth,
 	type Component,
 	type TUI,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -36,6 +39,12 @@ export interface TodoToolDetails {
 	error?: string;
 }
 
+export interface BadgeBounds {
+	y: number;
+	startX: number;
+	endX: number;
+}
+
 export const WIDGET_KEY = "todos";
 export const STATUS_KEY = "todos";
 export const SHORTCUT_KEY = "alt+t";
@@ -43,6 +52,281 @@ export const COMMAND_NAME = "todos";
 export const TOOL_NAME = "todo";
 export const SESSION_CUSTOM_TYPE = "rbf-todos";
 export const MAX_VISIBLE_WIDGET_ITEMS = 5;
+
+const FOOTER_TODOS_PATCHED_KEY = Symbol.for("@earendil-works/pi-rbf:footer-todos-patched");
+const ORIGINAL_FOOTER_RENDER_KEY = Symbol.for("@earendil-works/pi-rbf:original-todos-footer-render");
+const ORIGINAL_FOOTER_HANDLE_MOUSE_KEY = Symbol.for("@earendil-works/pi-rbf:original-todos-footer-handle-mouse");
+
+const FALLBACK_THEME = {
+	fg: (_name: string, str: string) => str,
+	bold: (str: string) => str,
+	inverse: (str: string) => str,
+};
+
+export function getActiveTheme(): any {
+	return (
+		(typeof globalThis !== "undefined"
+			? (globalThis as any)[Symbol.for("@earendil-works/pi-coding-agent:theme")] ??
+				(globalThis as any)[Symbol.for("@mariozechner/pi-coding-agent:theme")]
+			: undefined) ?? FALLBACK_THEME
+	);
+}
+
+let activeTodoManager: TodoManager | null = null;
+let activeGetIsHovered: (() => boolean) | null = null;
+let isBadgeHovered = false;
+let currentBadgeBounds: BadgeBounds | null = null;
+let lastFooterScreenY: number | null = null;
+let onBadgeClickHandler: (() => void) | null = null;
+
+export function getIsBadgeHovered(): boolean {
+	return isBadgeHovered;
+}
+
+export function setIsBadgeHovered(hovered: boolean): void {
+	isBadgeHovered = hovered;
+}
+
+export function getBadgeBounds(): BadgeBounds | null {
+	return currentBadgeBounds;
+}
+
+export function getLastFooterScreenY(): number | null {
+	return lastFooterScreenY;
+}
+
+export function setLastFooterScreenY(screenY: number | null): void {
+	lastFooterScreenY = screenY;
+}
+
+/**
+ * Injects todo progress badge directly into the stats line (lines[1])
+ * to the right of stats and (auto).
+ */
+export function formatStatsLineWithTodos(
+	statsLine: string,
+	completedCount: number,
+	totalCount: number,
+	isSelected: boolean,
+	width: number,
+	theme: any,
+): string {
+	if (totalCount <= 0 || !statsLine) return statsLine;
+
+	const badgeText = `📋 ${completedCount}/${totalCount}`;
+	const bullet = theme?.fg ? theme.fg("dim", "· ") : "· ";
+	let styledBadge: string;
+	if (isSelected) {
+		if (theme?.inverse) {
+			styledBadge =
+				bullet +
+				(theme.bold
+					? theme.bold(theme.inverse(` ${badgeText} `))
+					: theme.inverse(` ${badgeText} `));
+		} else {
+			styledBadge = bullet + `[${badgeText}]`;
+		}
+	} else {
+		styledBadge = bullet + (theme?.fg ? theme.fg("accent", badgeText) : badgeText);
+	}
+
+	// Find the padding between the left stats and right-aligned model
+	const padMatch = statsLine.match(/^(.*?)(\s{2,})(.*)$/);
+	if (!padMatch) {
+		const combined = `${statsLine} ${styledBadge}`;
+		return truncateToWidth(combined, width, "");
+	}
+
+	const left = padMatch[1];
+	const right = padMatch[3];
+	const newLeft = `${left} ${styledBadge}`;
+	const newLeftWidth = visibleWidth(newLeft);
+	const rightWidth = visibleWidth(right);
+	const minPadding = 2;
+
+	if (newLeftWidth + minPadding + rightWidth <= width) {
+		const pad = " ".repeat(width - newLeftWidth - rightWidth);
+		return newLeft + pad + right;
+	}
+
+	const availableForRight = width - newLeftWidth - minPadding;
+	if (availableForRight > 0) {
+		const truncatedRight = truncateToWidth(right, availableForRight, "");
+		const pad = " ".repeat(Math.max(0, width - newLeftWidth - visibleWidth(truncatedRight)));
+		return newLeft + pad + truncatedRight;
+	}
+
+	return truncateToWidth(newLeft, width, "");
+}
+
+/**
+ * Calculates the horizontal hit-box bounds for the todos badge in lines[1].
+ */
+export function calculateBadgeBounds(
+	statsLine: string,
+	completedCount: number,
+	totalCount: number,
+	width: number,
+): BadgeBounds | null {
+	if (totalCount <= 0 || !statsLine) return null;
+
+	const badgeText = `📋 ${completedCount}/${totalCount}`;
+	const padMatch = statsLine.match(/^(.*?)(\s{2,})(.*)$/);
+	const left = padMatch ? padMatch[1] : statsLine;
+	const leftWidth = visibleWidth(left);
+	const startX = leftWidth + 1;
+	// Bullet "· " has width 2, badgeText, plus optional padding (2)
+	const badgeWidth = 2 + visibleWidth(badgeText) + 2;
+	const endX = Math.min(width, startX + badgeWidth);
+	if (startX >= width) return null;
+
+	return { y: 1, startX, endX };
+}
+
+export function patchFooterComponent(
+	todoManager?: TodoManager,
+	getIsHovered?: () => boolean,
+	onBadgeClick?: () => void,
+): boolean {
+	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
+		return false;
+	}
+	if (todoManager) {
+		activeTodoManager = todoManager;
+	}
+	if (getIsHovered) {
+		activeGetIsHovered = getIsHovered;
+	}
+	if (onBadgeClick) {
+		onBadgeClickHandler = onBadgeClick;
+	}
+	if ((FooterComponent.prototype as any)[FOOTER_TODOS_PATCHED_KEY]) {
+		return true;
+	}
+
+	const originalRender = FooterComponent.prototype.render;
+	(FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY] = originalRender;
+	const originalHandleMouse = (FooterComponent.prototype as any).handleMouse;
+	if (originalHandleMouse) {
+		(FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY] = originalHandleMouse;
+	}
+	(FooterComponent.prototype as any)[FOOTER_TODOS_PATCHED_KEY] = true;
+
+	FooterComponent.prototype.render = function (this: any, width: number): string[] {
+		const lines = originalRender.call(this, width);
+		if (!lines || lines.length < 2) {
+			currentBadgeBounds = null;
+			return lines;
+		}
+
+		const tm = activeTodoManager;
+		if (!tm) {
+			currentBadgeBounds = null;
+			return lines;
+		}
+
+		const { total, completed } = tm.getCounts();
+		if (total <= 0) {
+			currentBadgeBounds = null;
+			return lines;
+		}
+
+		const theme = this.session?.theme ?? getActiveTheme();
+		const hovered = activeGetIsHovered ? activeGetIsHovered() : isBadgeHovered;
+
+		currentBadgeBounds = calculateBadgeBounds(lines[1], completed, total, width);
+		lines[1] = formatStatsLineWithTodos(lines[1], completed, total, hovered, width, theme);
+
+		return lines;
+	};
+
+	(FooterComponent.prototype as any).handleMouse = function (
+		this: any,
+		event: TuiMouseEvent,
+	): TuiMouseEventResult | undefined {
+		const orig = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
+		const origResult = orig ? orig.call(this, event) : undefined;
+		if (origResult?.handled) {
+			return origResult;
+		}
+
+		const tm = activeTodoManager;
+		if (!tm || tm.getCounts().total === 0) {
+			if (isBadgeHovered) {
+				isBadgeHovered = false;
+				return { handled: true, render: true };
+			}
+			return origResult;
+		}
+
+		const bounds = currentBadgeBounds;
+		if (!bounds) {
+			return origResult;
+		}
+
+		if (typeof event.screenY === "number" && typeof event.y === "number") {
+			lastFooterScreenY = event.screenY - event.y;
+		}
+
+		const inBounds =
+			event.y === bounds.y &&
+			event.x >= bounds.startX &&
+			event.x <= bounds.endX;
+
+		if (event.type === "move") {
+			if (inBounds !== isBadgeHovered) {
+				isBadgeHovered = inBounds;
+				return { handled: true, render: true };
+			}
+			if (inBounds) {
+				return { handled: true };
+			}
+			return origResult;
+		}
+
+		if (event.type === "press" && inBounds && event.button === "left") {
+			return { handled: true };
+		}
+
+		if (event.type === "click" && inBounds && event.button === "left") {
+			if (onBadgeClickHandler) {
+				onBadgeClickHandler();
+			}
+			return { handled: true, render: true };
+		}
+
+		return origResult;
+	};
+
+	return true;
+}
+
+export function unpatchFooterComponent(): void {
+	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
+		return;
+	}
+	if ((FooterComponent.prototype as any)[FOOTER_TODOS_PATCHED_KEY]) {
+		const originalRender = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
+		if (originalRender) {
+			FooterComponent.prototype.render = originalRender;
+		}
+		const originalHandleMouse = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
+		if (originalHandleMouse) {
+			(FooterComponent.prototype as any).handleMouse = originalHandleMouse;
+		} else {
+			delete (FooterComponent.prototype as any).handleMouse;
+		}
+		delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
+		delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_HANDLE_MOUSE_KEY];
+		delete (FooterComponent.prototype as any)[FOOTER_TODOS_PATCHED_KEY];
+	}
+	activeTodoManager = null;
+	activeGetIsHovered = null;
+	isBadgeHovered = false;
+	currentBadgeBounds = null;
+	lastFooterScreenY = null;
+	onBadgeClickHandler = null;
+}
 
 // ─── TodoManager ─────────────────────────────────────────────────────────────
 
@@ -381,10 +665,16 @@ export function updateExtensionUI(
 		// Ignore if unsupported
 	}
 
-	// 2. Footer status
-	const footerStatus = todoManager.formatFooterStatus(theme);
+	// 2. Clear line 3 footer status (status badge is rendered directly in stats line 1 via patched FooterComponent)
 	try {
-		ctx.ui.setStatus?.(STATUS_KEY, footerStatus);
+		ctx.ui.setStatus?.(STATUS_KEY, undefined);
+	} catch {
+		// Ignore if unsupported
+	}
+
+	// 3. Request render so the patched footer stats line updates immediately
+	try {
+		(ctx.ui as any).requestRender?.();
 	} catch {
 		// Ignore if unsupported
 	}
@@ -891,21 +1181,33 @@ export function createTodoToolDefinition(
 
 export function rbfTodos(pi: ExtensionAPI): void {
 	const todoManager = new TodoManager();
+	activeTodoManager = todoManager;
 	let currentContext: ExtensionContext | undefined;
 	let lastToggleTime = 0;
 	let terminalInputSubscribed = false;
 
-	const handleToggleShortcut = (ctx: ExtensionContext) => {
+	const handleToggleShortcut = (ctx?: ExtensionContext) => {
 		const now = Date.now();
 		if (now - lastToggleTime < 250) {
 			return;
 		}
 		lastToggleTime = now;
-		currentContext = ctx;
-		const isVisible = todoManager.toggleWidgetVisible();
-		updateExtensionUI(ctx, todoManager);
-		ctx.ui?.notify?.(isVisible ? "Todos widget shown" : "Todos widget hidden", "info");
+		if (ctx) {
+			currentContext = ctx;
+		}
+		todoManager.toggleWidgetVisible();
+		if (currentContext) {
+			updateExtensionUI(currentContext, todoManager);
+		}
 	};
+
+	patchFooterComponent(
+		todoManager,
+		() => isBadgeHovered,
+		() => {
+			handleToggleShortcut(currentContext);
+		},
+	);
 
 	// 1. Register model tool `todo`
 	if (typeof pi.registerTool === "function") {
@@ -960,10 +1262,35 @@ export function rbfTodos(pi: ExtensionAPI): void {
 		todoManager.reconstructFromSession(entries);
 		updateExtensionUI(ctx, todoManager);
 
-		// Raw terminal input fallback for Alt+T if editor is unfocused
+		// Raw terminal input fallback for Alt+T and SGR mouse tracking
 		if (!terminalInputSubscribed && ctx.hasUI && typeof ctx.ui?.onTerminalInput === "function") {
 			terminalInputSubscribed = true;
 			ctx.ui.onTerminalInput((data: string) => {
+				// SGR mouse handling: reset hover if moved outside badge bounds
+				const sgrMatch = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+				if (sgrMatch) {
+					if (getIsBadgeHovered()) {
+						const screenX = Number.parseInt(sgrMatch[2], 10) - 1;
+						const screenY = Number.parseInt(sgrMatch[3], 10) - 1;
+						const bounds = getBadgeBounds();
+						const footerY =
+							getLastFooterScreenY() ??
+							(process.stdout.rows ? process.stdout.rows - 2 : null);
+						const badgeY = footerY !== null ? footerY + 1 : null;
+						if (
+							!bounds ||
+							badgeY === null ||
+							screenY !== badgeY ||
+							screenX < bounds.startX ||
+							screenX > bounds.endX
+						) {
+							setIsBadgeHovered(false);
+							(ctx.ui as any)?.requestRender?.();
+						}
+					}
+					return undefined;
+				}
+
 				if (matchesKey(data, SHORTCUT_KEY) || data === "\x1bt" || data === "†") {
 					if (isKeyRelease(data) || isKeyRepeat(data)) {
 						return { consume: true };
@@ -1000,6 +1327,11 @@ export function rbfTodos(pi: ExtensionAPI): void {
 		if (didCollapse) {
 			updateExtensionUI(ctx, todoManager);
 		}
+	});
+
+	// 7. Cleanup patches on session shutdown
+	pi.on?.("session_shutdown", async () => {
+		unpatchFooterComponent();
 	});
 }
 
