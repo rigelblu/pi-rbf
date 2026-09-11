@@ -949,6 +949,14 @@ describe("formatStatsLineWithTodos & calculateBadgeBounds", () => {
 		expect(formatted).toContain("(anthropic) claude-3-5-sonnet");
 	});
 
+	it("injects resting badge with success color when all todos are completed", () => {
+		const line = "↑109k ↓195 (auto)          (anthropic) claude-3-5-sonnet";
+		const formatted = formatStatsLineWithTodos(line, 3, 3, false, 80, theme);
+		expect(theme.fg).toHaveBeenCalledWith("success", "📋 3/3");
+		expect(formatted).toContain("· ");
+		expect(formatted).toContain("📋 3/3");
+	});
+
 	it("injects hovered badge with inverse styling when isSelected is true", () => {
 		const line = "↑109k ↓195 (auto)          (anthropic) claude-3-5-sonnet";
 		const formatted = formatStatsLineWithTodos(line, 1, 3, true, 80, theme);

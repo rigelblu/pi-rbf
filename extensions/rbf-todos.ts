@@ -146,7 +146,9 @@ export function formatStatsLineWithTodos(
 			styledBadge = bullet + `[${badgeText}]`;
 		}
 	} else {
-		styledBadge = bullet + (theme?.fg ? theme.fg("accent", badgeText) : badgeText);
+		const isCompleted = totalCount > 0 && completedCount === totalCount;
+		const color = isCompleted ? "success" : "accent";
+		styledBadge = bullet + (theme?.fg ? theme.fg(color, badgeText) : badgeText);
 	}
 
 	// Find the padding between the left stats and right-aligned model
@@ -718,7 +720,8 @@ export class TodoManager {
 		const { total, completed } = this.getCounts();
 		const raw = `📋 ${completed}/${total}`;
 		if (theme) {
-			return theme.fg("accent", raw);
+			const color = total > 0 && completed === total ? "success" : "accent";
+			return theme.fg(color, raw);
 		}
 		return raw;
 	}
