@@ -63,23 +63,24 @@ const FALLBACK_THEME = {
 	inverse: (str: string) => str,
 };
 
-export const ROSE_PINE_LOVE = "#b4637a";
-export const ROSE_PINE_LOVE_ANSI = "\x1b[38;2;180;99;122m";
+export const STARTED_COLOR = "#7A81FF";
+export const STARTED_COLOR_ANSI = "\x1b[38;2;122;129;255m";
 export const ANSI_RESET_FG = "\x1b[39m";
 
-export function formatLove(theme: Theme | undefined, text: string): string {
+export function formatStarted(theme: Theme | undefined, text: string): string {
 	if (!theme) return text;
 	if (typeof (theme as any).getFgAnsi !== "function" && typeof theme.fg === "function") {
 		return theme.fg("accent" as any, text);
 	}
 	if (typeof (theme as any).getColorMode === "function" && (theme as any).getColorMode() === "256color") {
-		return `\x1b[38;5;132m${text}${ANSI_RESET_FG}`;
+		return `\x1b[38;5;105m${text}${ANSI_RESET_FG}`;
 	}
-	return `${ROSE_PINE_LOVE_ANSI}${text}${ANSI_RESET_FG}`;
+	return `${STARTED_COLOR_ANSI}${text}${ANSI_RESET_FG}`;
 }
 
-export const formatIris = formatLove;
-export const formatGold = formatLove;
+export const formatLove = formatStarted;
+export const formatIris = formatStarted;
+export const formatGold = formatStarted;
 
 export function getActiveTheme(): any {
 	return (
@@ -666,9 +667,9 @@ export class TodoManager {
 				}
 			} else if (item.status === "in_progress") {
 				if (theme) {
-					const styledIcon = theme.bold(formatLove(theme, "⋮"));
-					const styledId = theme.bold(formatLove(theme, `#${item.id}`));
-					const styledText = formatLove(theme, item.text);
+					const styledIcon = theme.bold(formatStarted(theme, "⋮"));
+					const styledId = theme.bold(formatStarted(theme, `#${item.id}`));
+					const styledText = formatStarted(theme, item.text);
 					statusStyled = `${styledIcon} ${styledId} ${styledText}`;
 				} else {
 					statusStyled = `⋮ #${item.id} ${item.text}`;
@@ -835,7 +836,7 @@ export function createTodoListModalComponent(
 
 			const iconStr =
 				item.status === "in_progress"
-					? formatLove(theme, statusIcon)
+					? formatStarted(theme, statusIcon)
 					: theme.fg(statusColor as any, statusIcon);
 
 			let idStr = `#${item.id}`;
@@ -844,7 +845,7 @@ export function createTodoListModalComponent(
 			} else if (item.status === "completed") {
 				idStr = theme.fg("success", idStr);
 			} else if (item.status === "in_progress") {
-				idStr = formatLove(theme, idStr);
+				idStr = formatStarted(theme, idStr);
 			} else {
 				idStr = theme.fg("muted", idStr);
 			}
@@ -853,7 +854,7 @@ export function createTodoListModalComponent(
 			if (item.status === "completed") {
 				textStr = theme.fg("success", item.text);
 			} else if (item.status === "in_progress") {
-				textStr = formatLove(theme, item.text);
+				textStr = formatStarted(theme, item.text);
 			} else {
 				const isTopUnstarted = itemIndex === firstPendingIdx;
 				textStr = isTopUnstarted ? item.text : theme.fg("muted", item.text);
@@ -1254,13 +1255,13 @@ export function createTodoToolDefinition(
 				}
 				const styledIcon =
 					details.item.status === "in_progress"
-						? formatLove(theme, icon)
+						? formatStarted(theme, icon)
 						: theme.fg(color as any, icon);
 				const styledDescText =
 					details.item.status === "completed"
 						? theme.fg("success", details.item.text)
 						: details.item.status === "in_progress"
-						? formatLove(theme, details.item.text)
+						? formatStarted(theme, details.item.text)
 						: theme.fg("muted", details.item.text);
 				const desc =
 					theme.fg("text", `Todo #${details.item.id} [${details.item.status}]: `) +
