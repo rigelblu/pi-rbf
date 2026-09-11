@@ -388,8 +388,8 @@ describe("TodoManager pure logic", () => {
 
 			const lines = mgr.formatWidgetLines(undefined, 70);
 			expect(lines).toBeDefined();
-			expect(lines![0]).toContain("┌─ Todos (1/2 completed) ");
-			expect(lines![lines!.length - 1]).toContain("└");
+			expect(lines![0]).toContain("── Todos (1/2 completed) ");
+			expect(lines![lines!.length - 1]).toContain("───");
 			expect(lines![1]).toContain("✓ #1 First step");
 			expect(lines![2]).toContain("⋮ #2 Second step");
 		});

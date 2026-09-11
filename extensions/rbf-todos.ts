@@ -629,22 +629,22 @@ export class TodoManager {
 
 		const { total, completed } = this.getCounts();
 		const boxWidth = Math.min(Math.max(40, maxWidth), 90);
-		const contentWidth = boxWidth - 5; // 3 chars left ("│  ") + 2 chars right (" │")
+		const contentWidth = boxWidth - 2; // 2 chars indentation ("  ")
 
 		const lines: string[] = [];
 
-		// Header top border: ┌─ Todos (X/Y completed) ────────┐
+		// Header top border: ── Todos (X/Y completed) ────────
 		const headerTitle = " Todos ";
 		const countText = `(${completed}/${total} completed) `;
 		const titleVisibleWidth = visibleWidth(headerTitle) + visibleWidth(countText);
-		const topFill = Math.max(0, boxWidth - 3 - titleVisibleWidth);
+		const topFill = Math.max(0, boxWidth - 2 - titleVisibleWidth);
 
-		const styledBorderLeft = theme ? theme.fg("borderAccent", "┌─") : "┌─";
+		const styledBorderLeft = theme ? theme.fg("borderAccent", "──") : "──";
 		const styledHeader = theme ? theme.bold(theme.fg("borderAccent", headerTitle)) : headerTitle;
 		const styledCount = theme ? theme.fg("muted", countText) : countText;
 		const styledBorderRight = theme
-			? theme.fg("borderAccent", `${"─".repeat(topFill)}┐`)
-			: `${"─".repeat(topFill)}┐`;
+			? theme.fg("borderAccent", "─".repeat(topFill))
+			: "─".repeat(topFill);
 		lines.push(`${styledBorderLeft}${styledHeader}${styledCount}${styledBorderRight}`);
 
 		// Up to MAX_VISIBLE_WIDGET_ITEMS
@@ -689,10 +689,7 @@ export class TodoManager {
 			}
 
 			const truncated = truncateToWidth(statusStyled, contentWidth);
-			const padding = Math.max(0, contentWidth - visibleWidth(truncated));
-			const leftBorder = theme ? theme.fg("borderAccent", "│  ") : "│  ";
-			const rightBorder = theme ? theme.fg("borderAccent", " │") : " │";
-			lines.push(`${leftBorder}${truncated}${" ".repeat(padding)}${rightBorder}`);
+			lines.push(`  ${truncated}`);
 		}
 
 		// Overflow notice
@@ -701,14 +698,11 @@ export class TodoManager {
 			const overflowText = `… and ${overflowCount} more (type /todos to view all)`;
 			const styledOverflow = theme ? theme.fg("muted", overflowText) : overflowText;
 			const truncated = truncateToWidth(styledOverflow, contentWidth);
-			const padding = Math.max(0, contentWidth - visibleWidth(truncated));
-			const leftBorder = theme ? theme.fg("borderAccent", "│  ") : "│  ";
-			const rightBorder = theme ? theme.fg("borderAccent", " │") : " │";
-			lines.push(`${leftBorder}${truncated}${" ".repeat(padding)}${rightBorder}`);
+			lines.push(`  ${truncated}`);
 		}
 
-		// Bottom border: └─────────────────────────┘
-		const bottomBorder = `└${"─".repeat(boxWidth - 2)}┘`;
+		// Bottom border: ─────────────────────────
+		const bottomBorder = "─".repeat(boxWidth);
 		lines.push(theme ? theme.fg("borderAccent", bottomBorder) : bottomBorder);
 
 		return lines;
