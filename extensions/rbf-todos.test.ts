@@ -394,7 +394,7 @@ describe("TodoManager pure logic", () => {
 			expect(lines![2]).toContain("⋮ #2 Second step");
 		});
 
-		it("formats in_progress item using Rose Pine iris", () => {
+		it("formats in_progress item using Rose Pine love", () => {
 			const mgr = new TodoManager();
 			mgr.add("Active task");
 			mgr.update(1, { status: "in_progress" });
@@ -688,7 +688,7 @@ describe("createTodoListModalComponent", () => {
 		expect(mgr.getTodos()[0].text).toBe("Beta");
 	});
 
-	it("renders in_progress items with vertical ellipsis and iris color", () => {
+	it("renders in_progress items with vertical ellipsis and love color", () => {
 		const mgr = new TodoManager();
 		mgr.add("Active task");
 		mgr.update(1, { status: "in_progress" });
