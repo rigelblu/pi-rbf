@@ -391,7 +391,19 @@ describe("TodoManager pure logic", () => {
 			expect(lines![0]).toContain("┌─ Todos (1/2 completed) ");
 			expect(lines![lines!.length - 1]).toContain("└");
 			expect(lines![1]).toContain("✓ #1 First step");
-			expect(lines![2]).toContain("⠸ #2 Second step");
+			expect(lines![2]).toContain("⋮ #2 Second step");
+		});
+
+		it("formats in_progress item using borderAccent matching the border", () => {
+			const mgr = new TodoManager();
+			mgr.add("Active task");
+			mgr.update(1, { status: "in_progress" });
+			const theme = createMockTheme();
+			const lines = mgr.formatWidgetLines(theme, 70);
+			expect(lines).toBeDefined();
+			expect(theme.fg).toHaveBeenCalledWith("borderAccent", "⋮");
+			expect(theme.fg).toHaveBeenCalledWith("borderAccent", "#1");
+			expect(theme.fg).toHaveBeenCalledWith("borderAccent", "Active task");
 		});
 
 		it(`caps visible items at ${MAX_VISIBLE_WIDGET_ITEMS} and displays overflow notice`, () => {
@@ -647,6 +659,21 @@ describe("createTodoListModalComponent", () => {
 		modal.handleInput?.("c");
 		expect(mgr.getTodos()).toHaveLength(1);
 		expect(mgr.getTodos()[0].text).toBe("Beta");
+	});
+
+	it("renders in_progress items with vertical ellipsis and borderAccent color", () => {
+		const mgr = new TodoManager();
+		mgr.add("Active task");
+		mgr.update(1, { status: "in_progress" });
+		const tui = { requestRender: vi.fn() } as unknown as any;
+		const theme = createMockTheme();
+		const done = vi.fn();
+
+		const modal = createTodoListModalComponent(mgr, tui, theme, done);
+		const lines = modal.render(80);
+		expect(lines.some((l) => l.includes("⋮"))).toBe(true);
+		expect(theme.fg).toHaveBeenCalledWith("borderAccent", "⋮");
+		expect(theme.fg).toHaveBeenCalledWith("borderAccent", "Active task");
 	});
 });
 

@@ -583,12 +583,12 @@ export class TodoManager {
 				}
 			} else if (item.status === "in_progress") {
 				if (theme) {
-					const styledIcon = theme.fg("accent", "⠸");
-					const styledId = theme.bold(`#${item.id}`);
-					const styledText = theme.fg("accent", item.text);
+					const styledIcon = theme.bold(theme.fg("borderAccent", "⋮"));
+					const styledId = theme.bold(theme.fg("borderAccent", `#${item.id}`));
+					const styledText = theme.fg("borderAccent", item.text);
 					statusStyled = `${styledIcon} ${styledId} ${styledText}`;
 				} else {
-					statusStyled = `⠸ #${item.id} ${item.text}`;
+					statusStyled = `⋮ #${item.id} ${item.text}`;
 				}
 			} else {
 				// pending
@@ -746,8 +746,8 @@ export function createTodoListModalComponent(
 				statusIcon = "✓";
 				statusColor = "success";
 			} else if (item.status === "in_progress") {
-				statusIcon = "⠸";
-				statusColor = "accent";
+				statusIcon = "⋮";
+				statusColor = "borderAccent";
 			}
 
 			const iconStr = theme.fg(statusColor as any, statusIcon);
@@ -756,7 +756,7 @@ export function createTodoListModalComponent(
 			if (item.status === "completed") {
 				textStr = theme.fg("dim", item.text);
 			} else if (item.status === "in_progress") {
-				textStr = theme.fg("accent", item.text);
+				textStr = theme.fg("borderAccent", item.text);
 			}
 
 			const rowText = `${cursor}${iconStr} ${idStr} ${textStr}`;
@@ -1070,7 +1070,7 @@ export function createTodoToolDefinition(
 						const header = `Todos (${completed}/${total} completed):\n`;
 						const body = todos
 							.map((t) => {
-								const sym = t.status === "completed" ? "✓" : t.status === "in_progress" ? "⠸" : "○";
+								const sym = t.status === "completed" ? "✓" : t.status === "in_progress" ? "⋮" : "○";
 								return `  ${sym} #${t.id} [${t.status}] ${t.text}`;
 							})
 							.join("\n");
@@ -1146,8 +1146,8 @@ export function createTodoToolDefinition(
 				let icon = "✓ ";
 				let color = "success";
 				if (details.item.status === "in_progress") {
-					icon = "⠸ ";
-					color = "accent";
+					icon = "⋮ ";
+					color = "borderAccent";
 				} else if (details.item.status === "pending") {
 					icon = "○ ";
 					color = "muted";
@@ -1239,7 +1239,7 @@ export function rbfTodos(pi: ExtensionAPI): void {
 					const { total, completed } = todoManager.getCounts();
 					const summary = todos
 						.map((t) => {
-							const sym = t.status === "completed" ? "✓" : t.status === "in_progress" ? "⠸" : "○";
+							const sym = t.status === "completed" ? "✓" : t.status === "in_progress" ? "⋮" : "○";
 							return `[${sym}] #${t.id} [${t.status}] ${t.text}`;
 						})
 						.join("\n");
