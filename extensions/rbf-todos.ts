@@ -630,7 +630,7 @@ export class TodoManager {
 
 		const { total, completed } = this.getCounts();
 		const boxWidth = Math.min(Math.max(40, maxWidth), 90);
-		const contentWidth = boxWidth - 2; // 2 chars indentation ("  ")
+		const contentWidth = boxWidth - 1; // 1 char indentation (" ")
 
 		const lines: string[] = [];
 
@@ -690,7 +690,7 @@ export class TodoManager {
 			}
 
 			const truncated = truncateToWidth(statusStyled, contentWidth);
-			lines.push(`  ${truncated}`);
+			lines.push(` ${truncated}`);
 		}
 
 		// Overflow notice
@@ -699,7 +699,7 @@ export class TodoManager {
 			const overflowText = `… and ${overflowCount} more (type /todos to view all)`;
 			const styledOverflow = theme ? theme.fg("muted", overflowText) : overflowText;
 			const truncated = truncateToWidth(styledOverflow, contentWidth);
-			lines.push(`  ${truncated}`);
+			lines.push(` ${truncated}`);
 		}
 
 		// Bottom border: ─────────────────────────
