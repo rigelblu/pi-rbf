@@ -394,16 +394,16 @@ describe("TodoManager pure logic", () => {
 			expect(lines![2]).toContain("⋮ #2 Second step");
 		});
 
-		it("formats in_progress item using Rose Pine gold", () => {
+		it("formats in_progress item using Rose Pine iris", () => {
 			const mgr = new TodoManager();
 			mgr.add("Active task");
 			mgr.update(1, { status: "in_progress" });
 			const theme = createMockTheme();
 			const lines = mgr.formatWidgetLines(theme, 70);
 			expect(lines).toBeDefined();
-			expect(theme.fg).toHaveBeenCalledWith("warning", "⋮");
-			expect(theme.fg).toHaveBeenCalledWith("warning", "#1");
-			expect(theme.fg).toHaveBeenCalledWith("warning", "Active task");
+			expect(theme.fg).toHaveBeenCalledWith("accent", "⋮");
+			expect(theme.fg).toHaveBeenCalledWith("accent", "#1");
+			expect(theme.fg).toHaveBeenCalledWith("accent", "Active task");
 		});
 
 		it("formats pending items: top unstarted in dark font, items below in muted light grey", () => {
@@ -688,7 +688,7 @@ describe("createTodoListModalComponent", () => {
 		expect(mgr.getTodos()[0].text).toBe("Beta");
 	});
 
-	it("renders in_progress items with vertical ellipsis and gold color", () => {
+	it("renders in_progress items with vertical ellipsis and iris color", () => {
 		const mgr = new TodoManager();
 		mgr.add("Active task");
 		mgr.update(1, { status: "in_progress" });
@@ -699,8 +699,8 @@ describe("createTodoListModalComponent", () => {
 		const modal = createTodoListModalComponent(mgr, tui, theme, done);
 		const lines = modal.render(80);
 		expect(lines.some((l) => l.includes("⋮"))).toBe(true);
-		expect(theme.fg).toHaveBeenCalledWith("warning", "⋮");
-		expect(theme.fg).toHaveBeenCalledWith("warning", "Active task");
+		expect(theme.fg).toHaveBeenCalledWith("accent", "⋮");
+		expect(theme.fg).toHaveBeenCalledWith("accent", "Active task");
 	});
 });
 
