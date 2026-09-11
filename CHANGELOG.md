@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.20.0 (2026-09-11)
+## 🟠⋯ Added for End Users
+- 2026-09-11 - feat (ux) | track session progress with todos (#pi-24)
+
+---
+
 # 🔵⋯ v0.19.0 (2026-09-10)
 ## 🟠⋯ Added for End Users
 - 2026-09-10 - feat (ux) | see and cancel shell commands running in the background (#pi-29)

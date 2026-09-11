@@ -452,3 +452,51 @@ Local Pi extension enabling users to detach running foreground shell commands (`
 - Local verification: launch `pi -e ./extensions/rbf-background-tasks.ts`, run `! sleep 15`, verify `(ctrl+b to run in background)` appears, press `Ctrl+B`, inspect `/tasks`, stop task with `x`, verify footer badge clears.
 - Global installation: `cp ./extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-background-tasks.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-background-tasks.ts`
+
+---
+
+# 🔵⋯ rbf-todos
+
+## 🟠⋯ Overview
+Local Pi extension tracking session progress with an agent-callable `todo` checklist tool, a live monospace boxed checklist widget pinned above the prompt editor, an `Alt+T` visibility toggle shortcut, an interactive `/todos` full-screen modal viewer, a footer status line indicator (`📋 X/Y`), completion auto-collapse on prompt submission, and branch-safe state reconstruction.
+
+## 🟠⋯ Capabilities & Behavior
+- Model Tool `todo`:
+  - `add`: `{ text: string }` creates a new checklist item in `pending` status with an auto-incrementing ID.
+  - `update`: `{ id: number, status?: "pending" | "in_progress" | "completed", text?: string }` updates item status or description.
+  - `toggle`: `{ id: number }` cycles item status (`pending` -> `in_progress` -> `completed` -> `pending`).
+  - `list`: returns formatted list of current items and completion counts.
+  - `clear`: removes all items and resets the checklist.
+- Above-Editor Boxed Widget:
+  - Displays directly above the input box via `ctx.ui.setWidget("todos", ...)` with placement `aboveEditor`.
+  - Monospace grid border rendering with exact column width calculation, resilient against terminal resizing and ANSI escape sequences.
+  - Status symbols: completed `✓` in success color with dimmed text, in-progress `⠸` in accent color with bold ID, pending `○` in muted color.
+  - Capped at 5 visible items with a clean `… and N more (type /todos to view all)` overflow notice to prevent viewport compression.
+- TUI Shortcut `Alt+T`:
+  - Toggles visibility of the above-editor checklist widget without affecting prompt input.
+  - Avoids collision with Pi's reserved `ctrl+t` keybinding (`app.thinking.toggle`).
+- Interactive Modal Command `/todos`:
+  - Opens a full-screen interactive viewer via `ctx.ui.custom()` to inspect and scroll through the complete list of todos.
+  - `Up` / `Down` (or `k` / `j`) navigates the list.
+  - `Space` or `Enter` toggles status of the selected item.
+  - `c` clears completed items.
+  - `q` or `Escape` closes the modal.
+  - Non-TUI mode falls back to notifications.
+- Footer Status Line:
+  - Displays `📋 X/Y` in accent color via `ctx.ui.setStatus("todos", ...)`.
+  - Persists even when the above-editor widget is collapsed or toggled off with `Alt+T`.
+- Completion Auto-Collapse:
+  - When all todos are marked `completed`, the widget remains visible for the remainder of the current turn so the user sees the completed state.
+  - On the next user prompt submission (`before_agent_start` / `input`), the completed widget collapses automatically to restore clean prompt space.
+  - Adding a new todo or re-opening a completed todo un-collapses the widget immediately.
+- Branch-Safe State Reconstruction:
+  - Listens to `session_start` and `session_tree`.
+  - Reconstructs active checklist state from tool results and custom entries along the active session branch, ensuring time-traveling via `/tree`, `/rewind`, or `/fork` restores the exact checklist state for that point in history.
+- Zero External Dependencies:
+  - Pure TypeScript importing only `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`.
+
+## 🟠⋯ Setup & Verification
+- Local verification: launch `pi -e ./extensions/rbf-todos.ts`, prompt agent to create a 3-step plan with the `todo` tool, verify widget appears, press `Alt+T` to toggle, run `/todos` to inspect modal, and verify auto-collapse on prompt submission after completion.
+- Global installation: `cp ./extensions/rbf-todos.ts ~/.pi/agent/extensions/rbf-todos.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-todos.ts`
+
