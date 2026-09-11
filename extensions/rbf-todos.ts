@@ -714,7 +714,7 @@ export function createTodoListModalComponent(
 
 		lines.push("");
 		lines.push(
-			theme.bold(theme.fg("borderAccent", " Session Todos")) +
+			theme.bold(theme.fg("borderAccent", " Todos")) +
 				(total > 0 ? theme.fg("muted", ` (${completed}/${total} completed)`) : ""),
 		);
 		lines.push("");
@@ -1243,7 +1243,7 @@ export function rbfTodos(pi: ExtensionAPI): void {
 							return `[${sym}] #${t.id} [${t.status}] ${t.text}`;
 						})
 						.join("\n");
-					ctx.ui?.notify?.(`Session Todos (${completed}/${total}):\n${summary}`, "info");
+					ctx.ui?.notify?.(`Todos (${completed}/${total}):\n${summary}`, "info");
 					return;
 				}
 
