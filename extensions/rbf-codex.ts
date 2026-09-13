@@ -17,13 +17,15 @@ import { createInterface } from "node:readline";
 export const PROVIDER_ID = "rbf-codex";
 export const API_ID = "rbf-codex-app-server";
 export const BOOTSTRAP_MODEL_ID = "codex";
+/** Catalog ids wear this prefix so the picker row never collides with Pi's built-in `openai-codex` rows that list the same Codex ids. */
+export const CATALOG_ID_PREFIX = "codex-";
 export const ENTRY_TYPE = "rbf-codex-thread/v1";
 export const CODEX_FALLBACK_BIN = "/Users/tomhosiawa/.local/bin/codex";
 export const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SETUP_TIMEOUT_MS = 15_000;
 const INTERRUPT_WAIT_MS = 3_000;
 const STDERR_TAIL_LINES = 64;
-const WORKING_LINE_MAX = 120;
+const workingLineMax = () => Math.max(20, (process.stdout.columns ?? 120) - 8);
 
 export type ThreadEntry = { threadId: string; cwd: string; sessionId: string };
 type Rec = Record<string, unknown>;
@@ -51,10 +53,28 @@ export const NOTICE = {
 	policy: (approval: string, sandbox: string) => `Codex: approval ${approval}, sandbox ${sandbox}.`,
 } as const;
 
+/** Codex reports commands wrapped in the login shell (`/bin/zsh -lc '<cmd>'`); show what the user would have typed. */
+export function displayCommand(command: string): string {
+	const m = /^\/bin\/(?:zsh|bash|sh) -lc (.*)$/s.exec(command);
+	if (!m) return command;
+	const inner = m[1];
+	return /^'(.*)'$/s.test(inner) ? inner.slice(1, -1) : inner;
+}
+
+/** Which server requests are questions for the human; every request is declined, these also get a notice. */
+export function humanRequestKind(method: string): "approval" | "input" | undefined {
+	if (/approval/i.test(method)) return "approval";
+	if (/requestUserInput|elicitation/i.test(method)) return "input";
+	return undefined;
+}
+
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const ZERO_USAGE = { ...ZERO_COST, totalTokens: 0, cost: { ...ZERO_COST, total: 0 } };
 const SENTINEL = 1_000_000_000; // keeps Pi's threshold compaction from ever firing
 const PI_LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** The user pressed Escape while a setup request was in flight. */
+class AbortedError extends Error {}
 
 export class CodexError extends Error {
 	constructor(
@@ -82,7 +102,13 @@ export const BOOTSTRAP_MODEL: ProviderModelConfig = {
 	cost: ZERO_COST,
 };
 
-type CodexModel = { id: string; model: string; displayName: string; hidden: boolean; supportedReasoningEfforts: { reasoningEffort: string }[]; inputModalities?: string[] };
+type CodexModel = { id: string; displayName: string; hidden: boolean; supportedReasoningEfforts: { reasoningEffort: string }[] };
+
+/** Pi model id → the id Codex expects on `turn/start`; the bootstrap row sends none. */
+export function codexModelId(piModelId: string): string | undefined {
+	if (piModelId === BOOTSTRAP_MODEL_ID) return undefined;
+	return piModelId.startsWith(CATALOG_ID_PREFIX) ? piModelId.slice(CATALOG_ID_PREFIX.length) : piModelId;
+}
 
 /** One Codex `model/list` entry → Pi model config. Pi offers `xhigh` and `max` only when the map names them. */
 export function toProviderModel(m: CodexModel): ProviderModelConfig {
@@ -90,11 +116,11 @@ export function toProviderModel(m: CodexModel): ProviderModelConfig {
 	const thinkingLevelMap: Record<string, string | null> = { minimal: null };
 	for (const level of PI_LEVELS) if (level !== "minimal") thinkingLevelMap[level] = efforts.has(level) ? level : null;
 	return {
-		id: m.id,
+		id: `${CATALOG_ID_PREFIX}${m.id}`,
 		name: `${m.displayName} (Codex agent)`,
 		reasoning: true,
 		thinkingLevelMap,
-		input: m.inputModalities?.includes("image") ? ["text", "image"] : ["text"],
+		input: ["text"], // text-only until pi-10.3 carries images; Pi's editor then blocks a paste up front
 		contextWindow: SENTINEL,
 		maxTokens: SENTINEL,
 		cost: ZERO_COST,
@@ -105,7 +131,8 @@ export function toProviderModel(m: CodexModel): ProviderModelConfig {
 function storedToConfigs(stored: RefreshModelsContext["stored"]): ProviderModelConfig[] {
 	return (stored?.models ?? [])
 		.filter((m) => m.id !== BOOTSTRAP_MODEL_ID)
-		.map((m) => ({ id: m.id, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: m.cost }));
+		// A store written before the prefix existed holds bare Codex ids; normalize so no session ever sees both forms.
+		.map((m) => ({ id: m.id.startsWith(CATALOG_ID_PREFIX) ? m.id : `${CATALOG_ID_PREFIX}${m.id}`, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: m.cost }));
 }
 
 function toStoredModel(c: ProviderModelConfig): Model<typeof API_ID> {
@@ -118,16 +145,88 @@ export function mapEffort(model: Model<any>, level: ThinkingLevel | undefined): 
 	return typeof mapped === "string" ? mapped : undefined;
 }
 
+// ── Pi's assistant-message event protocol, one writer per turn ───────────────
+// Pi rebuilds the message from `partial` snapshots indexed by content block, so thinking
+// and text interleave as separate blocks: switching kind closes the open block and opens a new one.
+export class AssistantMessageWriter {
+	readonly stream = createAssistantMessageEventStream();
+	private readonly partial: AssistantMessage;
+	private open: { kind: "thinking" | "text"; index: number } | null = null;
+	private ended = false;
+
+	constructor(model: Model<any>) {
+		this.partial = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: ZERO_USAGE, stopReason: "stop", timestamp: Date.now() };
+	}
+
+	private snap(): AssistantMessage {
+		return { ...this.partial, content: this.partial.content.map((b) => ({ ...b })) };
+	}
+
+	private closeBlock(): void {
+		if (!this.open) return;
+		const b = this.partial.content[this.open.index] as { text?: string; thinking?: string };
+		if (this.open.kind === "text") this.stream.push({ type: "text_end", contentIndex: this.open.index, content: b.text ?? "", partial: this.snap() });
+		else this.stream.push({ type: "thinking_end", contentIndex: this.open.index, content: b.thinking ?? "", partial: this.snap() });
+		this.open = null;
+	}
+
+	private delta(kind: "thinking" | "text", text: string): void {
+		if (!text || this.ended) return;
+		if (this.open?.kind !== kind) {
+			this.closeBlock();
+			const index = this.partial.content.length;
+			this.partial.content.push(kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
+			this.open = { kind, index };
+			this.stream.push(kind === "text" ? { type: "text_start", contentIndex: index, partial: this.snap() } : { type: "thinking_start", contentIndex: index, partial: this.snap() });
+		}
+		const b = this.partial.content[this.open.index] as { text?: string; thinking?: string };
+		if (kind === "text") b.text = (b.text ?? "") + text;
+		else b.thinking = (b.thinking ?? "") + text;
+		this.stream.push(kind === "text" ? { type: "text_delta", contentIndex: this.open.index, delta: text, partial: this.snap() } : { type: "thinking_delta", contentIndex: this.open.index, delta: text, partial: this.snap() });
+	}
+
+	start(): void {
+		this.stream.push({ type: "start", partial: this.snap() });
+	}
+	thinking(text: string): void {
+		this.delta("thinking", text);
+	}
+	text(text: string): void {
+		this.delta("text", text);
+	}
+	/** The newest non-empty line of the open thinking block; feeds the working line. */
+	lastThinkingLine(): string {
+		if (this.open?.kind !== "thinking") return "";
+		const b = this.partial.content[this.open.index] as { thinking?: string };
+		return (b.thinking ?? "").split("\n").filter(Boolean).pop()?.trim() ?? "";
+	}
+	/** Terminal event; `errorMessage` is always one of the fixed COPY sentences, never Codex text. */
+	finish(kind: "done" | "aborted" | "error", errorKey?: CopyKey): void {
+		if (this.ended) return;
+		this.ended = true;
+		this.closeBlock();
+		const message: AssistantMessage = { ...this.partial, timestamp: Date.now(), stopReason: kind === "done" ? "stop" : kind };
+		if (kind === "done") this.stream.push({ type: "done", reason: "stop", message });
+		else {
+			message.errorMessage = kind === "aborted" ? "Request was aborted" : COPY[errorKey ?? "generic"];
+			this.stream.push({ type: "error", reason: kind, error: message });
+		}
+		this.stream.end(message);
+	}
+}
+
 // ── stdio JSON-RPC client; one per Pi session, not detached ──────────────────
 export class AppServerClient {
 	private nextId = 1;
-	private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+	private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 	private readonly listeners = new Set<(m: JsonRpc) => void>();
 	readonly stderrTail: string[] = [];
 	exited = false;
 	readonly onExit = new Set<() => void>();
 
 	private constructor(readonly child: ChildProcessWithoutNullStreams) {
+		// A write that lands after Codex died raises EPIPE on stdin; unhandled, that exits Pi. `exit` follows anyway.
+		child.stdin.on("error", () => {});
 		createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
 		child.stderr.on("data", (chunk: Buffer | string) => {
 			for (const l of String(chunk).split("\n")) if (l.trim()) this.stderrTail.push(l.trim());
@@ -135,11 +234,7 @@ export class AppServerClient {
 		});
 		child.once("exit", () => {
 			this.exited = true;
-			for (const p of this.pending.values()) {
-				clearTimeout(p.timer);
-				p.reject(new CodexError("codex-stopped", this.lastStderr()));
-			}
-			this.pending.clear();
+			for (const p of [...this.pending.values()]) p.reject(new CodexError("codex-stopped", this.lastStderr()));
 			for (const fn of this.onExit) fn();
 		});
 	}
@@ -185,9 +280,7 @@ export class AppServerClient {
 		}
 		if (typeof m.id === "number") {
 			const p = this.pending.get(m.id);
-			if (!p) return;
-			this.pending.delete(m.id);
-			clearTimeout(p.timer);
+			if (!p) return; // a reply that already timed out or was aborted
 			if (m.error) p.reject(new CodexError("generic", m.error.message));
 			else p.resolve(m.result);
 			return;
@@ -200,14 +293,21 @@ export class AppServerClient {
 		this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...m })}\n`);
 	}
 
-	request(method: string, params: unknown, timeoutMs = SETUP_TIMEOUT_MS): Promise<unknown> {
+	request(method: string, params: unknown, timeoutMs = SETUP_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
+		if (this.exited) return Promise.reject(new CodexError("codex-stopped", this.lastStderr()));
+		if (signal?.aborted) return Promise.reject(new AbortedError());
 		const id = this.nextId++;
 		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
+			const done = (fn: () => void) => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
 				this.pending.delete(id);
-				reject(new CodexError("generic", `Timed out waiting for ${method}`));
-			}, timeoutMs);
-			this.pending.set(id, { resolve, reject, timer });
+				fn();
+			};
+			const onAbort = () => done(() => reject(new AbortedError()));
+			const timer = setTimeout(() => done(() => reject(new CodexError("generic", `Timed out waiting for ${method}`))), timeoutMs);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			this.pending.set(id, { resolve: (v) => done(() => resolve(v)), reject: (e) => done(() => reject(e)) });
 			this.write({ id, method, params });
 		});
 	}
@@ -301,13 +401,16 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return parts.join("\n\n");
 		}
 
-		async function ensureClient(cwd: string): Promise<AppServerClient> {
+		async function ensureClient(cwd: string, signal?: AbortSignal): Promise<AppServerClient> {
 			if (state.client && !state.client.exited) return state.client;
 			const client = await AppServerClient.start(cwd, command);
 			state.client = client;
 			try {
-				await client.request("initialize", { clientInfo: { name: "pi-rbf-codex", version: "0.21.0" }, capabilities: { experimentalApi: true } });
+				await client.request("initialize", { clientInfo: { name: "pi-rbf-codex", version: "0.21.0" }, capabilities: { experimentalApi: true } }, SETUP_TIMEOUT_MS, signal);
 			} catch (e) {
+				// Never keep an uninitialized child around; the next prompt must spawn afresh.
+				state.client = null;
+				void client.close();
 				const msg = e instanceof CodexError ? (e.detail ?? "") : String(e);
 				if (/auth|login|logged/i.test(msg)) throw new CodexError("codex-logged-out");
 				throw e;
@@ -316,14 +419,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return client;
 		}
 
-		async function ensureThread(client: AppServerClient, ctx: ExtensionContext, cwd: string): Promise<{ threadId: string; policy: string; sandbox: string }> {
+		async function ensureThread(client: AppServerClient, ctx: ExtensionContext, cwd: string, signal?: AbortSignal): Promise<{ threadId: string; policy: string; sandbox: string }> {
 			const bound = newestOwnEntry(ctx);
 			let res: Rec;
 			if (bound) {
 				if (bound.cwd !== cwd) throw new CodexError("workspace-mismatch", `Codex thread directory: ${bound.cwd}`);
-				res = rec(await client.request("thread/resume", { threadId: bound.threadId, excludeTurns: true }));
+				res = rec(await client.request("thread/resume", { threadId: bound.threadId, excludeTurns: true }, SETUP_TIMEOUT_MS, signal));
 			} else {
-				res = rec(await client.request("thread/start", { cwd, ephemeral: false }));
+				res = rec(await client.request("thread/start", { cwd, ephemeral: false }, SETUP_TIMEOUT_MS, signal));
 				const threadId = rec(res.thread).id;
 				if (typeof threadId !== "string") throw new CodexError("generic", "thread/start returned no thread id");
 				pi.appendEntry<ThreadEntry>(ENTRY_TYPE, { threadId, cwd, sessionId: ctx.sessionManager.getSessionId() });
@@ -335,43 +438,13 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		}
 
 		function streamSimple(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-			const stream = createAssistantMessageEventStream();
-			const partial: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: ZERO_USAGE, stopReason: "stop", timestamp: Date.now() };
-			let open: { kind: "thinking" | "text"; index: number } | null = null;
-			const snap = () => ({ ...partial, content: partial.content.map((b) => ({ ...b })) });
-			const closeBlock = () => {
-				if (!open) return;
-				const b = partial.content[open.index] as { text?: string; thinking?: string };
-				if (open.kind === "text") stream.push({ type: "text_end", contentIndex: open.index, content: b.text ?? "", partial: snap() });
-				else stream.push({ type: "thinking_end", contentIndex: open.index, content: b.thinking ?? "", partial: snap() });
-				open = null;
-			};
-			const delta = (kind: "thinking" | "text", text: string) => {
-				if (!text) return;
-				if (open?.kind !== kind) {
-					closeBlock();
-					const index = partial.content.length;
-					partial.content.push(kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
-					open = { kind, index };
-					stream.push(kind === "text" ? { type: "text_start", contentIndex: index, partial: snap() } : { type: "thinking_start", contentIndex: index, partial: snap() });
-				}
-				const b = partial.content[open.index] as { text?: string; thinking?: string };
-				if (kind === "text") b.text = (b.text ?? "") + text;
-				else b.thinking = (b.thinking ?? "") + text;
-				stream.push(kind === "text" ? { type: "text_delta", contentIndex: open.index, delta: text, partial: snap() } : { type: "thinking_delta", contentIndex: open.index, delta: text, partial: snap() });
-			};
+			const out = new AssistantMessageWriter(model);
 			const finish = (kind: "done" | "aborted" | "error", errorKey?: CopyKey) => {
-				closeBlock();
 				state.ctx?.ui.setWorkingMessage();
-				const message: AssistantMessage = { ...partial, timestamp: Date.now(), stopReason: kind === "done" ? "stop" : kind };
-				if (kind === "done") stream.push({ type: "done", reason: "stop", message });
-				else {
-					message.errorMessage = kind === "aborted" ? "Request was aborted" : COPY[errorKey ?? "generic"];
-					stream.push({ type: "error", reason: kind, error: message });
-				}
-				stream.end(message);
+				out.finish(kind, errorKey);
 			};
 			const fail = (e: unknown) => {
+				if (e instanceof AbortedError) return finish("aborted");
 				const err = e instanceof CodexError ? e : new CodexError("generic", String(e));
 				if (err.detail) notify(`Codex: ${err.detail}`, "warning");
 				finish("error", err.key);
@@ -386,13 +459,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				} catch (e) {
 					return fail(e);
 				}
-				const cwd = realpathSync.native(ctx.sessionManager.getCwd());
+				let cwd: string;
 				let client: AppServerClient;
 				let threadId: string;
 				try {
 					if (options?.signal?.aborted) return finish("aborted");
-					client = await ensureClient(cwd);
-					const t = await ensureThread(client, ctx, cwd);
+					cwd = realpathSync.native(ctx.sessionManager.getCwd());
+					client = await ensureClient(cwd, options?.signal);
+					const t = await ensureThread(client, ctx, cwd, options?.signal);
 					threadId = t.threadId;
 					if (!state.noticedPolicy) {
 						state.noticedPolicy = true;
@@ -402,16 +476,18 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				} catch (e) {
 					return fail(e);
 				}
-				stream.push({ type: "start", partial: snap() });
+				out.start();
 
 				let turnId = "";
 				let finalFallback = "";
 				let streamedText = false;
 				const phases = new Map<string, string | null>();
 				let settled = false;
+				let interruptTimer: NodeJS.Timeout | undefined;
 				const settle = (fn: () => void) => {
 					if (settled) return;
 					settled = true;
+					if (interruptTimer) clearTimeout(interruptTimer);
 					unsubscribe();
 					client.onExit.delete(onExit);
 					options?.signal?.removeEventListener("abort", onAbort);
@@ -429,55 +505,63 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					});
 				const onAbort = () => {
 					if (turnId) client.notify("turn/interrupt", { threadId, turnId });
-					setTimeout(
+					interruptTimer = setTimeout(
 						() =>
 							settle(() => {
-								void client.close().then(() => {
-									if (state.client === client) state.client = null;
-								});
+								// The next prompt must respawn, not reuse a child whose stdin is closing.
+								if (state.client === client) state.client = null;
+								void client.close();
 								finish("aborted");
 							}),
 						INTERRUPT_WAIT_MS,
 					);
 				};
-				const isHumanRequest = (m: JsonRpc) => m.id !== undefined && !!m.method && /requestApproval|requestUserInput/.test(m.method);
 				const unsubscribe = client.subscribe((m) => {
-					if (isHumanRequest(m)) {
-						notify(NOTICE.declined(m.method ?? "a request"), "warning");
+					try {
+						handle(m);
+					} catch (e) {
+						// One malformed notification must never escape readline's event and take Pi down.
+						settle(() => fail(e));
+					}
+				});
+				const handle = (m: JsonRpc) => {
+					if (m.id !== undefined && m.method) {
+						const asked = humanRequestKind(m.method);
+						if (asked) notify(NOTICE.declined(asked), "warning");
 						return;
 					}
 					const p = (m.params ?? {}) as Rec;
-					const forThisTurn = p.turnId === turnId || (m.method === "turn/completed" && p.turn && rec(p.turn).id === turnId);
+					const forThisTurn = p.turnId === turnId || (m.method === "turn/completed" && !!p.turn && typeof p.turn === "object" && (p.turn as Rec).id === turnId);
 					if (!forThisTurn) return;
 					switch (m.method) {
 						case "item/started": {
 							const item = rec(p.item);
 							if (item.type === "commandExecution") {
-								ctx.ui.setWorkingMessage(`$ ${String(item.command)}`);
-								delta("thinking", `$ ${String(item.command)}\n`);
+								const cmd = displayCommand(String(item.command));
+								ctx.ui.setWorkingMessage(`$ ${cmd}`);
+								out.thinking(`$ ${cmd}\n`);
 							} else if (item.type === "agentMessage") phases.set(String(item.id), (item.phase as string | null) ?? null);
 							break;
 						}
 						case "item/completed": {
 							const item = rec(p.item);
 							if (item.type === "commandExecution" && typeof item.exitCode === "number" && item.exitCode !== 0) {
-								ctx.ui.setWorkingMessage(`$ ${String(item.command)} → exit ${item.exitCode}`);
-								delta("thinking", `→ exit ${item.exitCode}\n`);
+								ctx.ui.setWorkingMessage(`$ ${displayCommand(String(item.command))} → exit ${item.exitCode}`);
+								out.thinking(`→ exit ${item.exitCode}\n`);
 							} else if (item.type === "agentMessage" && phases.get(String(item.id)) !== "commentary") finalFallback = String(item.text ?? "");
 							break;
 						}
 						case "item/reasoning/summaryTextDelta":
-							delta("thinking", String(p.delta ?? ""));
+							out.thinking(String(p.delta ?? ""));
 							break;
 						case "item/agentMessage/delta": {
 							const d = String(p.delta ?? "");
 							if (phases.get(String(p.itemId)) === "commentary") {
-								delta("thinking", d);
-								const line = ((partial.content[open?.index ?? 0] as { thinking?: string })?.thinking ?? "").split("\n").filter(Boolean).pop() ?? "";
-								ctx.ui.setWorkingMessage(line.trim().slice(0, WORKING_LINE_MAX));
+								out.thinking(d);
+								ctx.ui.setWorkingMessage(out.lastThinkingLine().slice(0, workingLineMax()));
 							} else {
 								streamedText = true;
-								delta("text", d);
+								out.text(d);
 							}
 							break;
 						}
@@ -485,7 +569,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 							const turn = rec(p.turn);
 							settle(() => {
 								if (turn.status === "completed") {
-									if (!streamedText && finalFallback) delta("text", finalFallback);
+									if (!streamedText && finalFallback) out.text(finalFallback);
 									if (!streamedText && !finalFallback) return finish("error", "no-answer");
 									finish("done");
 								} else if (turn.status === "interrupted") finish("aborted");
@@ -498,7 +582,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 							break;
 						}
 					}
-				});
+				};
 				client.onExit.add(onExit);
 				options?.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -506,7 +590,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				const effort = mapEffort(model, options?.reasoning);
 				const turnParams: Rec = { threadId, input };
 				if (effort) turnParams.effort = effort;
-				if (model.id !== BOOTSTRAP_MODEL_ID) turnParams.model = model.id;
+				const codexId = codexModelId(model.id);
+				if (codexId) turnParams.model = codexId;
 				try {
 					let started: Rec;
 					try {
@@ -524,7 +609,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					settle(() => fail(e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e));
 				}
 			})();
-			return stream;
+			return out.stream;
 		}
 
 		/** Pi calls this without network at startup and with network when the picker opens. */
@@ -562,7 +647,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			state.client = null;
 			state.shuttingDown = false;
 			state.noticedPolicy = false;
-			if (!isBoundBranch(ctx)) return;
+			if (!newestOwnEntry(ctx)) return; // a forked copy starts cold, so its last prompt was not ours to interrupt
 			const last = [...ctx.sessionManager.getBranch()].reverse().find((e) => e.type === "message") as { message?: { role: string } } | undefined;
 			if (last?.message?.role === "user") notify(NOTICE.interrupted, "warning");
 		});

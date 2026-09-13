@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel } from "@earendil-works/pi-ai";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { API_ID, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, PROVIDER_ID, createRbfCodex, mapEffort, toProviderModel } from "./rbf-codex.ts";
+import { API_ID, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, PROVIDER_ID, codexModelId, createRbfCodex, displayCommand, humanRequestKind, mapEffort, toProviderModel } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
@@ -82,6 +82,7 @@ describe("rbf-codex", () => {
 	let dir: string;
 	let logPath: string;
 	const savedEnv = { ...process.env };
+	const booted: { shutdown: () => Promise<unknown> | undefined }[] = [];
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "rbf-codex-test-"));
@@ -89,7 +90,9 @@ describe("rbf-codex", () => {
 		process.env.RBF_FAKE_LOG = logPath;
 		delete process.env.RBF_FAKE_SCENARIO;
 	});
-	afterEach(() => {
+	afterEach(async () => {
+		// Close every fake child this test spawned; leaked children made the full suite flaky under load.
+		await Promise.all(booted.splice(0).map((b) => b.shutdown()));
 		process.env = { ...savedEnv };
 		rmSync(dir, { recursive: true, force: true });
 	});
@@ -119,6 +122,7 @@ describe("rbf-codex", () => {
 			return collect(fx.provider.config.streamSimple!(m, { messages } as Context, options));
 		};
 		const shutdown = () => fx.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, c.ctx);
+		booted.push({ shutdown });
 		return { ...fx, ...c, turn, shutdown };
 	}
 
@@ -147,7 +151,10 @@ describe("rbf-codex", () => {
 
 		it("maps a Codex model to a Pi model with only listed efforts, minimal null, and xhigh and max named", () => {
 			const m = toProviderModel(codexModel("gpt-x", ["medium", "high", "ultra"], { inputModalities: ["text", "image"] }));
-			expect(m).toMatchObject({ id: "gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text", "image"] });
+			expect(m).toMatchObject({ id: "codex-gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text"] }); // text-only until pi-10.3; id prefixed so the row never collides with openai-codex
+			expect(codexModelId("codex-gpt-x")).toBe("gpt-x");
+			expect(codexModelId("gpt-legacy")).toBe("gpt-legacy");
+			expect(codexModelId(BOOTSTRAP_MODEL_ID)).toBeUndefined();
 			expect(m.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null });
 			expect(toProviderModel(codexModel("gpt-y", ["low", "xhigh", "max"])).thinkingLevelMap).toEqual({ minimal: null, low: "low", medium: null, high: null, xhigh: "xhigh", max: "max" });
 		});
@@ -157,13 +164,13 @@ describe("rbf-codex", () => {
 			const ctx = { allowNetwork: opts.allowNetwork, force: opts.force, stored: opts.stored, publish, signal: new AbortController().signal } as unknown as RefreshModelsContext;
 			return { ctx, publish };
 		}
-		const storedEntry = (checkedAt: number) => ({ models: [{ ...model("gpt-stored", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), name: "GPT-STORED (Codex agent)" }], checkedAt });
+		const storedEntry = (checkedAt: number) => ({ models: [{ ...model("gpt-stored", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), name: "GPT-STORED (Codex agent)" }], checkedAt }); // bare id, as a pre-prefix store would hold
 
 		it("returns the stored list without network and never spawns", async () => {
 			const b = await boot();
 			const r = refreshCtx({ allowNetwork: false, stored: storedEntry(0) });
 			const list = await b.provider.config.refreshModels!(r.ctx);
-			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-stored"]);
+			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-stored"]); // normalized on read
 			expect(r.publish).not.toHaveBeenCalled();
 			expect(sent()).toEqual([]);
 		});
@@ -173,19 +180,19 @@ describe("rbf-codex", () => {
 			const fx = makePi();
 			createRbfCodex({ command: fakeCommand, argv: [], now: () => now })(fx.pi);
 			const fresh = refreshCtx({ allowNetwork: true, stored: storedEntry(now - CATALOG_MAX_AGE_MS + 1000) });
-			expect((await fx.provider.config.refreshModels!(fresh.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-stored"]);
+			expect((await fx.provider.config.refreshModels!(fresh.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-stored"]);
 			expect(fresh.publish).not.toHaveBeenCalled();
 			expect(sent()).toEqual([]);
 
 			const forced = refreshCtx({ allowNetwork: true, force: true, stored: storedEntry(now) });
 			const list = await fx.provider.config.refreshModels!(forced.ctx);
-			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-fake-1", "gpt-fake-2"]);
-			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text", "image"], reasoning: true });
+			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-fake-1", "codex-gpt-fake-2"]);
+			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text"], reasoning: true });
 			expect(list[2].thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 			expect(forced.publish).toHaveBeenCalledTimes(1);
 			const persisted = (forced.publish.mock.calls[0] as unknown as [{ persist: { models: Model<any>[]; checkedAt: number } }])[0].persist;
 			expect(persisted.checkedAt).toBe(now);
-			expect(persisted.models.map((m) => m.id)).toEqual(["gpt-fake-1", "gpt-fake-2"]);
+			expect(persisted.models.map((m) => m.id)).toEqual(["codex-gpt-fake-1", "codex-gpt-fake-2"]);
 			expect(persisted.models[0]).toMatchObject({ api: API_ID, provider: PROVIDER_ID });
 			expect(methods()).toEqual(["initialize", "initialized", "model/list"]);
 
@@ -197,7 +204,7 @@ describe("rbf-codex", () => {
 		it("returns the stored or bootstrap list without throwing when the spawn fails", async () => {
 			const b = await boot({ command: MISSING_COMMAND });
 			const r1 = refreshCtx({ allowNetwork: true, force: true, stored: storedEntry(0) });
-			expect((await b.provider.config.refreshModels!(r1.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-stored"]);
+			expect((await b.provider.config.refreshModels!(r1.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-stored"]);
 			const r2 = refreshCtx({ allowNetwork: true, force: true });
 			expect(await b.provider.config.refreshModels!(r2.ctx)).toEqual([BOOTSTRAP_MODEL]);
 			expect(r1.publish).not.toHaveBeenCalled();
@@ -207,16 +214,16 @@ describe("rbf-codex", () => {
 	describe("model and effort on turn/start", () => {
 		it("sends the catalog model id and the mapped effort", async () => {
 			const b = await boot();
-			await b.turn("hi", model("gpt-fake-2", { minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" }), { reasoning: "high" });
+			await b.turn("hi", model("codex-gpt-fake-2", { minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" }), { reasoning: "high" });
 			const start = sent().find((m) => m.method === "turn/start")!;
-			expect(start.params).toMatchObject({ model: "gpt-fake-2", effort: "high" });
+			expect(start.params).toMatchObject({ model: "gpt-fake-2", effort: "high" }); // prefix stripped for Codex
 		});
 
 		it("sends effort but no model for the bootstrap id, and neither effort when the level is unsupported or off", async () => {
 			const b = await boot();
 			await b.turn("one", model(), { reasoning: "medium" });
 			await b.turn("two", model(), {});
-			await b.turn("three", model("gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
+			await b.turn("three", model("codex-gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts[0]).toMatchObject({ effort: "medium" });
 			expect(starts[0]).not.toHaveProperty("model");
@@ -231,7 +238,7 @@ describe("rbf-codex", () => {
 		it("retries once without model and effort when Codex rejects the persisted model id, with the retired-model notice", async () => {
 			scenario({ retiredModel: "gpt-gone" });
 			const b = await boot();
-			const r = await b.turn("hi", model("gpt-gone"), { reasoning: "high" });
+			const r = await b.turn("hi", model("codex-gpt-gone"), { reasoning: "high" });
 			expect(r.text).toBe("FAKE_OK");
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts).toHaveLength(2);
@@ -312,6 +319,17 @@ describe("rbf-codex", () => {
 			expect(kinds[kinds.length - 1]).toBe("done");
 		});
 
+		it("strips Codex's login-shell wrapper from the working line and the thinking record", async () => {
+			expect(displayCommand("/bin/zsh -lc pwd")).toBe("pwd");
+			expect(displayCommand("/bin/zsh -lc '/bin/sleep 20'")).toBe("/bin/sleep 20");
+			expect(displayCommand("ls -la")).toBe("ls -la");
+			scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc pwd" }, { kind: "answer", id: "m1", text: "OK" }, { kind: "complete" }] });
+			const b = await boot();
+			const r = await b.turn("Run pwd");
+			expect(r.thinking).toBe("$ pwd\n");
+			expect(b.setWorkingMessage.mock.calls[0][0]).toBe("$ pwd");
+		});
+
 		it("an agent message with null phase streams as the answer and is not repeated at turn end", async () => {
 			scenario({ turn: [{ kind: "answer", id: "m1", text: "HELLO", phase: null }, { kind: "complete" }] });
 			const b = await boot();
@@ -338,13 +356,38 @@ describe("rbf-codex", () => {
 			expect(r.text).toBe("DONE");
 			const reply = sent().find((m) => m.id !== undefined && !m.method);
 			expect(reply).toMatchObject({ error: { code: -32601 } });
-			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("item/commandExecution/requestApproval"), "warning");
+			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("approval"), "warning");
+		});
+
+		it("a legacy approval request and a user-input request are declined with the matching notice; other server requests silently", async () => {
+			scenario({ turn: [{ kind: "serverRequest", method: "execCommandApproval" }, { kind: "serverRequest", method: "item/tool/requestUserInput" }, { kind: "serverRequest", method: "attestation/generate" }, { kind: "answer", id: "m1", text: "DONE" }, { kind: "complete" }] });
+			const b = await boot();
+			expect((await b.turn("hi")).text).toBe("DONE");
+			expect(sent().filter((m) => m.id !== undefined && !m.method && (m as { error?: unknown }).error)).toHaveLength(3);
+			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("approval"), "warning");
+			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("input"), "warning");
+			expect(b.notify).toHaveBeenCalledTimes(3); // policy notice + two declines
+			expect(humanRequestKind("mcpServer/elicitation/request")).toBe("input");
+			expect(humanRequestKind("account/chatgptAuthTokens/refresh")).toBeUndefined();
 		});
 
 		it("joins steer and custom user messages after the last assistant message into one turn, in order", async () => {
 			const b = await boot();
 			await b.turn([userMessage("old"), assistantMessage("answered"), userMessage("first"), { role: "user", content: "steer text", timestamp: Date.now() } as any, userMessage("third")]);
 			expect(sent().find((m) => m.method === "turn/start")!.params).toMatchObject({ input: [{ type: "text", text: "first\n\nsteer text\n\nthird", text_elements: [] }] });
+		});
+
+		it("sends exactly one turn/start per streamSimple call across success, failure, and interruption", async () => {
+			const b = await boot();
+			await b.turn("one");
+			await b.turn("two");
+			const ac = new AbortController();
+			const p = b.turn("three", model(), { signal: ac.signal });
+			await vi.waitFor(() => expect(methods().filter((m) => m === "turn/start")).toHaveLength(3));
+			ac.abort();
+			await p;
+			await b.turn("four");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(4);
 		});
 
 		it("a failed turn ends with the fixed turn-failed sentence and a notice carrying Codex's message", async () => {
@@ -416,6 +459,23 @@ describe("rbf-codex", () => {
 			scenario({ initializeError: "not logged in: run codex login" });
 			const b2 = await boot();
 			expect((await b2.turn("hi")).final?.errorMessage).toBe(COPY["codex-logged-out"]);
+			// The failed child is not kept: after login the next prompt spawns and initializes again.
+			delete process.env.RBF_FAKE_SCENARIO;
+			await vi.waitFor(() => expect(sent().filter((m) => m.method === "initialize")).toHaveLength(1));
+			expect((await b2.turn("again")).text).toBe("FAKE_OK");
+			expect(sent().filter((m) => m.method === "initialize")).toHaveLength(2);
+		});
+
+		it("Escape during setup ends aborted without waiting for the request", async () => {
+			const b = await boot({ command: { bin: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] } });
+			const ac = new AbortController();
+			const p = b.turn("hi", model(), { signal: ac.signal });
+			await new Promise((r) => setTimeout(r, 150));
+			ac.abort();
+			const started = Date.now();
+			const r = await p;
+			expect(r.final?.stopReason).toBe("aborted");
+			expect(Date.now() - started).toBeLessThan(1000);
 		});
 
 		it("every fixed error sentence is neither retryable nor a context overflow for Pi", () => {
@@ -436,9 +496,12 @@ describe("rbf-codex", () => {
 
 	describe("session hooks", () => {
 		it("shows the interrupted-request notice on session_start only for a bound branch ending in an unanswered user message", async () => {
-			const entry = { type: "custom", customType: ENTRY_TYPE, data: { threadId: "t", cwd: process.cwd(), sessionId: "s" } };
-			const bound = await boot({ branch: [entry, { type: "message", message: { role: "user", content: "x" } }] });
+			const entry = { type: "custom", customType: ENTRY_TYPE, data: { threadId: "t", cwd: process.cwd(), sessionId: "session-A" } };
+			const bound = await boot({ sessionId: "session-A", branch: [entry, { type: "message", message: { role: "user", content: "x" } }] });
 			expect(bound.notify).toHaveBeenCalledWith(NOTICE.interrupted, "warning");
+			// A forked copy carries the original's session id, starts cold, and must not claim an interrupted request.
+			const forked = await boot({ sessionId: "session-B", branch: [entry, { type: "message", message: { role: "user", content: "x" } }] });
+			expect(forked.notify).not.toHaveBeenCalled();
 			const answered = await boot({ branch: [entry, { type: "message", message: { role: "user", content: "x" } }, { type: "message", message: { role: "assistant", content: "y" } }] });
 			expect(answered.notify).not.toHaveBeenCalled();
 			const unbound = await boot({ branch: [{ type: "message", message: { role: "user", content: "x" } }] });

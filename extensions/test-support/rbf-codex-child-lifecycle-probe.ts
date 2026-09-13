@@ -5,7 +5,7 @@
 //   2. a fresh app-server can `thread/resume` that thread and sees the cut turn as `interrupted`;
 //   3. a new turn on the resumed thread completes and carries a nonce;
 //   4. stdin EOF then SIGTERM leaves no app-server behind.
-// Prints one line: parent_kill_child_exit_ms=<n> sleep_orphaned=<bool> resume_ok=<bool>
+// Prints one line: parent_kill_child_exit_ms=<n> sleep_seen=<bool> sleep_orphaned=<bool> resume_ok=<bool>
 // cut_turn_status=<s> new_turn_status=<s> reply_has_nonce=<bool> sigterm_orphans=<n>
 //
 //   bun run extensions/test-support/rbf-codex-child-lifecycle-probe.ts --codex /Users/tomhosiawa/.local/bin/codex
@@ -199,7 +199,7 @@ async function main(): Promise<void> {
 	await new Promise((r) => setTimeout(r, 300));
 	const sigtermOrphans = pids(`codex app-server`).filter((p) => p === client.child.pid || p === appServerPid).length;
 	rmSync(root, { recursive: true, force: true });
-	console.log(`parent_kill_child_exit_ms=${childExitMs} sleep_orphaned=${sleepOrphaned} resume_ok=${resumeOk} cut_turn_status=${cutTurnStatus} new_turn_status=${newTurnStatus} reply_has_nonce=${replyHasNonce} sigterm_orphans=${sigtermOrphans}`);
+	console.log(`parent_kill_child_exit_ms=${childExitMs} sleep_seen=${sleepBefore} sleep_orphaned=${sleepOrphaned} resume_ok=${resumeOk} cut_turn_status=${cutTurnStatus} new_turn_status=${newTurnStatus} reply_has_nonce=${replyHasNonce} sigterm_orphans=${sigtermOrphans}`);
 }
 
 if (import.meta.main) {
