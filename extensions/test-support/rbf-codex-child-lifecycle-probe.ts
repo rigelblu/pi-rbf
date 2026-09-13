@@ -10,7 +10,7 @@
 //
 //   bun run extensions/test-support/rbf-codex-child-lifecycle-probe.ts --codex /Users/tomhosiawa/.local/bin/codex
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -116,6 +116,9 @@ async function main(): Promise<void> {
 	const work = join(root, "work");
 	execFileSync("mkdir", ["-p", home, work]);
 	writeFileSync(join(home, "config.toml"), 'approval_policy = "never"\nsandbox_mode = "workspace-write"\n');
+	// Isolated home, same login: Codex cannot run a turn without credentials.
+	const userAuth = join(process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"), "auth.json");
+	if (existsSync(userAuth)) copyFileSync(userAuth, join(home, "auth.json"));
 	const env = { ...process.env, CODEX_HOME: home };
 	const sleepTag = `pi10-probe-${process.pid}`;
 	const nonce = `NONCE-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
