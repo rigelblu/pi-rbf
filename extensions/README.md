@@ -500,3 +500,27 @@ Local Pi extension tracking session progress with an agent-callable `todo` check
 - Global installation: `cp ./extensions/rbf-todos.ts ~/.pi/agent/extensions/rbf-todos.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-todos.ts`
 
+
+---
+
+# 🔵⋯ rbf-codex
+
+## 🟠⋯ Overview
+Local Pi extension that registers Codex as a model provider, so a Pi conversation runs on Codex's full agent harness with Pi as the only visible interface. Verified against Pi 0.85.1 and Codex CLI 0.154.0 on Node.
+
+## 🟠⋯ Capabilities & Behavior
+- Who owns what: Codex owns context, instructions, tools, sandbox, approval policy, compaction, and auth; Pi owns input, display, the conversation binding, and cancellation. Pi passes no policy and injects nothing
+- Runtime: Pi spawns `codex app-server` over stdio as a direct child, one per Pi session, and closes it with the session (stdin EOF, then SIGTERM, then SIGKILL). No daemon, socket, or lock
+- Models and effort: `/model` lists Codex's real models tagged `(Codex agent)` next to the bootstrap `codex` row; Pi's thinking selector sets the effort. Both go on every turn. The bootstrap row means Codex's default model at the picked effort. The catalog refreshes when the picker opens, at most once a day, and persists in Pi's model store
+- Activity: the current command shows in the working line under the prompt; commands, exit codes, reasoning summaries, and commentary persist as thinking; the answer streams
+- Binding: one `rbf-codex-thread/v1` entry `{ threadId, cwd, sessionId }` in the session log, appended after the first `thread/start`. Reopening the session resumes the thread; `/fork`, `/clone`, and `pi --fork` start a cold thread
+- No turn survival: a turn running when Pi exits is interrupted in Codex; on reopen a notice asks you to send it again
+- Escape sends `turn/interrupt`; manual `/compact` is cancelled with a notice; tree navigation supplies a fixed branch summary instead of asking Codex
+- Refusals are fixed sentences that never trigger Pi's auto-retry: Codex missing, not logged in, another directory, image input, stopped, failed, no answer, unavailable. Details go to a notice
+- `pi --sandbox` and this provider are mutually exclusive: with `--sandbox` in argv the extension registers nothing
+
+## 🟠⋯ Setup & Verification
+- Prerequisites: `codex --version` prints `codex-cli 0.154.0` and `codex login status` shows a logged-in account; the extension looks for `codex` on `PATH`, then `/Users/tomhosiawa/.local/bin/codex`
+- Local verification: `pi -p --no-extensions -e ./extensions/rbf-codex.ts --model rbf-codex/codex "Reply exactly PI_CODEX_OK and nothing else."` prints `PI_CODEX_OK`; `bun run test -- extensions/rbf-codex.test.ts` runs the focused suite against a fake app-server
+- Global installation: `cp ./extensions/rbf-codex.ts ~/.pi/agent/extensions/rbf-codex.ts`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-codex.ts`. Codex threads, credentials, and settings are untouched; `codex resume` still opens any thread. The provider's entry in Pi's model store stays behind and is inert
