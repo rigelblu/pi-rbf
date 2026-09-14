@@ -5,6 +5,9 @@ title: Changelog
 # 🔵⋯ [Unreleased]
 ## 🟠⋯ Added for End Users
 
+## 🟠⋯ Fixed for End Users
+- 2026-09-14 - fix (ux) | see the provider on the model status line, like the footer: after `/model`, a picker pick, or a Ctrl+P model cycle, the status line reads `Model: (<provider>) <id>` / `Switched to (<provider>) <name>` whenever more than one provider is configured (#pi-31)
+
 ---
 
 # 🔵⋯ v0.21.1 (2026-09-14)

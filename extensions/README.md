@@ -503,6 +503,25 @@ Local Pi extension tracking session progress with an agent-callable `todo` check
 
 ---
 
+# 🔵⋯ rbf-model-status
+
+## 🟠⋯ Overview
+Local Pi extension that makes the transient status line after a model change name the provider the way the footer does: `Model: (<provider>) <id>` after `/model <id>` or a picker pick (`/model`, Ctrl+L), and `Switched to (<provider>) <name> …` after a model cycle (Ctrl+P, Shift+Ctrl+P).
+
+## 🟠⋯ Capabilities & Behavior
+- Same rule as the footer: the `(<provider>) ` prefix appears only when more than one provider is configured (`footerDataProvider.getAvailableProviderCount() > 1`); with one provider both lines stay bare
+- Copy untouched: only the prefix is inserted after `Model: ` or `Switched to `; the rest of Pi's line, including `(thinking: <level>)` and a catalog name such as `gpt-5.6-luna (Codex agent)`, is what Pi printed
+- Every other status line (`Default model: …`, `Forked to new session`, …) passes through unchanged
+- Extension notifications reach the same seam, so another extension's `info` notice that starts with `Model: ` or `Switched to ` gains the prefix too; non-string notices pass through untouched
+- Mechanism: wraps `InteractiveMode.prototype.showStatus`, the one seam the three Pi call sites share; symbol-guarded so `/reload` never double-wraps; no width fallback, since the status row is a chat line, not the footer's fixed strip
+
+## 🟠⋯ Setup & Verification
+- Local verification: `pi -e ./extensions/rbf-model-status.ts`, then `/model <id>` and Ctrl+P; with two or more providers configured both status lines carry `(<provider>)`
+- Global installation: `cp ./extensions/rbf-model-status.ts ~/.pi/agent/extensions/rbf-model-status.ts`; always on once installed, no flag or configuration
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-model-status.ts`
+
+---
+
 # 🔵⋯ rbf-codex
 
 ## 🟠⋯ Overview
