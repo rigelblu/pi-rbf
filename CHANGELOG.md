@@ -7,6 +7,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.21.0 (2026-09-13)
+## 🟠⋯ Added for End Users
+- 2026-09-13 - feat (codex) | use Codex's full agent harness through one Pi conversation: pick a `codex-…` model and effort in Pi's picker, see each command in the working line, keep the activity as thinking, watch the answer stream, Escape to cancel, and continue the same thread after reopening (#pi-10)
+
+---
+
 # 🔵⋯ v0.20.0 (2026-09-11)
 ## 🟠⋯ Added for End Users
 - 2026-09-11 - feat (ux) | track session progress with todos (#pi-24)
