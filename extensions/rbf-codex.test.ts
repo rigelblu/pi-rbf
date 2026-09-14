@@ -469,7 +469,7 @@ describe("rbf-codex", () => {
 			scenario({ turn: [{ kind: "command", id: "c1", command: "false", exitCode: 2, output: ["boom\n"] }, { kind: "answer", id: "m1", text: "failed" }, { kind: "complete" }] });
 			const b = await boot();
 			const r = await b.round([userMessage("run it")]);
-			expect(r.result).toMatchObject({ content: [{ type: "text", text: "boom\n\nexit 2" }], isError: true }); // a thrown error row carries no structured details, exactly as Pi's createErrorToolResult
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "boom\n\nCommand exited with code 2" }], isError: true }); // a thrown error row carries no structured details and Pi's bash copy, exactly as Pi's createErrorToolResult
 			expect(r.next!.text).toBe("failed");
 		});
 

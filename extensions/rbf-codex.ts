@@ -1155,7 +1155,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		function commandResult(itemId: string, item: Rec, output: string): ToolResult {
 			const exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
 			const status = String(item.status ?? "completed");
-			const text = `${String(item.aggregatedOutput ?? output).trimEnd()}${exitCode ? `\n\nexit ${exitCode}` : ""}`.trim();
+			// Pi's bash appends `Command exited with code N` after a blank line (`bash.js` appendStatus); the same copy, so the row and the transcript read as Pi's.
+			const text = `${String(item.aggregatedOutput ?? output).trimEnd()}${exitCode ? `\n\nCommand exited with code ${exitCode}` : ""}`.trim();
 			return textResult(text || (status === "declined" ? ROW_STATUS.declined : ""), { itemId, exitCode, durationMs: item.durationMs ?? null, status }, (exitCode ?? 0) !== 0 || status === "declined" || status === "failed");
 		}
 		function patchResult(itemId: string, item: Rec, changes: PatchChangeArg[]): ToolResult {
@@ -1272,7 +1273,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				const lines = text ? text.split("\n") : [];
 				const shown = opts.expanded ? lines : lines.slice(-COMMAND_PREVIEW_LINES);
 				const skipped = lines.length - shown.length;
-				const body = shown.map((l) => theme.fg(context.isError ? "error" : "toolOutput", l)).join("\n");
+				// Pi's bash row keeps `toolOutput` on a failed command too; the error tint is the row's background, never the text (row gate, 2026-09-14).
+				const body = shown.map((l) => theme.fg("toolOutput", l)).join("\n");
 				const output = text ? `\n${skipped > 0 ? `${theme.fg("muted", `... (${skipped} earlier lines)`)}\n` : ""}${body}` : "";
 				const took = st.startedAt === undefined ? "" : `\n${theme.fg("muted", `${opts.isPartial ? "Elapsed" : "Took"} ${(((st.endedAt ?? Date.now()) - st.startedAt) / 1000).toFixed(1)}s`)}`;
 				return new Text(`${output}${took}`, 0, 0);
@@ -1318,7 +1320,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				return new Text(args.questions.map((q) => theme.fg("toolTitle", theme.bold(`? ${q.header}`))).join("\n"), 0, 0);
 			},
 			renderResult(result, _opts, theme, context) {
-				return new Text(`\n${theme.fg(context.isError ? "error" : "toolOutput", resultText(result))}`, 0, 0);
+				return new Text(`\n${theme.fg("toolOutput", resultText(result))}`, 0, 0); // as the command row: tint is the background
 			},
 		});
 
