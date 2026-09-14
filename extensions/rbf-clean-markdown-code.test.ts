@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { getCapabilities, Markdown, setCapabilities, Text, type MarkdownTheme } from "@earendil-works/pi-tui";
 import rbfCleanMarkdownCode, {
 	applyCleanMarkdownCode,
 	cleanReadOutputText,
@@ -86,7 +86,8 @@ describe("rbf-clean-markdown-code highlightConfigSections", () => {
 });
 
 describe("rbf-clean-markdown-code Markdown.prototype.renderToken patching", () => {
-	const mockTheme: any = {
+	const piThemeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+	const mockTheme: MarkdownTheme = {
 		heading: (s: string) => s,
 		link: (s: string) => s,
 		linkUrl: (s: string) => s,
@@ -129,6 +130,89 @@ describe("rbf-clean-markdown-code Markdown.prototype.renderToken patching", () =
 		expect(plain).toContain('"name": "pi-rbf"');
 		expect(plain).toContain("  {");
 		expect(plain).toContain("  }");
+	});
+
+	it.each([
+		["truecolor", true, "\x1b[38;2;"],
+		["256-color", false, "\x1b[38;5;"],
+	])("renders a real %s fenced assignment with Pi's MarkdownTheme", (_mode, trueColor, ansiPrefix) => {
+		patchMarkdownRenderToken();
+
+		const originalCapabilities = getCapabilities();
+		try {
+			setCapabilities({ ...originalCapabilities, trueColor });
+			initTheme("rose-pine-dawn");
+			const markdownTheme = getMarkdownTheme();
+			expect("fg" in markdownTheme).toBe(false);
+
+			const md = new Markdown('```lua\nvim.opt.foldmethod = "manual"\n```', 0, 0, markdownTheme);
+			let rendered: string[] = [];
+			expect(() => {
+				rendered = md.render(80);
+			}).not.toThrow();
+
+			const output = rendered.join("\n");
+			expect(stripAnsi(output)).toContain('  vim.opt.foldmethod = "manual"');
+			expect(output).toContain(ansiPrefix);
+			expect(output).not.toContain("```");
+		} finally {
+			setCapabilities(originalCapabilities);
+			initTheme();
+		}
+	});
+
+	it.each([
+		["missing", undefined],
+		["non-callable", { fg: undefined }],
+	])("uses fixed colors when Pi's global theme is %s", (_case, replacement) => {
+		patchMarkdownRenderToken();
+
+		const originalTheme: unknown = Reflect.get(globalThis, piThemeKey);
+		try {
+			if (replacement === undefined) {
+				Reflect.deleteProperty(globalThis, piThemeKey);
+			} else {
+				Reflect.set(globalThis, piThemeKey, replacement);
+			}
+
+			const md = new Markdown('```lua\nvim.opt.foldmethod = "manual"\n```', 0, 0, mockTheme);
+			let rendered: string[] = [];
+			expect(() => {
+				rendered = md.render(80);
+			}).not.toThrow();
+
+			const output = rendered.join("\n");
+			expect(output).toContain("\x1b[38;2;86;148;159mvim.opt.foldmethod\x1b[39m");
+			expect(output).toContain('\x1b[38;2;171;82;108m"manual"\x1b[39m');
+		} finally {
+			Reflect.set(globalThis, piThemeKey, originalTheme);
+		}
+	});
+
+	it.each([
+		[
+			"truecolor",
+			'\x1b[38;2;86;148;159mvim.opt.foldmethod\x1b[39m = \x1b[38;2;171;82;108m"manual"\x1b[39m',
+		],
+		["256-color", '\x1b[38;5;73mvim.opt.foldmethod\x1b[39m = \x1b[38;5;168m"manual"\x1b[39m'],
+	])("preserves an already-highlighted %s fenced assignment", (_mode, highlightedAssignment) => {
+		patchMarkdownRenderToken();
+
+		const markdownTheme: MarkdownTheme = {
+			...getMarkdownTheme(),
+			codeBlockIndent: "  ",
+			highlightCode: () => [highlightedAssignment],
+		};
+		const md = new Markdown('```lua\nvim.opt.foldmethod = "manual"\n```', 0, 0, markdownTheme);
+		let rendered: string[] = [];
+		expect(() => {
+			rendered = md.render(80);
+		}).not.toThrow();
+
+		const output = rendered.join("\n");
+		expect(output).toContain(highlightedAssignment);
+		expect(stripAnsi(output)).toContain('  vim.opt.foldmethod = "manual"');
+		expect(output).not.toContain("```");
 	});
 
 	it("preserves normal markdown paragraphs and headings", () => {

@@ -1,22 +1,39 @@
 import { ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Markdown } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 
 export const MARKDOWN_CLEAN_CODE_PATCHED_KEY = Symbol.for("rbf.cleanMarkdownCode.markdownPatched");
 export const ORIGINAL_RENDER_TOKEN_KEY = Symbol.for("rbf.cleanMarkdownCode.originalRenderToken");
 export const TOOL_EXECUTION_READ_PATCHED_KEY = Symbol.for("rbf.cleanMarkdownCode.toolExecutionPatched");
 export const ORIGINAL_UPDATE_DISPLAY_KEY = Symbol.for("rbf.cleanMarkdownCode.originalUpdateDisplay");
 
+const PI_THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme");
+const EXTENDED_FOREGROUND_COLOR_PATTERN = /\x1b\[38;(?:2;\d+;\d+;\d+|5;\d+)m/g;
+
+type ForegroundTheme = Pick<Theme, "fg">;
+type MarkdownRenderContext = { theme?: MarkdownTheme };
+
+function isForegroundTheme(candidate: unknown): candidate is ForegroundTheme {
+	return (
+		typeof candidate === "object" &&
+		candidate !== null &&
+		typeof (candidate as Partial<ForegroundTheme>).fg === "function"
+	);
+}
+
+function resolveForegroundTheme(candidate?: ForegroundTheme): ForegroundTheme | undefined {
+	if (isForegroundTheme(candidate)) return candidate;
+
+	const globalTheme: unknown = Reflect.get(globalThis, PI_THEME_KEY);
+	return isForegroundTheme(globalTheme) ? globalTheme : undefined;
+}
+
 /**
  * Highlight section headers and config syntax in read output and markdown code blocks.
  */
-export function highlightConfigSections(text: string, theme?: any): string {
+export function highlightConfigSections(text: string, theme?: ForegroundTheme): string {
 	if (!text) return text;
-	const activeTheme =
-		theme ??
-		(typeof globalThis !== "undefined"
-			? (globalThis as any)[Symbol.for("@earendil-works/pi-coding-agent:theme")]
-			: undefined);
+	const activeTheme = resolveForegroundTheme(theme);
 
 	const lines = text.split("\n");
 	return lines
@@ -39,7 +56,7 @@ export function highlightConfigSections(text: string, theme?: any): string {
 			}
 
 			// Key-value pair if unhighlighted: key = "value"
-			const hasMultipleColors = (line.match(/\x1b\[38;2;[0-9;]+m/g) || []).length > 1;
+			const hasMultipleColors = (line.match(EXTENDED_FOREGROUND_COLOR_PATTERN) || []).length > 1;
 			if (!hasMultipleColors) {
 				const kvMatch = plain.match(/^(\s*)([A-Za-z0-9_.-]+)(\s*=\s*)([\s\S]*)$/);
 				if (kvMatch) {
@@ -112,7 +129,7 @@ export function patchMarkdownRenderToken(): boolean {
 	proto[ORIGINAL_RENDER_TOKEN_KEY] = originalRenderToken;
 
 	proto.renderToken = function (
-		this: any,
+		this: MarkdownRenderContext,
 		token: any,
 		width: number,
 		nextTokenType?: string,
@@ -124,13 +141,13 @@ export function patchMarkdownRenderToken(): boolean {
 			if (this.theme?.highlightCode) {
 				const highlightedLines = this.theme.highlightCode(token.text, token.lang);
 				for (const hlLine of highlightedLines) {
-					lines.push(`${indent}${highlightConfigSections(hlLine, this.theme)}`);
+					lines.push(`${indent}${highlightConfigSections(hlLine)}`);
 				}
 			} else {
 				const codeLines = token.text.split("\n");
 				for (const codeLine of codeLines) {
 					const styled = typeof this.theme?.codeBlock === "function" ? this.theme.codeBlock(codeLine) : codeLine;
-					lines.push(`${indent}${highlightConfigSections(styled, this.theme)}`);
+					lines.push(`${indent}${highlightConfigSections(styled)}`);
 				}
 			}
 			if (nextTokenType && nextTokenType !== "space") {
