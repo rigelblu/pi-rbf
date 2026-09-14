@@ -5,7 +5,7 @@
 // sandbox, approval policy, and compaction; Pi passes no policy and declines every
 // server request. One Pi conversation maps to one Codex thread, recorded as one
 // `rbf-codex-thread/v1` entry in the session log. Codex's real model list sits in Pi's
-// picker tagged "(Codex agent)"; the picked model and thinking level go on every
+// picker under the `codex-harness` provider tag; the picked model and thinking level go on every
 // `turn/start`. A turn running when Pi exits is not recovered.
 import { parseArgs, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -14,11 +14,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-export const PROVIDER_ID = "rbf-codex";
+export const PROVIDER_ID = "codex-harness"; // the picker prints this id in brackets; it must read apart from Pi's built-in `openai-codex`
 export const API_ID = "rbf-codex-app-server";
 export const BOOTSTRAP_MODEL_ID = "codex";
-/** Catalog ids wear this prefix so the picker row never collides with Pi's built-in `openai-codex` rows that list the same Codex ids. */
-export const CATALOG_ID_PREFIX = "codex-";
+/** Catalog ids briefly wore this prefix on 2026-09-13; a store written then is normalized on read. */
+const LEGACY_ID_PREFIX = "codex-";
 export const ENTRY_TYPE = "rbf-codex-thread/v1";
 export const CODEX_FALLBACK_BIN = "/Users/tomhosiawa/.local/bin/codex";
 export const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -107,7 +107,7 @@ type CodexModel = { id: string; displayName: string; hidden: boolean; supportedR
 /** Pi model id → the id Codex expects on `turn/start`; the bootstrap row sends none. */
 export function codexModelId(piModelId: string): string | undefined {
 	if (piModelId === BOOTSTRAP_MODEL_ID) return undefined;
-	return piModelId.startsWith(CATALOG_ID_PREFIX) ? piModelId.slice(CATALOG_ID_PREFIX.length) : piModelId;
+	return piModelId.startsWith(LEGACY_ID_PREFIX) ? piModelId.slice(LEGACY_ID_PREFIX.length) : piModelId;
 }
 
 /** One Codex `model/list` entry → Pi model config. Pi offers `xhigh` and `max` only when the map names them. */
@@ -116,7 +116,7 @@ export function toProviderModel(m: CodexModel): ProviderModelConfig {
 	const thinkingLevelMap: Record<string, string | null> = { minimal: null };
 	for (const level of PI_LEVELS) if (level !== "minimal") thinkingLevelMap[level] = efforts.has(level) ? level : null;
 	return {
-		id: `${CATALOG_ID_PREFIX}${m.id}`,
+		id: m.id, // Codex's own id; the provider tag in the picker row tells it apart from openai-codex
 		name: `${m.displayName} (Codex agent)`,
 		reasoning: true,
 		thinkingLevelMap,
@@ -131,8 +131,8 @@ export function toProviderModel(m: CodexModel): ProviderModelConfig {
 function storedToConfigs(stored: RefreshModelsContext["stored"]): ProviderModelConfig[] {
 	return (stored?.models ?? [])
 		.filter((m) => m.id !== BOOTSTRAP_MODEL_ID)
-		// A store written before the prefix existed holds bare Codex ids; normalize so no session ever sees both forms.
-		.map((m) => ({ id: m.id.startsWith(CATALOG_ID_PREFIX) ? m.id : `${CATALOG_ID_PREFIX}${m.id}`, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: m.cost }));
+		// A store written during the brief `codex-` prefix holds prefixed ids; normalize so no session ever sees both forms.
+		.map((m) => ({ id: m.id.startsWith(LEGACY_ID_PREFIX) ? m.id.slice(LEGACY_ID_PREFIX.length) : m.id, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: m.cost }));
 }
 
 function toStoredModel(c: ProviderModelConfig): Model<typeof API_ID> {
@@ -534,6 +534,16 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					const forThisTurn = p.turnId === turnId || (m.method === "turn/completed" && !!p.turn && typeof p.turn === "object" && (p.turn as Rec).id === turnId);
 					if (!forThisTurn) return;
 					switch (m.method) {
+						case "error": {
+							// A logged-out Codex accepts initialize and thread/start, then reports 401 here while retrying; stop the turn and say so.
+							const err = p.error && typeof p.error === "object" ? (p.error as Rec) : {};
+							const info = err.codexErrorInfo && typeof err.codexErrorInfo === "object" ? JSON.stringify(err.codexErrorInfo) : "";
+							if (/401|Unauthorized/i.test(`${String(err.message ?? "")} ${String(err.additionalDetails ?? "")} ${info}`)) {
+								if (turnId) client.notify("turn/interrupt", { threadId, turnId });
+								settle(() => fail(new CodexError("codex-logged-out")));
+							}
+							break;
+						}
 						case "item/started": {
 							const item = rec(p.item);
 							if (item.type === "commandExecution") {
@@ -575,6 +585,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 								} else if (turn.status === "interrupted") finish("aborted");
 								else {
 									const err = turn.error ? String(rec(turn.error).message) : String(turn.status);
+									if (/401|Unauthorized/i.test(err)) return finish("error", "codex-logged-out");
 									notify(`Codex: ${err}`, "warning");
 									finish("error", "turn-failed");
 								}

@@ -10,6 +10,7 @@ export type FakeTurnEvent =
 	| { kind: "commentary"; id: string; text: string }
 	| { kind: "answer"; id: string; text: string; phase?: "final_answer" | null; streamed?: boolean }
 	| { kind: "serverRequest"; method: string }
+	| { kind: "authError" }
 	| { kind: "die" }
 	| { kind: "hang" }
 	| { kind: "complete"; status?: "completed" | "interrupted" | "failed"; errorMessage?: string };
@@ -73,6 +74,9 @@ async function runTurn(turnId: string): Promise<void> {
 				notify("item/started", { threadId: THREAD_ID, turnId, item: { id: ev.id, type: "agentMessage", text: "", phase: ev.phase === undefined ? "final_answer" : ev.phase } });
 				if (ev.streamed !== false) for (const piece of ev.text.match(/.{1,4}/g) ?? []) notify("item/agentMessage/delta", { threadId: THREAD_ID, turnId, itemId: ev.id, delta: piece });
 				notify("item/completed", { threadId: THREAD_ID, turnId, item: { id: ev.id, type: "agentMessage", text: ev.text, phase: ev.phase === undefined ? "final_answer" : ev.phase } });
+				break;
+			case "authError":
+				notify("error", { threadId: THREAD_ID, turnId, error: { message: "Reconnecting... 2/5", codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 401 } }, additionalDetails: "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header" }, willRetry: true });
 				break;
 			case "serverRequest":
 				send({ id: 9000 + turnCounter, method: ev.method, params: { threadId: THREAD_ID, turnId, itemId: "req-1" } });

@@ -151,9 +151,9 @@ describe("rbf-codex", () => {
 
 		it("maps a Codex model to a Pi model with only listed efforts, minimal null, and xhigh and max named", () => {
 			const m = toProviderModel(codexModel("gpt-x", ["medium", "high", "ultra"], { inputModalities: ["text", "image"] }));
-			expect(m).toMatchObject({ id: "codex-gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text"] }); // text-only until pi-10.3; id prefixed so the row never collides with openai-codex
-			expect(codexModelId("codex-gpt-x")).toBe("gpt-x");
-			expect(codexModelId("gpt-legacy")).toBe("gpt-legacy");
+			expect(m).toMatchObject({ id: "gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text"] }); // text-only until pi-10.3; the provider tag keeps the row apart from openai-codex
+			expect(codexModelId("gpt-x")).toBe("gpt-x");
+			expect(codexModelId("codex-gpt-x")).toBe("gpt-x"); // a store from the brief prefix era
 			expect(codexModelId(BOOTSTRAP_MODEL_ID)).toBeUndefined();
 			expect(m.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null });
 			expect(toProviderModel(codexModel("gpt-y", ["low", "xhigh", "max"])).thinkingLevelMap).toEqual({ minimal: null, low: "low", medium: null, high: null, xhigh: "xhigh", max: "max" });
@@ -164,13 +164,13 @@ describe("rbf-codex", () => {
 			const ctx = { allowNetwork: opts.allowNetwork, force: opts.force, stored: opts.stored, publish, signal: new AbortController().signal } as unknown as RefreshModelsContext;
 			return { ctx, publish };
 		}
-		const storedEntry = (checkedAt: number) => ({ models: [{ ...model("gpt-stored", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), name: "GPT-STORED (Codex agent)" }], checkedAt }); // bare id, as a pre-prefix store would hold
+		const storedEntry = (checkedAt: number) => ({ models: [{ ...model("codex-gpt-stored", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), name: "GPT-STORED (Codex agent)" }], checkedAt }); // prefixed id, as a store from the prefix era would hold
 
 		it("returns the stored list without network and never spawns", async () => {
 			const b = await boot();
 			const r = refreshCtx({ allowNetwork: false, stored: storedEntry(0) });
 			const list = await b.provider.config.refreshModels!(r.ctx);
-			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-stored"]); // normalized on read
+			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-stored"]); // legacy prefix stripped on read
 			expect(r.publish).not.toHaveBeenCalled();
 			expect(sent()).toEqual([]);
 		});
@@ -180,19 +180,19 @@ describe("rbf-codex", () => {
 			const fx = makePi();
 			createRbfCodex({ command: fakeCommand, argv: [], now: () => now })(fx.pi);
 			const fresh = refreshCtx({ allowNetwork: true, stored: storedEntry(now - CATALOG_MAX_AGE_MS + 1000) });
-			expect((await fx.provider.config.refreshModels!(fresh.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-stored"]);
+			expect((await fx.provider.config.refreshModels!(fresh.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-stored"]);
 			expect(fresh.publish).not.toHaveBeenCalled();
 			expect(sent()).toEqual([]);
 
 			const forced = refreshCtx({ allowNetwork: true, force: true, stored: storedEntry(now) });
 			const list = await fx.provider.config.refreshModels!(forced.ctx);
-			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-fake-1", "codex-gpt-fake-2"]);
+			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-fake-1", "gpt-fake-2"]);
 			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text"], reasoning: true });
 			expect(list[2].thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 			expect(forced.publish).toHaveBeenCalledTimes(1);
 			const persisted = (forced.publish.mock.calls[0] as unknown as [{ persist: { models: Model<any>[]; checkedAt: number } }])[0].persist;
 			expect(persisted.checkedAt).toBe(now);
-			expect(persisted.models.map((m) => m.id)).toEqual(["codex-gpt-fake-1", "codex-gpt-fake-2"]);
+			expect(persisted.models.map((m) => m.id)).toEqual(["gpt-fake-1", "gpt-fake-2"]);
 			expect(persisted.models[0]).toMatchObject({ api: API_ID, provider: PROVIDER_ID });
 			expect(methods()).toEqual(["initialize", "initialized", "model/list"]);
 
@@ -204,7 +204,7 @@ describe("rbf-codex", () => {
 		it("returns the stored or bootstrap list without throwing when the spawn fails", async () => {
 			const b = await boot({ command: MISSING_COMMAND });
 			const r1 = refreshCtx({ allowNetwork: true, force: true, stored: storedEntry(0) });
-			expect((await b.provider.config.refreshModels!(r1.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "codex-gpt-stored"]);
+			expect((await b.provider.config.refreshModels!(r1.ctx)).map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-stored"]);
 			const r2 = refreshCtx({ allowNetwork: true, force: true });
 			expect(await b.provider.config.refreshModels!(r2.ctx)).toEqual([BOOTSTRAP_MODEL]);
 			expect(r1.publish).not.toHaveBeenCalled();
@@ -214,16 +214,16 @@ describe("rbf-codex", () => {
 	describe("model and effort on turn/start", () => {
 		it("sends the catalog model id and the mapped effort", async () => {
 			const b = await boot();
-			await b.turn("hi", model("codex-gpt-fake-2", { minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" }), { reasoning: "high" });
+			await b.turn("hi", model("gpt-fake-2", { minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" }), { reasoning: "high" });
 			const start = sent().find((m) => m.method === "turn/start")!;
-			expect(start.params).toMatchObject({ model: "gpt-fake-2", effort: "high" }); // prefix stripped for Codex
+			expect(start.params).toMatchObject({ model: "gpt-fake-2", effort: "high" });
 		});
 
 		it("sends effort but no model for the bootstrap id, and neither effort when the level is unsupported or off", async () => {
 			const b = await boot();
 			await b.turn("one", model(), { reasoning: "medium" });
 			await b.turn("two", model(), {});
-			await b.turn("three", model("codex-gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
+			await b.turn("three", model("gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts[0]).toMatchObject({ effort: "medium" });
 			expect(starts[0]).not.toHaveProperty("model");
@@ -238,7 +238,7 @@ describe("rbf-codex", () => {
 		it("retries once without model and effort when Codex rejects the persisted model id, with the retired-model notice", async () => {
 			scenario({ retiredModel: "gpt-gone" });
 			const b = await boot();
-			const r = await b.turn("hi", model("codex-gpt-gone"), { reasoning: "high" });
+			const r = await b.turn("hi", model("gpt-gone"), { reasoning: "high" });
 			expect(r.text).toBe("FAKE_OK");
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts).toHaveLength(2);
@@ -451,6 +451,16 @@ describe("rbf-codex", () => {
 			const r = await b.turn([{ role: "user", content: [{ type: "image", data: "", mimeType: "image/png" }], timestamp: Date.now() } as any]);
 			expect(r.final?.errorMessage).toBe(COPY["unsupported-input"]);
 			expect(sent()).toEqual([]);
+		});
+
+		it("a 401 during the turn ends with codex-logged-out at once and interrupts the retrying turn", async () => {
+			scenario({ turn: [{ kind: "authError" }, { kind: "hang" }] });
+			const b = await boot();
+			const started = Date.now();
+			const r = await b.turn("hi");
+			expect(r.final?.errorMessage).toBe(COPY["codex-logged-out"]);
+			expect(Date.now() - started).toBeLessThan(3000);
+			expect(methods()).toContain("turn/interrupt");
 		});
 
 		it("a missing Codex binary ends with codex-missing; an auth error on initialize ends with codex-logged-out", async () => {
