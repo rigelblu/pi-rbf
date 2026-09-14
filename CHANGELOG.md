@@ -7,6 +7,15 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.21.1 (2026-09-14)
+## 🟠⋯ Added for End Users
+- 2026-09-14 - feat (codex) | use Pi's normal conversation controls with Codex: every command and file change Codex runs is a Pi tool row you can expand, drawn like Pi's own bash and edit rows; when Codex asks before running something, answer Yes, Yes for this session, or No (which stops the turn so you can say what to do instead) in Pi's own dialog, and answer its clarifying questions the same way; fork or navigate the session and each branch keeps its own Codex memory; type while Codex works and it steers the running turn; paste an image on an image-capable Codex model (#pi-10)
+
+## 🟠⋯ Fixed for End Users
+- 2026-09-14 - fix (codex) | Escape cancels a Codex turn at once instead of after a 3 s wait and a restart (#pi-10)
+
+---
+
 # 🔵⋯ v0.21.0 (2026-09-13)
 ## 🟠⋯ Added for End Users
 - 2026-09-13 - feat (codex) | use Codex's full agent harness through one Pi conversation: pick a `codex-…` model and effort in Pi's picker, see each command in the working line, keep the activity as thinking, watch the answer stream, Escape to cancel, and continue the same thread after reopening (#pi-10)

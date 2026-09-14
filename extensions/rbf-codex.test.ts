@@ -694,6 +694,14 @@ describe("rbf-codex", () => {
 			expect(rp.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
 		});
 
+		it("an error row throws RowError so Pi tints it (a returned isError is ignored by Pi's loop)", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "touch /etc/x", approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("No, tell Codex what to do instead");
+			const first = await b.turn("go");
+			await expect(b.tools.get(TOOL_COMMAND)!.execute(first.toolCall!.id, first.toolCall!.arguments, undefined, undefined, b.ctx)).rejects.toBeInstanceOf(RowError);
+		});
+
 		it("a dialog still open when the turn ends is closed through its signal and answered decline", async () => {
 			scenario({ turn: [{ kind: "command", id: "c1", command: "ls", approvals: [{ when: "after" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
 			const b = await boot();
