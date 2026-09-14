@@ -1,17 +1,24 @@
-// rbf-codex — use Codex's full agent harness through Pi (#pi-10, v0.21.0).
+// rbf-codex — use Codex's full agent harness through Pi (#pi-10, v0.21.1).
 //
 // Pi spawns `codex app-server` over stdio as a direct child, one per Pi session, and
-// sends each turn the user messages since the last answer. Codex owns context, tools,
-// sandbox, approval policy, and compaction; Pi passes no policy and declines every
-// server request. One Pi conversation maps to one Codex thread, recorded as one
-// `rbf-codex-thread/v1` entry in the session log. Codex's real model list sits in Pi's
-// picker under the `codex-harness` provider tag; the picked model and thinking level go on every
-// `turn/start`. A turn running when Pi exits is not recovered.
-import { parseArgs, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+// sends each prompt to Codex as one turn. Codex owns context, tools, sandbox, approval
+// policy, and compaction; Pi passes no policy. Each Codex command, file change, and
+// question becomes a real Pi tool round-trip (`codex_command`, `codex_patch`,
+// `codex_question`), so one Codex turn spans several `streamSimple` calls and tool
+// executions; `ActiveTurn` buffers Codex's events between them. Approvals and questions
+// are answered from inside the tool's `execute` through Pi's own dialogs. One Pi branch
+// maps to one Codex thread: `rbf-codex-thread/v1` records the binding and
+// `rbf-codex-turn/v1` records each turn, so a branch that diverged gets a `thread/fork`
+// at its last turn. A turn running when Pi exits is not recovered.
+import { parseArgs, renderDiff, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { AssistantMessage, AssistantMessageEventStream, Context, Model, RefreshModelsContext, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEventStream, Context, Model, RefreshModelsContext, SimpleStreamOptions, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
+import { Box, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, relative } from "node:path";
 import { createInterface } from "node:readline";
 
 export const PROVIDER_ID = "codex-harness"; // the picker prints this id in brackets; it must read apart from Pi's built-in `openai-codex`
@@ -20,14 +27,22 @@ export const BOOTSTRAP_MODEL_ID = "codex";
 /** Catalog ids briefly wore this prefix on 2026-09-13; a store written then is normalized on read. */
 const LEGACY_ID_PREFIX = "codex-";
 export const ENTRY_TYPE = "rbf-codex-thread/v1";
+export const TURN_ENTRY_TYPE = "rbf-codex-turn/v1";
+export const TOOL_COMMAND = "codex_command";
+export const TOOL_PATCH = "codex_patch";
+export const TOOL_QUESTION = "codex_question";
 export const CODEX_FALLBACK_BIN = "/Users/tomhosiawa/.local/bin/codex";
 export const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const CLIENT_VERSION = "0.21.1";
 const SETUP_TIMEOUT_MS = 15_000;
 const INTERRUPT_WAIT_MS = 3_000;
 const STDERR_TAIL_LINES = 64;
-const workingLineMax = () => Math.max(20, (process.stdout.columns ?? 120) - 8);
+const COMMAND_PREVIEW_LINES = 5;
+type CommandRowState = { startedAt?: number; endedAt?: number; interval?: ReturnType<typeof setInterval> };
+const terminalWidth = () => Math.max(20, process.stdout.columns ?? 120);
 
 export type ThreadEntry = { threadId: string; cwd: string; sessionId: string };
+export type TurnEntry = { threadId: string; turnId: string; status: string };
 type Rec = Record<string, unknown>;
 type JsonRpc = { id?: number | string; method?: string; params?: unknown; result?: unknown; error?: { code: number; message: string } };
 
@@ -35,7 +50,7 @@ export const COPY = {
 	"codex-missing": "Codex CLI not found. Install Codex, check `codex --version`, and send again.",
 	"codex-logged-out": "Codex is not logged in. Run `codex login`, then send again.",
 	"workspace-mismatch": "This conversation's Codex thread belongs to another directory. Start a new Pi conversation here, or reopen it from that directory.",
-	"unsupported-input": "Codex accepts plain text only in this version. Remove the image and send again.",
+	"unsupported-input": "This Codex model accepts plain text only. Remove the image, or pick an image-capable Codex model.",
 	"codex-stopped": "Codex stopped unexpectedly. Send your message again to continue this conversation.",
 	"turn-failed": "Codex could not complete this request. Send your message again or start a new Pi conversation.",
 	"no-answer": "Codex finished without an answer. Send your message again.",
@@ -45,6 +60,9 @@ export type CopyKey = keyof typeof COPY;
 
 export const NOTICE = {
 	declined: (what: string) => `Codex asked for ${what}; this version cannot answer, so it was declined.`,
+	secret: "Codex asked for a secret; Pi cannot take one privately, so it was declined.",
+	restarted: 'Codex restarted; your "Yes for this session" answers were reset.',
+	nothingToSend: "Nothing to send: no user message since Codex's last answer.",
 	coldStart: "Codex starts cold; it has not seen this transcript.",
 	retiredModel: (model: string) => `Codex no longer offers ${model}; this turn used Codex's default model. Pick another in the model picker.`,
 	compact: "Codex manages its own context; /compact is not needed in a Codex conversation.",
@@ -52,6 +70,12 @@ export const NOTICE = {
 	treeSummary: "Navigated a Codex conversation; Codex keeps its own context.",
 	policy: (approval: string, sandbox: string) => `Codex: approval ${approval}, sandbox ${sandbox}.`,
 } as const;
+
+/** The approval dialog, in order; the third choice and Escape both answer `cancel`, which refuses and stops the turn. */
+export const APPROVAL_CHOICES = ["Yes", "Yes for this session", "No, tell Codex what to do instead"] as const;
+const APPROVAL_DECISION: Record<string, "accept" | "acceptForSession" | "cancel"> = { Yes: "accept", "Yes for this session": "acceptForSession", "No, tell Codex what to do instead": "cancel" };
+export const OTHER_CHOICE = "Other…";
+export const ROW_STATUS = { declined: "Declined", aborted: "Command aborted", stopped: "Codex stopped" } as const;
 
 /** Codex reports commands wrapped in the login shell (`/bin/zsh -lc '<cmd>'`); show what the user would have typed. */
 export function displayCommand(command: string): string {
@@ -61,11 +85,142 @@ export function displayCommand(command: string): string {
 	return /^'(.*)'$/s.test(inner) ? inner.slice(1, -1) : inner;
 }
 
-/** Which server requests are questions for the human; every request is declined, these also get a notice. */
+/** Which server requests are questions for the human; only these open a row and a dialog. */
 export function humanRequestKind(method: string): "approval" | "input" | undefined {
 	if (/approval/i.test(method)) return "approval";
 	if (/requestUserInput|elicitation/i.test(method)) return "input";
 	return undefined;
+}
+const HUMAN_REQUESTS: Record<string, RowKind> = {
+	"item/commandExecution/requestApproval": "commandExecution",
+	"item/fileChange/requestApproval": "fileChange",
+	"item/tool/requestUserInput": "question",
+};
+
+// ── tool argument shapes; persisted in every session log, so irreversible ─────
+export const CommandParams = Type.Object({ itemId: Type.String(), command: Type.String(), cwd: Type.String() });
+export const PatchChange = Type.Object({ path: Type.String(), kind: Type.String(), movePath: Type.Optional(Type.String()), diff: Type.String() });
+export const PatchParams = Type.Object({ itemId: Type.String(), changes: Type.Array(PatchChange) });
+export const QuestionOption = Type.Object({ label: Type.String(), description: Type.String() });
+export const Question = Type.Object({ id: Type.String(), header: Type.String(), question: Type.String(), options: Type.Optional(Type.Array(QuestionOption)), isOther: Type.Optional(Type.Boolean()), isSecret: Type.Optional(Type.Boolean()) });
+export const QuestionParams = Type.Object({ itemId: Type.String(), questions: Type.Array(Question) });
+export type CommandArgs = { itemId: string; command: string; cwd: string };
+export type PatchChangeArg = { path: string; kind: string; movePath?: string; diff: string };
+export type PatchArgs = { itemId: string; changes: PatchChangeArg[] };
+export type QuestionArg = { id: string; header: string; question: string; options?: { label: string; description: string }[]; isOther?: boolean; isSecret?: boolean };
+export type QuestionArgs = { itemId: string; questions: QuestionArg[] };
+export type RowKind = "commandExecution" | "fileChange" | "question";
+
+/**
+ * Pi's edit row, `renderDiff`, and `rbf-edit-glance` read Pi's own numbered diff lines (`+2 new`, `-1 old`, ` 3 context`, ` ...` for a gap),
+ * not a unified diff. Codex sends a unified diff (bare hunks) for an `update` and the whole file content for an `add` or `delete`.
+ */
+export function toPreviewDiff(kind: string, text: string): string {
+	if (!text) return "";
+	const body = text.replace(/\n$/, "").split("\n");
+	const rows: { sign: string; num: number | null; line: string }[] = [];
+	if (kind === "add" || kind === "delete") {
+		const sign = kind === "add" ? "+" : "-";
+		body.forEach((line, i) => rows.push({ sign, num: i + 1, line }));
+	} else {
+		let oldN = 1;
+		let newN = 1;
+		let inHunk = !body.some((l) => l.startsWith("@@"));
+		for (const line of body) {
+			const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+			if (hunk) {
+				if (rows.length) rows.push({ sign: " ", num: null, line: "..." });
+				oldN = Number(hunk[1]);
+				newN = Number(hunk[2]);
+				inHunk = true;
+				continue;
+			}
+			if (!inHunk || line.startsWith("\\")) continue; // file headers before the first hunk; `\ No newline at end of file`
+			if (line.startsWith("+")) rows.push({ sign: "+", num: newN++, line: line.slice(1) });
+			else if (line.startsWith("-")) rows.push({ sign: "-", num: oldN++, line: line.slice(1) });
+			else {
+				rows.push({ sign: " ", num: oldN, line: line.slice(1) });
+				oldN++;
+				newN++;
+			}
+		}
+	}
+	const width = String(Math.max(1, ...rows.map((r) => r.num ?? 0))).length;
+	return rows.map((r) => `${r.sign}${(r.num === null ? "" : String(r.num)).padStart(width, " ")} ${r.line}`).join("\n");
+}
+
+/** Codex's `FileUpdateChange.kind` is a tagged object; the tool argument carries it flat. */
+export function flattenChanges(changes: unknown): PatchChangeArg[] {
+	if (!Array.isArray(changes)) return [];
+	return changes.map((c) => {
+		const r = (c ?? {}) as Rec;
+		const kind = r.kind && typeof r.kind === "object" ? (r.kind as Rec) : {};
+		const movePath = typeof kind.move_path === "string" ? kind.move_path : undefined;
+		const type = String(kind.type ?? "update");
+		return { path: String(r.path ?? ""), kind: type, ...(movePath ? { movePath } : {}), diff: toPreviewDiff(type, String(r.diff ?? "")) };
+	});
+}
+
+/** Pi's rows show the path the model gave, usually relative; Codex gives absolute ones, so show them relative to the working directory, or under `~`. */
+export function displayPath(p: string, cwd: string = process.cwd()): string {
+	if (!isAbsolute(p)) return p;
+	const rel = relative(cwd, p);
+	if (rel && !rel.startsWith("..") && !isAbsolute(rel)) return rel;
+	const home = homedir();
+	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+export function diffCounts(diff: string): { added: number; removed: number } {
+	let added = 0;
+	let removed = 0;
+	for (const line of diff.split("\n")) {
+		if (line.startsWith("+++") || line.startsWith("---")) continue;
+		if (line.startsWith("+")) added++;
+		else if (line.startsWith("-")) removed++;
+	}
+	return { added, removed };
+}
+
+/** Pi's own row word for Codex's change kind. */
+export function patchVerb(kind: string): string {
+	return kind === "add" ? "write" : kind === "delete" ? "delete" : "edit";
+}
+
+export function patchRowLine(c: PatchChangeArg): string {
+	const { added, removed } = diffCounts(c.diff);
+	const target = c.movePath ? `${displayPath(c.path)} → ${displayPath(c.movePath)}` : displayPath(c.path);
+	return `${patchVerb(c.kind)} ${target} (+${added} −${removed})`;
+}
+
+function patchPathsSummary(changes: PatchChangeArg[]): string {
+	return changes
+		.map((c) => {
+			const { added, removed } = diffCounts(c.diff);
+			return `${displayPath(c.path)} (+${added} −${removed})`;
+		})
+		.join(", ");
+}
+
+/** A dialog title is truncated to the width with `…`: keep the leading verb and the first command or path; drop the reason first, then trailing paths. */
+export function truncateTitle(title: string, width: number): string {
+	if (title.length <= width) return title;
+	const reasonAt = title.indexOf(" — ");
+	if (reasonAt !== -1) {
+		const withoutReason = title.slice(0, reasonAt);
+		if (withoutReason.length <= width) return withoutReason;
+		title = withoutReason;
+	}
+	while (title.length > width && title.includes(", ")) title = title.slice(0, title.lastIndexOf(", "));
+	if (title.length <= width) return title;
+	return `${title.slice(0, Math.max(1, width - 1))}…`;
+}
+
+export function approvalTitle(kind: RowKind, req: Rec, changes: PatchChangeArg[]): string {
+	const reason = typeof req.reason === "string" && req.reason ? ` — ${req.reason}` : "";
+	if (kind === "fileChange") return `${changes.length ? `Codex wants to edit: ${patchPathsSummary(changes)}` : "Codex wants to edit files"}${reason}`;
+	const command = typeof req.command === "string" && req.command ? displayCommand(req.command) : "(pending)";
+	const verb = req.kind === "writeStdin" ? "Codex wants to send input to:" : "Codex wants to run:";
+	return `${verb} ${command}${reason}`;
 }
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -73,8 +228,16 @@ const ZERO_USAGE = { ...ZERO_COST, totalTokens: 0, cost: { ...ZERO_COST, total: 
 const SENTINEL = 1_000_000_000; // keeps Pi's threshold compaction from ever firing
 const PI_LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-/** The user pressed Escape while a setup request was in flight. */
+/** The user pressed Escape while a setup request or a row's wait was in flight. */
 class AbortedError extends Error {}
+/** Pi tints a row as an error only when the tool throws (its bash tool throws on a nonzero exit or an abort); a returned `isError` is ignored. So an error row throws this, carrying the row text. */
+export class RowError extends Error {}
+/** The turn ended while a tool execution was still waiting on its item. */
+class TurnEndedError extends Error {
+	constructor(readonly status: string) {
+		super(`turn ended: ${status}`);
+	}
+}
 
 export class CodexError extends Error {
 	constructor(
@@ -90,6 +253,15 @@ function rec(v: unknown): Rec {
 	return v as Rec;
 }
 
+/** A logged-out Codex accepts `initialize` and `thread/start`, then reports 401 during the turn; this is the tell wherever it surfaces. */
+function isLoggedOut(text: string): boolean {
+	return /401|Unauthorized/i.test(text);
+}
+
+function resultText(result: { content: { type: string; text?: string }[] }): string {
+	return result.content.map((c) => (c.type === "text" ? (c.text ?? "") : "")).join("\n");
+}
+
 // ── catalog ──────────────────────────────────────────────────────────────────
 export const BOOTSTRAP_MODEL: ProviderModelConfig = {
 	id: BOOTSTRAP_MODEL_ID,
@@ -102,7 +274,7 @@ export const BOOTSTRAP_MODEL: ProviderModelConfig = {
 	cost: ZERO_COST,
 };
 
-type CodexModel = { id: string; displayName: string; hidden: boolean; supportedReasoningEfforts: { reasoningEffort: string }[] };
+type CodexModel = { id: string; displayName: string; hidden: boolean; supportedReasoningEfforts: { reasoningEffort: string }[]; inputModalities?: string[] };
 
 /** Pi model id → the id Codex expects on `turn/start`; the bootstrap row sends none. */
 export function codexModelId(piModelId: string): string | undefined {
@@ -110,7 +282,7 @@ export function codexModelId(piModelId: string): string | undefined {
 	return piModelId.startsWith(LEGACY_ID_PREFIX) ? piModelId.slice(LEGACY_ID_PREFIX.length) : piModelId;
 }
 
-/** One Codex `model/list` entry → Pi model config. Pi offers `xhigh` and `max` only when the map names them. */
+/** One Codex `model/list` entry → Pi model config. Pi offers `xhigh` and `max` only when the map names them; Pi's editor accepts a paste only when `input` lists `image`. */
 export function toProviderModel(m: CodexModel): ProviderModelConfig {
 	const efforts = new Set(m.supportedReasoningEfforts.map((e) => e.reasoningEffort));
 	const thinkingLevelMap: Record<string, string | null> = { minimal: null };
@@ -120,7 +292,7 @@ export function toProviderModel(m: CodexModel): ProviderModelConfig {
 		name: `${m.displayName} (Codex agent)`,
 		reasoning: true,
 		thinkingLevelMap,
-		input: ["text"], // text-only until pi-10.3 carries images; Pi's editor then blocks a paste up front
+		input: m.inputModalities?.includes("image") ? ["text", "image"] : ["text"],
 		contextWindow: SENTINEL,
 		maxTokens: SENTINEL,
 		cost: ZERO_COST,
@@ -145,14 +317,15 @@ export function mapEffort(model: Model<any>, level: ThinkingLevel | undefined): 
 	return typeof mapped === "string" ? mapped : undefined;
 }
 
-// ── Pi's assistant-message event protocol, one writer per turn ───────────────
-// Pi rebuilds the message from `partial` snapshots indexed by content block, so thinking
-// and text interleave as separate blocks: switching kind closes the open block and opens a new one.
+// ── Pi's assistant-message event protocol, one writer per streamSimple call ──
+// Pi rebuilds the message from `partial` snapshots indexed by content block, so thinking,
+// text, and tool calls interleave as separate blocks: switching kind closes the open block.
 export class AssistantMessageWriter {
 	readonly stream = createAssistantMessageEventStream();
 	private readonly partial: AssistantMessage;
 	private open: { kind: "thinking" | "text"; index: number } | null = null;
 	private ended = false;
+	started = false;
 
 	constructor(model: Model<any>) {
 		this.partial = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: ZERO_USAGE, stopReason: "stop", timestamp: Date.now() };
@@ -186,6 +359,8 @@ export class AssistantMessageWriter {
 	}
 
 	start(): void {
+		if (this.started) return;
+		this.started = true;
 		this.stream.push({ type: "start", partial: this.snap() });
 	}
 	thinking(text: string): void {
@@ -194,19 +369,22 @@ export class AssistantMessageWriter {
 	text(text: string): void {
 		this.delta("text", text);
 	}
-	/** The newest non-empty line of the open thinking block; feeds the working line. */
-	lastThinkingLine(): string {
-		if (this.open?.kind !== "thinking") return "";
-		const b = this.partial.content[this.open.index] as { thinking?: string };
-		return (b.thinking ?? "").split("\n").filter(Boolean).pop()?.trim() ?? "";
+	/** One tool call block; the call then ends with `finish("toolUse")` and Pi executes the tool. */
+	toolCall(toolCall: ToolCall): void {
+		if (this.ended) return;
+		this.closeBlock();
+		const index = this.partial.content.length;
+		this.partial.content.push(toolCall);
+		this.stream.push({ type: "toolcall_start", contentIndex: index, partial: this.snap() });
+		this.stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: this.snap() });
 	}
 	/** Terminal event; `errorMessage` is always one of the fixed COPY sentences, never Codex text. */
-	finish(kind: "done" | "aborted" | "error", errorKey?: CopyKey): void {
+	finish(kind: "done" | "toolUse" | "aborted" | "error", errorKey?: CopyKey): void {
 		if (this.ended) return;
 		this.ended = true;
 		this.closeBlock();
 		const message: AssistantMessage = { ...this.partial, timestamp: Date.now(), stopReason: kind === "done" ? "stop" : kind };
-		if (kind === "done") this.stream.push({ type: "done", reason: "stop", message });
+		if (kind === "done" || kind === "toolUse") this.stream.push({ type: "done", reason: kind === "done" ? "stop" : "toolUse", message });
 		else {
 			message.errorMessage = kind === "aborted" ? "Request was aborted" : COPY[errorKey ?? "generic"];
 			this.stream.push({ type: "error", reason: kind, error: message });
@@ -223,6 +401,8 @@ export class AppServerClient {
 	readonly stderrTail: string[] = [];
 	exited = false;
 	readonly onExit = new Set<() => void>();
+	/** Handles an inbound server request; returns false to have it answered with a JSON-RPC error at once. */
+	onRequest: ((m: JsonRpc & { id: number | string; method: string }) => boolean) | null = null;
 
 	private constructor(readonly child: ChildProcessWithoutNullStreams) {
 		// A write that lands after Codex died raises EPIPE on stdin; unhandled, that exits Pi. `exit` follows anyway.
@@ -273,9 +453,14 @@ export class AppServerClient {
 			return;
 		}
 		if (m.id !== undefined && m.method) {
-			// Every server request is declined at once; nothing waits on the human in this version.
-			this.write({ id: m.id, error: { code: -32601, message: "pi-rbf-codex does not answer server requests" } });
-			for (const fn of this.listeners) fn(m);
+			let handled = false;
+			try {
+				handled = this.onRequest?.(m as JsonRpc & { id: number | string; method: string }) === true;
+			} catch {
+				handled = false;
+			}
+			if (!handled) this.respondError(m.id, "pi-rbf-codex does not answer this request");
+			for (const fn of [...this.listeners]) fn(m);
 			return;
 		}
 		if (typeof m.id === "number") {
@@ -285,7 +470,8 @@ export class AppServerClient {
 			else p.resolve(m.result);
 			return;
 		}
-		if (m.method) for (const fn of this.listeners) fn(m);
+		// A snapshot: a turn that subscribes while this message is dispatched (the next turn, started from the previous one's end) must not receive it.
+		if (m.method) for (const fn of [...this.listeners]) fn(m);
 	}
 
 	private write(m: JsonRpc): void {
@@ -314,6 +500,19 @@ export class AppServerClient {
 
 	notify(method: string, params: unknown): void {
 		this.write({ method, params });
+	}
+
+	/** `turn/interrupt` is a request in Codex's schema (a notification is silently ignored, probe 2026-09-14); the reply carries nothing we need. */
+	interrupt(threadId: string, turnId: string): void {
+		void this.request("turn/interrupt", { threadId, turnId }, SETUP_TIMEOUT_MS).catch(() => {});
+	}
+
+	/** Answer one server request; each id is answered exactly once by its owner. */
+	respond(id: number | string, result: unknown): void {
+		this.write({ id, result });
+	}
+	respondError(id: number | string, message: string): void {
+		this.write({ id, error: { code: -32601, message } });
 	}
 
 	subscribe(fn: (m: JsonRpc) => void): () => void {
@@ -351,6 +550,19 @@ export function isSandboxLaunch(argv: string[]): boolean {
 	return parseArgs(argv).unknownFlags.has("sandbox");
 }
 
+// ── the Codex side of one turn, across every streamSimple call and tool execution it spans ──
+type UserInputItem = { type: "text"; text: string; text_elements: [] } | { type: "image"; url: string };
+type TurnItem = { kind: RowKind; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec };
+type PendingRequest = { id: number | string; method: string; params: Rec; kind: RowKind };
+type WaitOutcome = { kind: "completed"; item: Rec } | { kind: "request"; req: PendingRequest };
+type Waiter = { resolve: (o: WaitOutcome) => void; reject: (e: Error) => void; onUpdate?: (output: string) => void };
+type ProjectedEvent =
+	| { kind: "row"; itemId: string }
+	| { kind: "thinking"; text: string }
+	| { kind: "answer"; text: string }
+	| { kind: "final"; text: string }
+	| { kind: "end"; status: string; error?: string };
+
 // ── the extension ────────────────────────────────────────────────────────────
 export function createRbfCodex(options: RbfCodexOptions = {}) {
 	const command = options.command ?? DEFAULT_COMMAND;
@@ -361,52 +573,331 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		if (isSandboxLaunch(options.argv ?? process.argv.slice(2))) return;
 
 		// Everything below lives in this closure; Pi rebinds a new instance on switch, fork, and reload.
-		const state = { ctx: null as ExtensionContext | null, client: null as AppServerClient | null, shuttingDown: false, noticedPolicy: false };
+		const state = { ctx: null as ExtensionContext | null, client: null as AppServerClient | null, shuttingDown: false, noticedPolicy: false, activeTurn: null as ActiveTurn | null, approvedForSession: false };
 
 		const notify = (text: string, type: "info" | "warning" | "error" = "info") => {
 			if (state.ctx?.mode === "tui") state.ctx.ui.notify(text, type);
 		};
 
-		function newestOwnEntry(ctx: ExtensionContext): ThreadEntry | null {
-			const sessionId = ctx.sessionManager.getSessionId();
-			const branch = ctx.sessionManager.getBranch();
-			for (let i = branch.length - 1; i >= 0; i--) {
-				const e = branch[i] as { type: string; customType?: string; data?: ThreadEntry };
-				if (e.type === "custom" && e.customType === ENTRY_TYPE) return e.data && e.data.sessionId === sessionId ? e.data : null;
+		class ActiveTurn {
+			readonly events: ProjectedEvent[] = [];
+			cursor = 0;
+			readonly items = new Map<string, TurnItem>();
+			private readonly waiters = new Map<string, Waiter>();
+			private readonly requests = new Map<string, PendingRequest[]>();
+			private readonly phases = new Map<string, string | null>();
+			ended: { status: string; error?: string } | null = null;
+			private consumer: ((ev: ProjectedEvent) => void) | null = null;
+			private readonly endController = new AbortController();
+			private endWaiters: (() => void)[] = [];
+			private interrupting: Promise<void> | null = null;
+			private readonly unsubscribe: () => void;
+			private readonly onExit: () => void;
+
+			/** Known once `turn/start` answers; until then every message for this thread belongs to this turn (Codex runs one turn per thread). */
+			turnId = "";
+			/** A steer Codex refused because the turn ended; it becomes the next turn's prompt when this one drains. */
+			unsent: UserInputItem[] | undefined;
+
+			constructor(
+				readonly client: AppServerClient,
+				readonly threadId: string,
+			) {
+				this.unsubscribe = client.subscribe((m) => {
+					try {
+						this.project(m);
+					} catch (e) {
+						// One malformed notification must never escape readline's event and take Pi down.
+						this.end({ status: "failed", error: String(e) });
+					}
+				});
+				this.onExit = () => {
+					try {
+						this.end({ status: "childExit" });
+					} catch {
+						// The child's exit event is a Node emitter; a throw here would exit Pi
+					}
+				};
+				client.onExit.add(this.onExit);
 			}
-			return null;
+			/** A `turn/start` that never answered: stop listening without ending anything; a request queued meanwhile is still answered once. */
+			dispose(): void {
+				this.unsubscribe();
+				this.client.onExit.delete(this.onExit);
+				for (const queue of this.requests.values()) for (const req of queue) this.client.respondError(req.id, "pi-rbf-codex: the turn did not start");
+				this.requests.clear();
+			}
+
+			/** The signal Pi's dialogs take, so a dialog still open when the turn ends is closed. */
+			get endSignal(): AbortSignal {
+				return this.endController.signal;
+			}
+
+			// Cursor ownership: `drain` advances it during replay, then installs the live consumer only once replay has caught up,
+			// so at any moment exactly one of the two moves it and `events[cursor..]` is always what the attached call has not seen.
+			private push(ev: ProjectedEvent): void {
+				this.events.push(ev);
+				this.consumer?.(ev);
+			}
+
+			/** Replay what this call has not seen, then go live; `consume` returns false to detach (the call ended). A throw detaches and goes to `onError`, never up a Node emitter. */
+			drain(consume: (ev: ProjectedEvent) => boolean, onError: (e: unknown) => void): void {
+				this.consumer = null;
+				const step = (ev: ProjectedEvent): boolean => {
+					try {
+						return consume(ev);
+					} catch (e) {
+						this.consumer = null;
+						onError(e);
+						return false;
+					}
+				};
+				while (this.cursor < this.events.length) {
+					const ev = this.events[this.cursor++];
+					if (!step(ev)) return;
+				}
+				this.consumer = (ev) => {
+					this.cursor++;
+					if (!step(ev)) this.consumer = null;
+				};
+			}
+			detach(): void {
+				this.consumer = null;
+			}
+			get drained(): boolean {
+				return this.ended !== null && this.cursor >= this.events.length;
+			}
+
+			private end(end: { status: string; error?: string }): void {
+				if (this.ended) return;
+				this.ended = end;
+				this.unsubscribe();
+				this.client.onExit.delete(this.onExit);
+				for (const w of [...this.waiters.values()]) w.reject(new TurnEndedError(end.status));
+				this.waiters.clear();
+				// A request queued for a row Pi has not executed yet would otherwise stay open forever; each id is answered exactly once.
+				for (const queue of this.requests.values()) for (const req of queue) this.client.respondError(req.id, "pi-rbf-codex: the turn ended before this request could be asked");
+				this.requests.clear();
+				this.endController.abort();
+				for (const fn of this.endWaiters.splice(0)) fn();
+				this.push({ kind: "end", status: end.status, error: end.error });
+			}
+
+			private item(itemId: string, kind: RowKind): TurnItem {
+				let it = this.items.get(itemId);
+				if (!it) {
+					it = { kind, rowOpened: false, changes: [], questions: [], output: "" };
+					this.items.set(itemId, it);
+				}
+				return it;
+			}
+			private openRow(itemId: string): void {
+				const it = this.items.get(itemId);
+				if (!it || it.rowOpened) return;
+				it.rowOpened = true;
+				this.push({ kind: "row", itemId });
+			}
+
+			private project(m: JsonRpc): void {
+				if (m.id !== undefined && m.method) return; // requests reach us through `takeRequest`
+				const p = (m.params ?? {}) as Rec;
+				const completedId = m.method === "turn/completed" && !!p.turn && typeof p.turn === "object" ? (p.turn as Rec).id : undefined;
+				const forThisTurn = this.turnId ? p.turnId === this.turnId || completedId === this.turnId : p.threadId === this.threadId && m.method !== "turn/completed";
+				if (!forThisTurn) return;
+				if (!this.turnId && m.method === "turn/started" && p.turn && typeof p.turn === "object") this.turnId = String((p.turn as Rec).id ?? ""); // Codex's first notification for the turn; it can beat the turn/start response
+				switch (m.method) {
+					case "error": {
+						// A logged-out Codex accepts initialize and thread/start, then reports 401 here while retrying; stop the turn and say so.
+						const err = p.error && typeof p.error === "object" ? (p.error as Rec) : {};
+						const info = err.codexErrorInfo && typeof err.codexErrorInfo === "object" ? JSON.stringify(err.codexErrorInfo) : "";
+						if (isLoggedOut(`${String(err.message ?? "")} ${String(err.additionalDetails ?? "")} ${info}`)) {
+							this.client.interrupt(this.threadId, this.turnId);
+							this.end({ status: "loggedOut" });
+						}
+						break;
+					}
+					case "item/started": {
+						const item = rec(p.item);
+						const id = String(item.id);
+						if (item.type === "commandExecution") {
+							const it = this.item(id, "commandExecution");
+							it.command = String(item.command ?? "");
+							it.cwd = String(item.cwd ?? "");
+							this.openRow(id);
+						} else if (item.type === "fileChange") {
+							const it = this.item(id, "fileChange");
+							it.changes = flattenChanges(item.changes);
+							this.openRow(id);
+						} else if (item.type === "agentMessage") this.phases.set(id, (item.phase as string | null) ?? null);
+						break;
+					}
+					case "item/commandExecution/outputDelta": {
+						const it = this.items.get(String(p.itemId));
+						if (!it) break;
+						it.output += String(p.delta ?? "");
+						this.waiters.get(String(p.itemId))?.onUpdate?.(it.output);
+						break;
+					}
+					case "item/completed": {
+						const item = rec(p.item);
+						const id = String(item.id);
+						if (item.type === "commandExecution" || item.type === "fileChange") {
+							const it = this.item(id, item.type as RowKind);
+							if (item.type === "commandExecution") it.command ??= String(item.command ?? "");
+							if (item.type === "fileChange" && !it.changes.length) it.changes = flattenChanges(item.changes);
+							it.completed = item;
+							this.openRow(id); // a completion without a start still leaves a row
+							const w = this.waiters.get(id);
+							if (w) {
+								this.waiters.delete(id);
+								w.resolve({ kind: "completed", item });
+							}
+						} else if (item.type === "agentMessage" && this.phases.get(id) !== "commentary") this.push({ kind: "final", text: String(item.text ?? "") });
+						break;
+					}
+					case "item/reasoning/summaryTextDelta":
+						this.push({ kind: "thinking", text: String(p.delta ?? "") });
+						break;
+					case "item/agentMessage/delta":
+						this.push({ kind: "answer", text: String(p.delta ?? "") }); // commentary streams as text too (Q17)
+						break;
+					case "turn/completed": {
+						const turn = rec(p.turn);
+						const error = turn.error ? String(rec(turn.error).message) : undefined;
+						this.end({ status: String(turn.status), error });
+						break;
+					}
+				}
+			}
+
+			/** A human-facing request for this turn: opens the item's row if none yet and hands the request to that item's `execute`. */
+			takeRequest(m: JsonRpc & { id: number | string; method: string }, kind: RowKind): void {
+				const p = (m.params ?? {}) as Rec;
+				const itemId = String(p.itemId);
+				const it = this.item(itemId, kind);
+				if (kind === "commandExecution" && !it.command) {
+					it.command = typeof p.command === "string" ? p.command : "";
+					it.cwd ??= typeof p.cwd === "string" ? p.cwd : "";
+				}
+				if (kind === "question" && Array.isArray(p.questions)) {
+					// Codex sends `options: null` on free-text questions; the persisted argument carries no key at all.
+					it.questions = (p.questions as Rec[]).map(({ options, ...q }) => (Array.isArray(options) ? { ...q, options } : q) as QuestionArg);
+				}
+				this.openRow(itemId);
+				const req: PendingRequest = { id: m.id, method: m.method, params: p, kind };
+				const w = this.waiters.get(itemId);
+				if (w) {
+					this.waiters.delete(itemId);
+					w.resolve({ kind: "request", req });
+				} else {
+					const q = this.requests.get(itemId) ?? [];
+					q.push(req);
+					this.requests.set(itemId, q);
+				}
+			}
+
+			/** The first of: the item's completion, or a human request for it (one already pending counts as first). */
+			waitFor(itemId: string, signal: AbortSignal | undefined, onUpdate?: (output: string) => void): Promise<WaitOutcome> {
+				const it = this.items.get(itemId);
+				const queued = this.requests.get(itemId);
+				if (queued?.length) return Promise.resolve({ kind: "request", req: queued.shift()! });
+				if (it?.completed) return Promise.resolve({ kind: "completed", item: it.completed });
+				if (this.ended) return Promise.reject(new TurnEndedError(this.ended.status));
+				if (signal?.aborted) return Promise.reject(new AbortedError());
+				return new Promise<WaitOutcome>((resolve, reject) => {
+					const onAbort = () => {
+						this.waiters.delete(itemId);
+						reject(new AbortedError());
+					};
+					signal?.addEventListener("abort", onAbort, { once: true });
+					const settle = <T>(fn: (v: T) => void) => (v: T) => {
+						signal?.removeEventListener("abort", onAbort);
+						fn(v);
+					};
+					this.waiters.set(itemId, { resolve: settle(resolve), reject: settle(reject), onUpdate });
+				});
+			}
+
+			/** `turn/interrupt` once; ≤ 3 s for the turn to end; else drop the child so the next prompt respawns. */
+			interrupt(): Promise<void> {
+				this.interrupting ??= (async () => {
+					if (this.ended) return;
+					this.client.interrupt(this.threadId, this.turnId);
+					const ended = new Promise<void>((resolve) => this.endWaiters.push(resolve));
+					await Promise.race([ended, new Promise<void>((r) => setTimeout(r, INTERRUPT_WAIT_MS))]);
+					if (this.ended) return;
+					// No completion came: the turn is abandoned as interrupted (Codex's rollout records it so once the child dies),
+					// and the next prompt must respawn rather than reuse a child whose stdin is closing.
+					this.end({ status: "interrupted" });
+					if (state.client === this.client) state.client = null;
+					void this.client.close();
+				})();
+				return this.interrupting;
+			}
+		}
+
+		/** The branch's thread entry and its newest *completed* turn after it. Only a completed turn can be a fork's `lastTurnId`:
+		 *  Codex refuses an interrupted or cut turn as in progress (probe 2026-09-14), and such turns carry no answer the branch shows anyway. */
+		function newestEntries(ctx: ExtensionContext): { thread: ThreadEntry | null; turn: TurnEntry | null } {
+			const branch = ctx.sessionManager.getBranch();
+			let turn: TurnEntry | null = null;
+			for (let i = branch.length - 1; i >= 0; i--) {
+				const e = branch[i] as { type: string; customType?: string; data?: unknown };
+				if (e.type !== "custom") continue;
+				if (e.customType === ENTRY_TYPE) return { thread: (e.data as ThreadEntry) ?? null, turn };
+				if (e.customType === TURN_ENTRY_TYPE && !turn && (e.data as TurnEntry | undefined)?.status === "completed") turn = e.data as TurnEntry;
+			}
+			return { thread: null, turn: null };
+		}
+
+		function newestOwnEntry(ctx: ExtensionContext): ThreadEntry | null {
+			const t = newestEntries(ctx).thread;
+			return t && t.sessionId === ctx.sessionManager.getSessionId() ? t : null;
 		}
 
 		function isBoundBranch(ctx: ExtensionContext): boolean {
 			return ctx.sessionManager.getBranch().some((e) => e.type === "custom" && (e as { customType?: string }).customType === ENTRY_TYPE);
 		}
 
-		/** Every user-role message after the last assistant message, joined by blank lines. */
-		function userTextSinceLastAnswer(context: Context): string {
-			const parts: string[] = [];
+		/** Every user-role message after the last assistant message: text first (joined by blank lines), then images in order. */
+		function userItems(context: Context, model: Model<any>): UserInputItem[] {
+			const texts: string[] = [];
+			const images: UserInputItem[] = [];
 			for (let i = context.messages.length - 1; i >= 0; i--) {
 				const m = context.messages[i];
 				if (m.role === "assistant") break;
 				if (m.role !== "user") continue;
-				if (typeof m.content === "string") parts.unshift(m.content);
+				if (typeof m.content === "string") texts.unshift(m.content);
 				else {
-					const texts: string[] = [];
+					const parts: string[] = [];
+					const mine: UserInputItem[] = [];
 					for (const block of m.content) {
-						if (block.type === "image") throw new CodexError("unsupported-input");
-						if (block.type === "text") texts.push(block.text);
+						if (block.type === "image") {
+							if (!model.input?.includes("image")) throw new CodexError("unsupported-input");
+							mine.push({ type: "image", url: `data:${block.mimeType};base64,${block.data}` });
+						} else if (block.type === "text") parts.push(block.text);
 					}
-					parts.unshift(texts.join("\n"));
+					texts.unshift(parts.join("\n"));
+					images.unshift(...mine);
 				}
 			}
-			return parts.join("\n\n");
+			const text = texts.join("\n\n");
+			const items: UserInputItem[] = text ? [{ type: "text", text, text_elements: [] }] : [];
+			return [...items, ...images];
 		}
 
 		async function ensureClient(cwd: string, signal?: AbortSignal): Promise<AppServerClient> {
 			if (state.client && !state.client.exited) return state.client;
 			const client = await AppServerClient.start(cwd, command);
 			state.client = client;
+			client.onRequest = onServerRequest;
+			if (state.approvedForSession) {
+				// Codex's session approval cache lived in the child that is gone; say so once.
+				state.approvedForSession = false;
+				notify(NOTICE.restarted, "warning");
+			}
 			try {
-				await client.request("initialize", { clientInfo: { name: "pi-rbf-codex", version: "0.21.0" }, capabilities: { experimentalApi: true } }, SETUP_TIMEOUT_MS, signal);
+				await client.request("initialize", { clientInfo: { name: "pi-rbf-codex", version: CLIENT_VERSION }, capabilities: { experimentalApi: true } }, SETUP_TIMEOUT_MS, signal);
 			} catch (e) {
 				// Never keep an uninitialized child around; the next prompt must spawn afresh.
 				state.client = null;
@@ -419,209 +910,417 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return client;
 		}
 
-		async function ensureThread(client: AppServerClient, ctx: ExtensionContext, cwd: string, signal?: AbortSignal): Promise<{ threadId: string; policy: string; sandbox: string }> {
-			const bound = newestOwnEntry(ctx);
-			let res: Rec;
-			if (bound) {
-				if (bound.cwd !== cwd) throw new CodexError("workspace-mismatch", `Codex thread directory: ${bound.cwd}`);
-				res = rec(await client.request("thread/resume", { threadId: bound.threadId, excludeTurns: true }, SETUP_TIMEOUT_MS, signal));
-			} else {
-				res = rec(await client.request("thread/start", { cwd, ephemeral: false }, SETUP_TIMEOUT_MS, signal));
-				const threadId = rec(res.thread).id;
-				if (typeof threadId !== "string") throw new CodexError("generic", "thread/start returned no thread id");
-				pi.appendEntry<ThreadEntry>(ENTRY_TYPE, { threadId, cwd, sessionId: ctx.sessionManager.getSessionId() });
+		/** Every server request: a human-facing one for the active turn goes to its row's `execute`; everything else is a JSON-RPC error at once. */
+		function onServerRequest(m: JsonRpc & { id: number | string; method: string }): boolean {
+			const kind = HUMAN_REQUESTS[m.method];
+			const p = (m.params ?? {}) as Rec;
+			const turn = state.activeTurn;
+			if (kind && turn && !turn.ended && (turn.turnId ? p.turnId === turn.turnId : p.threadId === turn.threadId) && typeof p.itemId === "string") {
+				turn.takeRequest(m, kind);
+				return true;
 			}
+			const asked = humanRequestKind(m.method);
+			if (asked) notify(NOTICE.declined(asked), "warning");
+			return false;
+		}
+
+		type Binding = { threadId: string; policy: string; sandbox: string };
+		function bindingOf(res: Rec): Binding {
 			const threadId = String(rec(res.thread).id);
 			const policy = typeof res.approvalPolicy === "string" ? res.approvalPolicy : JSON.stringify(res.approvalPolicy);
 			const sandbox = res.sandbox && typeof res.sandbox === "object" ? String((res.sandbox as Rec).type ?? "unknown") : String(res.sandbox ?? "unknown");
 			return { threadId, policy, sandbox };
 		}
 
+		/** The fork-or-resume rule, from the branch's thread and turn entries plus Codex's own turn list. */
+		async function bindThread(client: AppServerClient, ctx: ExtensionContext, cwd: string, signal?: AbortSignal): Promise<Binding> {
+			const sessionId = ctx.sessionManager.getSessionId();
+			const { thread: T, turn: U } = newestEntries(ctx);
+			const start = async () => {
+				const res = rec(await client.request("thread/start", { cwd, ephemeral: false }, SETUP_TIMEOUT_MS, signal));
+				const threadId = rec(res.thread).id;
+				if (typeof threadId !== "string") throw new CodexError("generic", "thread/start returned no thread id");
+				pi.appendEntry<ThreadEntry>(ENTRY_TYPE, { threadId, cwd, sessionId });
+				return bindingOf(res);
+			};
+			const fork = async (threadId: string, lastTurnId: string) => {
+				let res: Rec;
+				try {
+					res = rec(await client.request("thread/fork", { threadId, lastTurnId, cwd, ephemeral: false }, SETUP_TIMEOUT_MS, signal));
+				} catch (e) {
+					throw e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e;
+				}
+				const forked = rec(res.thread).id;
+				if (typeof forked !== "string") throw new CodexError("turn-failed", "thread/fork returned no thread id");
+				pi.appendEntry<ThreadEntry>(ENTRY_TYPE, { threadId: forked, cwd, sessionId });
+				return bindingOf(res);
+			};
+			if (!T) return start();
+			if (T.cwd !== cwd) throw new CodexError("workspace-mismatch", `Codex thread directory: ${T.cwd}`);
+			if (T.sessionId !== sessionId) return U ? fork(T.threadId, U.turnId) : start();
+			// Own thread: resume it; with a turn entry, fork only when Codex completed a turn this branch never saw.
+			const res = rec(await client.request("thread/resume", U ? { threadId: T.threadId } : { threadId: T.threadId, excludeTurns: true }, SETUP_TIMEOUT_MS, signal));
+			if (!U) return bindingOf(res);
+			const turns = (rec(res.thread).turns as Rec[] | undefined) ?? [];
+			const at = turns.findIndex((t) => t.id === U.turnId);
+			const unseenCompleted = at >= 0 && turns.slice(at + 1).some((t) => t.status === "completed");
+			return unseenCompleted ? fork(T.threadId, U.turnId) : bindingOf(res);
+		}
+
+		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, reasoning: ThinkingLevel | undefined): Promise<ActiveTurn> {
+			const effort = mapEffort(model, reasoning);
+			const turnParams: Rec = { threadId, input: items };
+			if (effort) turnParams.effort = effort;
+			const codexId = codexModelId(model.id);
+			if (codexId) turnParams.model = codexId;
+			// Subscribe before sending: readline hands over every line of one stdout chunk at once, so a notification can share a chunk with the response.
+			const turn = new ActiveTurn(client, threadId);
+			state.activeTurn = turn;
+			let started: Rec;
+			try {
+				try {
+					started = rec(await client.request("turn/start", turnParams));
+				} catch (e) {
+					const detail = e instanceof CodexError ? (e.detail ?? "") : String(e);
+					if (!(turnParams.model && detail.includes(String(turnParams.model)))) throw e;
+					// Codex retired the persisted model id: one retry on Codex's default, then the user picks another.
+					notify(NOTICE.retiredModel(String(turnParams.model)), "warning");
+					started = rec(await client.request("turn/start", { threadId, input: items }));
+				}
+			} catch (e) {
+				turn.dispose();
+				if (state.activeTurn === turn) state.activeTurn = null;
+				throw e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e;
+			}
+			turn.turnId = String(rec(started.turn).id);
+			return turn;
+		}
+
+		/** One user prompt is one Codex turn across N `streamSimple` calls and tool executions. */
 		function streamSimple(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 			const out = new AssistantMessageWriter(model);
-			const finish = (kind: "done" | "aborted" | "error", errorKey?: CopyKey) => {
-				state.ctx?.ui.setWorkingMessage();
-				out.finish(kind, errorKey);
-			};
 			const fail = (e: unknown) => {
-				if (e instanceof AbortedError) return finish("aborted");
+				if (e instanceof AbortedError) return out.finish("aborted");
 				const err = e instanceof CodexError ? e : new CodexError("generic", String(e));
 				if (err.detail) notify(`Codex: ${err.detail}`, "warning");
-				finish("error", err.key);
+				out.finish("error", err.key);
 			};
 
 			void (async () => {
 				const ctx = state.ctx;
 				if (!ctx) return fail(new CodexError("generic", "session_start has not run"));
-				let text: string;
+				const signal = options?.signal;
+
+				// Pi re-calls the provider once after an aborted tool; finish the turn it aborted and send nothing.
+				if (signal?.aborted) {
+					const turn = state.activeTurn;
+					if (!turn) return out.finish("aborted");
+					await turn.interrupt();
+					return drain(turn, { silent: true });
+				}
+
+				const turn = state.activeTurn;
+				const attach = turn !== null && !turn.drained;
+				const last = context.messages[context.messages.length - 1];
+				if (attach && last?.role === "toolResult") return drain(turn, {});
+				let items: UserInputItem[];
 				try {
-					text = userTextSinceLastAnswer(context);
+					items = userItems(context, model);
 				} catch (e) {
 					return fail(e);
 				}
-				let cwd: string;
-				let client: AppServerClient;
-				let threadId: string;
+				if (attach) {
+					// A steer: Pi delivered a new user message at the tool boundary while Codex still works.
+					try {
+						await turn.client.request("turn/steer", { threadId: turn.threadId, expectedTurnId: turn.turnId, input: items });
+					} catch {
+						turn.unsent = items; // the turn ended or refused the steer; it becomes the next turn's prompt, whichever call drains the end
+					}
+					return drain(turn, {});
+				}
+				if (!items.length) {
+					notify(NOTICE.nothingToSend, "warning");
+					return fail(new CodexError("generic"));
+				}
 				try {
-					if (options?.signal?.aborted) return finish("aborted");
-					cwd = realpathSync.native(ctx.sessionManager.getCwd());
-					client = await ensureClient(cwd, options?.signal);
-					const t = await ensureThread(client, ctx, cwd, options?.signal);
-					threadId = t.threadId;
+					const cwd = realpathSync.native(ctx.sessionManager.getCwd());
+					const client = await ensureClient(cwd, signal);
+					const bound = await bindThread(client, ctx, cwd, signal);
 					if (!state.noticedPolicy) {
 						state.noticedPolicy = true;
-						notify(NOTICE.policy(t.policy, t.sandbox));
+						notify(NOTICE.policy(bound.policy, bound.sandbox));
 					}
-					if (options?.signal?.aborted) return finish("aborted");
+					if (signal?.aborted) return out.finish("aborted");
+					const started = await startTurn(client, bound.threadId, items, model, options?.reasoning);
+					if (signal?.aborted) {
+						await started.interrupt();
+						return drain(started, { silent: true });
+					}
+					return drain(started, {});
 				} catch (e) {
 					return fail(e);
 				}
-				out.start();
+			})();
 
-				let turnId = "";
-				let finalFallback = "";
-				let streamedText = false;
-				const phases = new Map<string, string | null>();
-				let settled = false;
-				let interruptTimer: NodeJS.Timeout | undefined;
+			/** The turn's `end` event, drained by this call: record it, then finish the stream or start the refused steer's turn. */
+			function finishTurn(turn: ActiveTurn, ev: { status: string; error?: string }, mode: { silent?: boolean }, answer: { streamed: boolean; fallback: string }): void {
+				if (state.activeTurn === turn) state.activeTurn = null;
+				if (ev.status === "childExit") {
+					if (state.client === turn.client) state.client = null;
+					if (state.shuttingDown || mode.silent) return out.finish("aborted");
+					const lastErr = turn.client.lastStderr();
+					if (lastErr) notify(`Codex: ${lastErr}`, "warning");
+					return out.finish("error", "codex-stopped");
+				}
+				if (ev.status === "loggedOut") return out.finish("error", "codex-logged-out");
+				// No entry for childExit or loggedOut: such a turn may still be in progress in Codex's rollout and must never become a fork's lastTurnId.
+				pi.appendEntry<TurnEntry>(TURN_ENTRY_TYPE, { threadId: turn.threadId, turnId: turn.turnId, status: ev.status });
+				if (mode.silent) return out.finish("aborted");
+				if (turn.unsent?.length) {
+					// The steer was refused because the turn ended: it becomes its own turn now, in this same Pi message.
+					const unsent = turn.unsent;
+					turn.unsent = undefined;
+					void startTurn(turn.client, turn.threadId, unsent, model, options?.reasoning)
+						.then((next) => drain(next, {}))
+						.catch(fail);
+					return;
+				}
+				if (ev.status === "completed") {
+					if (!answer.streamed && answer.fallback) out.text(answer.fallback);
+					if (!answer.streamed && !answer.fallback) return out.finish("error", "no-answer");
+					return out.finish("done");
+				}
+				if (ev.status === "interrupted") return out.finish("aborted");
+				if (isLoggedOut(ev.error ?? "")) return out.finish("error", "codex-logged-out");
+				notify(`Codex: ${ev.error ?? ev.status}`, "warning");
+				out.finish("error", "turn-failed");
+			}
+
+			/** Replay this turn's buffered events from the cursor, then stream live ones, until a row or the end. */
+			function drain(turn: ActiveTurn, mode: { silent?: boolean }): void {
+				const answer = { streamed: false, fallback: "" };
+				if (!mode.silent) out.start();
+				const onAbort = () => void turn.interrupt();
+				options?.signal?.addEventListener("abort", onAbort, { once: true });
+				if (options?.signal?.aborted) void turn.interrupt(); // Escape landed during the steer or start round trip; the listener above never fires
 				const settle = (fn: () => void) => {
-					if (settled) return;
-					settled = true;
-					if (interruptTimer) clearTimeout(interruptTimer);
-					unsubscribe();
-					client.onExit.delete(onExit);
 					options?.signal?.removeEventListener("abort", onAbort);
+					turn.detach();
 					fn();
 				};
-				const onExit = () =>
-					settle(() => {
-						state.client = null;
-						if (state.shuttingDown) finish("aborted");
-						else {
-							const last = client.lastStderr();
-							if (last) notify(`Codex: ${last}`, "warning");
-							finish("error", "codex-stopped");
-						}
-					});
-				const onAbort = () => {
-					if (turnId) client.notify("turn/interrupt", { threadId, turnId });
-					interruptTimer = setTimeout(
-						() =>
-							settle(() => {
-								// The next prompt must respawn, not reuse a child whose stdin is closing.
-								if (state.client === client) state.client = null;
-								void client.close();
-								finish("aborted");
-							}),
-						INTERRUPT_WAIT_MS,
-					);
-				};
-				const unsubscribe = client.subscribe((m) => {
-					try {
-						handle(m);
-					} catch (e) {
-						// One malformed notification must never escape readline's event and take Pi down.
-						settle(() => fail(e));
-					}
-				});
-				const handle = (m: JsonRpc) => {
-					if (m.id !== undefined && m.method) {
-						const asked = humanRequestKind(m.method);
-						if (asked) notify(NOTICE.declined(asked), "warning");
-						return;
-					}
-					const p = (m.params ?? {}) as Rec;
-					const forThisTurn = p.turnId === turnId || (m.method === "turn/completed" && !!p.turn && typeof p.turn === "object" && (p.turn as Rec).id === turnId);
-					if (!forThisTurn) return;
-					switch (m.method) {
-						case "error": {
-							// A logged-out Codex accepts initialize and thread/start, then reports 401 here while retrying; stop the turn and say so.
-							const err = p.error && typeof p.error === "object" ? (p.error as Rec) : {};
-							const info = err.codexErrorInfo && typeof err.codexErrorInfo === "object" ? JSON.stringify(err.codexErrorInfo) : "";
-							if (/401|Unauthorized/i.test(`${String(err.message ?? "")} ${String(err.additionalDetails ?? "")} ${info}`)) {
-								if (turnId) client.notify("turn/interrupt", { threadId, turnId });
-								settle(() => fail(new CodexError("codex-logged-out")));
+				turn.drain((ev) => {
+					switch (ev.kind) {
+						case "thinking":
+							if (!mode.silent) out.thinking(ev.text);
+							return true;
+						case "answer":
+							if (!mode.silent) {
+								answer.streamed = true;
+								out.text(ev.text);
 							}
-							break;
+							return true;
+						case "final":
+							answer.fallback = ev.text;
+							return true;
+						case "row": {
+							if (mode.silent) return true;
+							const it = turn.items.get(ev.itemId)!;
+							out.toolCall(rowToolCall(ev.itemId, it));
+							settle(() => out.finish("toolUse")); // the ActiveTurn keeps receiving; the next call attaches
+							return false;
 						}
-						case "item/started": {
-							const item = rec(p.item);
-							if (item.type === "commandExecution") {
-								const cmd = displayCommand(String(item.command));
-								ctx.ui.setWorkingMessage(`$ ${cmd}`);
-								out.thinking(`$ ${cmd}\n`);
-							} else if (item.type === "agentMessage") phases.set(String(item.id), (item.phase as string | null) ?? null);
-							break;
-						}
-						case "item/completed": {
-							const item = rec(p.item);
-							if (item.type === "commandExecution" && typeof item.exitCode === "number" && item.exitCode !== 0) {
-								ctx.ui.setWorkingMessage(`$ ${displayCommand(String(item.command))} → exit ${item.exitCode}`);
-								out.thinking(`→ exit ${item.exitCode}\n`);
-							} else if (item.type === "agentMessage" && phases.get(String(item.id)) !== "commentary") finalFallback = String(item.text ?? "");
-							break;
-						}
-						case "item/reasoning/summaryTextDelta":
-							out.thinking(String(p.delta ?? ""));
-							break;
-						case "item/agentMessage/delta": {
-							const d = String(p.delta ?? "");
-							if (phases.get(String(p.itemId)) === "commentary") {
-								out.thinking(d);
-								ctx.ui.setWorkingMessage(out.lastThinkingLine().slice(0, workingLineMax()));
-							} else {
-								streamedText = true;
-								out.text(d);
-							}
-							break;
-						}
-						case "turn/completed": {
-							const turn = rec(p.turn);
-							settle(() => {
-								if (turn.status === "completed") {
-									if (!streamedText && finalFallback) out.text(finalFallback);
-									if (!streamedText && !finalFallback) return finish("error", "no-answer");
-									finish("done");
-								} else if (turn.status === "interrupted") finish("aborted");
-								else {
-									const err = turn.error ? String(rec(turn.error).message) : String(turn.status);
-									if (/401|Unauthorized/i.test(err)) return finish("error", "codex-logged-out");
-									notify(`Codex: ${err}`, "warning");
-									finish("error", "turn-failed");
-								}
-							});
-							break;
-						}
+						case "end":
+							settle(() => finishTurn(turn, ev, mode, answer));
+							return false;
 					}
-				};
-				client.onExit.add(onExit);
-				options?.signal?.addEventListener("abort", onAbort, { once: true });
+				}, fail);
+			}
 
-				const input = [{ type: "text", text, text_elements: [] }];
-				const effort = mapEffort(model, options?.reasoning);
-				const turnParams: Rec = { threadId, input };
-				if (effort) turnParams.effort = effort;
-				const codexId = codexModelId(model.id);
-				if (codexId) turnParams.model = codexId;
-				try {
-					let started: Rec;
-					try {
-						started = rec(await client.request("turn/start", turnParams));
-					} catch (e) {
-						const detail = e instanceof CodexError ? (e.detail ?? "") : String(e);
-						if (!(turnParams.model && detail.includes(String(turnParams.model)))) throw e;
-						// Codex retired the persisted model id: one retry on Codex's default, then the user picks another.
-						notify(NOTICE.retiredModel(String(turnParams.model)), "warning");
-						started = rec(await client.request("turn/start", { threadId, input }));
-					}
-					turnId = String(rec(started.turn).id);
-					if (options?.signal?.aborted) onAbort();
-				} catch (e) {
-					settle(() => fail(e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e));
-				}
-			})();
 			return out.stream;
 		}
+
+		function rowToolCall(itemId: string, it: TurnItem): ToolCall {
+			const id = `codex-${itemId}`;
+			if (it.kind === "commandExecution") return { type: "toolCall", id, name: TOOL_COMMAND, arguments: { itemId, command: it.command ?? "", cwd: it.cwd ?? "" } satisfies CommandArgs };
+			if (it.kind === "fileChange") return { type: "toolCall", id, name: TOOL_PATCH, arguments: { itemId, changes: it.changes } satisfies PatchArgs };
+			return { type: "toolCall", id, name: TOOL_QUESTION, arguments: { itemId, questions: it.questions } satisfies QuestionArgs };
+		}
+
+		// ── tools: each row waits for Codex's completion of its item, answering any human request from here ──
+		type ToolResult = { content: { type: "text"; text: string }[]; details: Rec; isError?: boolean };
+		const textResult = (text: string, details: Rec, isError = false): ToolResult => ({ content: [{ type: "text", text }], details, isError });
+		/** Return a good result; throw an error one so Pi tints it, exactly as bash throws on failure (the thrown text is what the row and Codex-free transcript show). */
+		const settle = (r: ToolResult): ToolResult => { if (r.isError) throw new RowError(resultText(r)); return r; };
+
+		function commandResult(itemId: string, item: Rec, output: string): ToolResult {
+			const exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
+			const status = String(item.status ?? "completed");
+			const text = `${String(item.aggregatedOutput ?? output).trimEnd()}${exitCode ? `\n\nexit ${exitCode}` : ""}`.trim();
+			return textResult(text || (status === "declined" ? ROW_STATUS.declined : ""), { itemId, exitCode, durationMs: item.durationMs ?? null, status }, (exitCode ?? 0) !== 0 || status === "declined" || status === "failed");
+		}
+		function patchResult(itemId: string, item: Rec, changes: PatchChangeArg[]): ToolResult {
+			const status = String(item.status ?? "completed");
+			const applied = changes.length ? changes : flattenChanges(item.changes);
+			const text = status === "completed" ? `applied ${applied.length} file(s): ${applied.map((c) => displayPath(c.path)).join(", ")}` : status;
+			return textResult(text, { itemId, status }, status !== "completed");
+		}
+
+		/** Opens the dialog(s) for one request and answers it exactly once. */
+		async function answerRequest(turn: ActiveTurn, req: PendingRequest, ctx: ExtensionContext): Promise<{ decision?: string; answers?: Record<string, string>; declined?: boolean }> {
+			const client = turn.client;
+			if (!ctx.hasUI) {
+				client.respondError(req.id, "pi-rbf-codex has no UI to ask the user");
+				notify(NOTICE.declined(req.kind === "question" ? "input" : "approval"), "warning");
+				return { declined: true };
+			}
+			const opts = { signal: turn.endSignal };
+			if (req.kind !== "question") {
+				const it = turn.items.get(String(req.params.itemId));
+				const title = truncateTitle(approvalTitle(req.kind, req.params, it?.changes ?? []), terminalWidth());
+				const picked = await ctx.ui.select(title, [...APPROVAL_CHOICES], opts);
+				if (turn.ended) {
+					client.respond(req.id, { decision: "decline" }); // the dialog was closed by the turn ending
+					return { decision: "decline" };
+				}
+				const decision = picked === undefined ? "cancel" : APPROVAL_DECISION[picked];
+				if (decision === "acceptForSession") state.approvedForSession = true;
+				client.respond(req.id, { decision });
+				return { decision };
+			}
+			const questions = Array.isArray(req.params.questions) ? (req.params.questions as QuestionArg[]) : [];
+			if (questions.some((q) => q.isSecret)) {
+				client.respondError(req.id, "pi-rbf-codex cannot take a secret privately");
+				notify(NOTICE.secret, "warning");
+				return { declined: true };
+			}
+			const answers: Record<string, string> = {};
+			for (const q of questions) {
+				const title = `${q.header}: ${q.question}`;
+				let answer: string | undefined;
+				if (q.options?.length) {
+					const labels = q.options.map((o) => `${o.label} — ${o.description}`);
+					const picked = await ctx.ui.select(title, q.isOther ? [...labels, OTHER_CHOICE] : labels, opts);
+					if (picked === OTHER_CHOICE) answer = await ctx.ui.input(title, undefined, opts);
+					else if (picked !== undefined) answer = q.options[labels.indexOf(picked)]?.label ?? picked;
+				} else answer = await ctx.ui.input(title, undefined, opts);
+				if (turn.ended) break;
+				if (answer !== undefined) answers[q.id] = answer;
+			}
+			client.respond(req.id, { answers: Object.fromEntries(questions.map((q) => [q.id, { answers: q.id in answers ? [answers[q.id]] : [] }])) });
+			return { answers };
+		}
+
+		async function executeRow(kind: RowKind, itemId: string, signal: AbortSignal | undefined, onUpdate: ((partial: ToolResult) => void) | undefined, ctx: ExtensionContext): Promise<ToolResult> {
+			const turn = state.activeTurn;
+			const it = turn?.items.get(itemId);
+			if (!turn || !it) return textResult("No active Codex turn holds this item; this tool cannot be called directly.", { itemId, status: "refused" }, true);
+			const onAbort = () => void turn.interrupt();
+			signal?.addEventListener("abort", onAbort, { once: true });
+			if (kind === "commandExecution") onUpdate?.(textResult("", { itemId, status: "inProgress" })); // Pi's bash row does the same, so `Elapsed` shows before any output
+			try {
+				for (;;) {
+					if (signal?.aborted) throw new AbortedError();
+					const next = await turn.waitFor(itemId, signal, onUpdate && ((output) => onUpdate(textResult(output, { itemId, status: "inProgress" }))));
+					if (next.kind === "completed") return settle(kind === "fileChange" ? patchResult(itemId, next.item, it.changes) : commandResult(itemId, next.item, it.output));
+					const answered = await answerRequest(turn, next.req, ctx);
+					if (kind === "question") {
+						if (answered.declined) throw new RowError(ROW_STATUS.declined);
+						const lines = it.questions.map((q) => `${q.header}: ${answered.answers?.[q.id] ?? ROW_STATUS.declined}`);
+						return textResult(lines.join("\n"), { itemId, answers: answered.answers ?? {} });
+					}
+					if (answered.declined || answered.decision === "cancel") throw new RowError(ROW_STATUS.declined);
+				}
+			} catch (e) {
+				if (e instanceof AbortedError) throw new Error("aborted");
+				if (e instanceof TurnEndedError) throw new RowError(e.status === "interrupted" ? ROW_STATUS.aborted : ROW_STATUS.stopped);
+				throw e;
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+			}
+		}
+
+		const NO_SNIPPET = "; it cannot be called directly.";
+		pi.registerTool({
+			name: TOOL_COMMAND,
+			label: "Codex command",
+			description: `Records a command the Codex agent is running in this conversation${NO_SNIPPET}`,
+			parameters: CommandParams,
+			executionMode: "sequential",
+			execute: (_id, params, signal, onUpdate, ctx) => executeRow("commandExecution", params.itemId, signal, onUpdate as (p: ToolResult) => void, ctx),
+			renderCall(args, theme, context) {
+				// Pi's bash row keeps the start time in the row's shared state, so the result can show `Elapsed` while running and `Took` after.
+				const st = context.state as CommandRowState;
+				if (context.executionStarted && st.startedAt === undefined) {
+					st.startedAt = Date.now();
+					st.endedAt = undefined;
+				}
+				const live = state.activeTurn?.items.get(args.itemId)?.command;
+				const cmd = displayCommand(args.command || live || "");
+				return new Text(theme.fg("toolTitle", theme.bold(`$ ${cmd || "(pending)"}`)), 0, 0);
+			},
+			renderResult(result, opts, theme, context) {
+				const st = context.state as CommandRowState;
+				if (st.startedAt !== undefined && opts.isPartial && !st.interval) st.interval = setInterval(() => context.invalidate(), 1000);
+				if (!opts.isPartial || context.isError) {
+					st.endedAt ??= Date.now();
+					if (st.interval) {
+						clearInterval(st.interval);
+						st.interval = undefined;
+					}
+				}
+				const text = resultText(result).trim();
+				const lines = text ? text.split("\n") : [];
+				const shown = opts.expanded ? lines : lines.slice(-COMMAND_PREVIEW_LINES);
+				const skipped = lines.length - shown.length;
+				const body = shown.map((l) => theme.fg(context.isError ? "error" : "toolOutput", l)).join("\n");
+				const output = text ? `\n${skipped > 0 ? `${theme.fg("muted", `... (${skipped} earlier lines)`)}\n` : ""}${body}` : "";
+				const took = st.startedAt === undefined ? "" : `\n${theme.fg("muted", `${opts.isPartial ? "Elapsed" : "Took"} ${(((st.endedAt ?? Date.now()) - st.startedAt) / 1000).toFixed(1)}s`)}`;
+				return new Text(`${output}${took}`, 0, 0);
+			},
+		});
+		pi.registerTool({
+			name: TOOL_PATCH,
+			label: "Codex edit",
+			description: `Records a file change the Codex agent is applying in this conversation${NO_SNIPPET}`,
+			parameters: PatchParams,
+			renderShell: "self", // Pi's own edit row renders in the unpadded self shell, not the padded contentBox; match it so the glance's tinted diff starts at column one
+			executionMode: "sequential",
+			execute: (_id, params, signal, onUpdate, ctx) => executeRow("fileChange", params.itemId, signal, onUpdate as (p: ToolResult) => void, ctx),
+			renderCall(args, theme, context) {
+				// Built exactly as Pi's own edit row (`renderers/edit.js`): one Box reused across renders (so rbf-edit-glance's paddingX=0 sticks
+				// instead of a fresh paddingX=1 box leaving a one-column gap), carrying `preview.diff` so the glance tints it like an edit.
+				const changes = args.changes.length ? args.changes : (state.activeTurn?.items.get(args.itemId)?.changes ?? []);
+				const diff = changes.map((c) => c.diff).filter(Boolean).join("\n");
+				const box = (context?.lastComponent instanceof Box ? context.lastComponent : new Box(1, 1, (t: string) => t)) as Box & { preview?: { diff: string } };
+				box.setBgFn((t: string) => theme.bg(diff ? "toolSuccessBg" : "toolPendingBg", t)); // Pi's edit row: pending until the diff is known, then success
+				box.preview = diff ? { diff } : undefined;
+				box.clear();
+				const header = changes.length ? changes.map((c) => theme.fg("toolTitle", theme.bold(patchRowLine(c)))).join("\n") : theme.fg("toolTitle", theme.bold("edit (pending)"));
+				box.addChild(new Text(header, 0, 0));
+				if (diff) {
+					box.addChild(new Spacer(1));
+					box.addChild(new Text(renderDiff(diff), 0, 0));
+				}
+				return box;
+			},
+			renderResult(result, _opts, theme, context) {
+				return new Text(context.isError ? `\n${theme.fg("error", resultText(result))}` : "", 0, 0);
+			},
+		});
+		pi.registerTool({
+			name: TOOL_QUESTION,
+			label: "Codex question",
+			description: `Records a question the Codex agent asked the user in this conversation${NO_SNIPPET}`,
+			parameters: QuestionParams,
+			executionMode: "sequential",
+			execute: (_id, params, signal, onUpdate, ctx) => executeRow("question", params.itemId, signal, onUpdate as (p: ToolResult) => void, ctx),
+			renderCall(args, theme) {
+				return new Text(args.questions.map((q) => theme.fg("toolTitle", theme.bold(`? ${q.header}`))).join("\n"), 0, 0);
+			},
+			renderResult(result, _opts, theme, context) {
+				return new Text(`\n${theme.fg(context.isError ? "error" : "toolOutput", resultText(result))}`, 0, 0);
+			},
+		});
 
 		/** Pi calls this without network at startup and with network when the picker opens. */
 		async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[]> {
@@ -642,7 +1341,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			const onAbort = () => void client.close();
 			signal.addEventListener("abort", onAbort, { once: true });
 			try {
-				await client.request("initialize", { clientInfo: { name: "pi-rbf-codex", version: "0.21.0" }, capabilities: { experimentalApi: true } });
+				await client.request("initialize", { clientInfo: { name: "pi-rbf-codex", version: CLIENT_VERSION }, capabilities: { experimentalApi: true } });
 				client.notify("initialized", {});
 				const res = rec(await client.request("model/list", { includeHidden: false }));
 				const data = Array.isArray(res.data) ? (res.data as CodexModel[]) : [];
@@ -658,9 +1357,12 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			state.client = null;
 			state.shuttingDown = false;
 			state.noticedPolicy = false;
+			state.activeTurn = null;
+			state.approvedForSession = false;
 			if (!newestOwnEntry(ctx)) return; // a forked copy starts cold, so its last prompt was not ours to interrupt
-			const last = [...ctx.sessionManager.getBranch()].reverse().find((e) => e.type === "message") as { message?: { role: string } } | undefined;
-			if (last?.message?.role === "user") notify(NOTICE.interrupted, "warning");
+			// An unanswered prompt, or a row whose tool never returned (Pi died mid-row): both mean the request was cut.
+			const last = [...ctx.sessionManager.getBranch()].reverse().find((e) => e.type === "message") as { message?: { role: string; stopReason?: string } } | undefined;
+			if (last?.message?.role === "user" || (last?.message?.role === "assistant" && last.message.stopReason === "toolUse")) notify(NOTICE.interrupted, "warning");
 		});
 		const closeChild = async () => {
 			state.shuttingDown = true;

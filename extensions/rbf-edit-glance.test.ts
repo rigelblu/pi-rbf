@@ -357,6 +357,19 @@ describe("rbf-edit-glance ToolExecutionComponent patching", () => {
 		expect(recollapsedOutput).not.toContain("line 13");
 	});
 
+	it("glances a codex_patch row exactly as an edit row (#pi-10.3)", () => {
+		applyEditGlance();
+		const diff = [" 1 context", "-2 oldLine();", "+2 newLine();", " 3 context end"].join("\n");
+		const codexDef = { ...createMockEditToolDef(diff), name: "codex_patch" };
+		const comp = new ToolExecutionComponent("codex_patch", "codex-item-1", { itemId: "item-1", changes: [] }, {}, codexDef as any, mockUi as any, "/cwd");
+		const callComp = (comp as any).callRendererComponent as any;
+		expect(callComp.paddingY).toBe(0);
+		expect(callComp.bgFn).toBeUndefined();
+		const fullText = stripAnsi(comp.render(80).join("\n"));
+		expect(fullText).toContain("└ Added 1 line, removed 1 line");
+		expect(fullText).toContain("newLine();");
+	});
+
 	it("leaves non-edit tool executions untouched", () => {
 		applyEditGlance();
 

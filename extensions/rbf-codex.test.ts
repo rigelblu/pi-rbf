@@ -1,11 +1,14 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
+import { validateToolArguments } from "@earendil-works/pi-ai";
+import { Box } from "@earendil-works/pi-tui";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { API_ID, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, PROVIDER_ID, codexModelId, createRbfCodex, displayCommand, humanRequestKind, mapEffort, toProviderModel } from "./rbf-codex.ts";
+import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TURN_ENTRY_TYPE, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, mapEffort, patchRowLine, RowError, toPreviewDiff, toProviderModel, truncateTitle } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
@@ -16,13 +19,18 @@ const MISSING_COMMAND = { bin: "/nonexistent/codex-not-here", args: ["app-server
 type Handler = (event: any, ctx: ExtensionContext) => Promise<any>;
 type Entry = { type: string; customType?: string; data?: unknown; message?: { role: string; content: unknown } };
 
+type Tool = { name: string; execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: ((p: any) => void) | undefined, ctx: ExtensionContext) => Promise<any>; renderCall: (args: any, theme: any, context: any) => any; renderResult: (result: any, opts: any, theme: any, context: any) => any };
+const fakeTheme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+
 function makePi() {
 	const handlers = new Map<string, Handler>();
 	const entries: { customType: string; data: unknown }[] = [];
+	const tools = new Map<string, Tool>();
 	let provider: { name: string; config: ProviderConfig } | undefined;
 	const pi = {
 		on: vi.fn((event: string, handler: Handler) => handlers.set(event, handler)),
 		appendEntry: vi.fn((customType: string, data: unknown) => entries.push({ customType, data })),
+		registerTool: vi.fn((tool: Tool) => tools.set(tool.name, tool)),
 		registerProvider: vi.fn((name: string, config: ProviderConfig) => {
 			provider = { name, config };
 		}),
@@ -31,6 +39,7 @@ function makePi() {
 		pi,
 		handlers,
 		entries,
+		tools,
 		get provider() {
 			if (!provider) throw new Error("no provider registered");
 			return provider;
@@ -45,16 +54,30 @@ function makeCtx(opts: { branch?: Entry[]; sessionId?: string; cwd?: string; mod
 	const branch = opts.branch ?? [];
 	const notify = vi.fn();
 	const setWorkingMessage = vi.fn();
+	/** Scripted dialog answers, in order; `undefined` is Escape. */
+	const answers: (string | undefined)[] = [];
+	const dialogs: { kind: "select" | "input"; title: string; options?: string[]; signal?: AbortSignal }[] = [];
+	const select = vi.fn(async (title: string, options: string[], o?: { signal?: AbortSignal }) => {
+		dialogs.push({ kind: "select", title, options, signal: o?.signal });
+		if (!answers.length) await new Promise<void>((resolve) => o?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+		return answers.shift();
+	});
+	const input = vi.fn(async (title: string, _placeholder?: string, o?: { signal?: AbortSignal }) => {
+		dialogs.push({ kind: "input", title, signal: o?.signal });
+		return answers.shift();
+	});
+	const mode = opts.mode ?? "tui";
 	const ctx = {
-		mode: opts.mode ?? "tui",
-		ui: { notify, setWorkingMessage },
+		mode,
+		hasUI: mode === "tui",
+		ui: { notify, setWorkingMessage, select, input },
 		sessionManager: {
 			getBranch: () => branch,
 			getSessionId: () => opts.sessionId ?? "session-A",
 			getCwd: () => opts.cwd ?? process.cwd(),
 		},
 	} as unknown as ExtensionContext;
-	return { ctx, branch, notify, setWorkingMessage };
+	return { ctx, branch, notify, setWorkingMessage, answers, dialogs, select, input };
 }
 
 function model(id = BOOTSTRAP_MODEL_ID, thinkingLevelMap: Model<any>["thinkingLevelMap"] = BOOTSTRAP_MODEL.thinkingLevelMap): Model<any> {
@@ -75,7 +98,12 @@ async function collect(stream: AsyncIterable<AssistantMessageEvent>) {
 	const final = last?.type === "done" ? last.message : last?.type === "error" ? last.error : undefined;
 	const text = final?.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("") ?? "";
 	const thinking = final?.content.filter((b) => b.type === "thinking").map((b) => (b as { thinking: string }).thinking).join("") ?? "";
-	return { events, final, text, thinking };
+	const toolCall = final?.content.find((b) => b.type === "toolCall") as ToolCall | undefined;
+	return { events, final, text, thinking, toolCall };
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function toolResultMessage(call: ToolCall, result: { content: { type: "text"; text: string }[]; details: unknown; isError?: boolean }) {
+	return { role: "toolResult" as const, toolCallId: call.id, toolName: call.name, content: result.content, details: result.details, isError: !!result.isError, timestamp: Date.now() };
 }
 
 describe("rbf-codex", () => {
@@ -123,7 +151,24 @@ describe("rbf-codex", () => {
 		};
 		const shutdown = () => fx.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, c.ctx);
 		booted.push({ shutdown });
-		return { ...fx, ...c, turn, shutdown };
+		// Mirror Pi's agent loop: an execute that throws becomes an error tool result (`createErrorToolResult` + isError), which is how Pi tints the row. A returned isError is ignored by Pi, so error rows must throw.
+		const exec = async (call: ToolCall, opts: { signal?: AbortSignal; onUpdate?: (p: any) => void; ctx?: ExtensionContext } = {}) => {
+			try { return await fx.tools.get(call.name)!.execute(call.id, call.arguments, opts.signal, opts.onUpdate, opts.ctx ?? c.ctx); }
+			catch (e) { if (e instanceof RowError) return { content: [{ type: "text" as const, text: e.message }], details: {}, isError: true }; throw e; } // an abort still rejects, as Pi's tool contract requires; only a settled error row becomes a result
+		};
+		/** One Pi round: the call that ends with a row, the tool's execution, and the call that attaches after it. */
+		const round = async (messages: Context["messages"], m: Model<any> = model(), opts: { signal?: AbortSignal; onUpdate?: (p: any) => void; gapMs?: number } = {}) => {
+			const first = await collect(fx.provider.config.streamSimple!(m, { messages } as Context, { signal: opts.signal }));
+			if (!first.toolCall) return { first, result: undefined, next: undefined, messages };
+			// Pi validates every emitted tool call against the tool's TypeBox schema before execute; a shape drift would fail here.
+			expect(validateToolArguments(fx.tools.get(first.toolCall.name) as any, first.toolCall)).toEqual(first.toolCall.arguments);
+			const result = await exec(first.toolCall, opts);
+			if (opts.gapMs) await sleep(opts.gapMs);
+			const after = [...messages, first.final!, toolResultMessage(first.toolCall, result)];
+			const next = await collect(fx.provider.config.streamSimple!(m, { messages: after } as Context, { signal: opts.signal }));
+			return { first, result, next, messages: after };
+		};
+		return { ...fx, ...c, turn, shutdown, exec, round };
 	}
 
 	describe("registration", () => {
@@ -151,7 +196,8 @@ describe("rbf-codex", () => {
 
 		it("maps a Codex model to a Pi model with only listed efforts, minimal null, and xhigh and max named", () => {
 			const m = toProviderModel(codexModel("gpt-x", ["medium", "high", "ultra"], { inputModalities: ["text", "image"] }));
-			expect(m).toMatchObject({ id: "gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text"] }); // text-only until pi-10.3; the provider tag keeps the row apart from openai-codex
+			expect(m).toMatchObject({ id: "gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text", "image"] }); // the provider tag keeps the row apart from openai-codex
+			expect(toProviderModel(codexModel("gpt-t", ["low"], { inputModalities: ["text"] })).input).toEqual(["text"]);
 			expect(codexModelId("gpt-x")).toBe("gpt-x");
 			expect(codexModelId("codex-gpt-x")).toBe("gpt-x"); // a store from the brief prefix era
 			expect(codexModelId(BOOTSTRAP_MODEL_ID)).toBeUndefined();
@@ -187,7 +233,8 @@ describe("rbf-codex", () => {
 			const forced = refreshCtx({ allowNetwork: true, force: true, stored: storedEntry(now) });
 			const list = await fx.provider.config.refreshModels!(forced.ctx);
 			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-fake-1", "gpt-fake-2"]);
-			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text"], reasoning: true });
+			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text", "image"], reasoning: true });
+			expect(list[1]).toMatchObject({ input: ["text"] });
 			expect(list[2].thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 			expect(forced.publish).toHaveBeenCalledTimes(1);
 			const persisted = (forced.publish.mock.calls[0] as unknown as [{ persist: { models: Model<any>[]; checkedAt: number } }])[0].persist;
@@ -255,13 +302,14 @@ describe("rbf-codex", () => {
 			const r1 = await b.turn("first");
 			expect(r1.text).toBe("FAKE_OK");
 			expect(methods()).toEqual(["initialize", "initialized", "thread/start", "turn/start"]);
-			expect(b.entries).toEqual([{ customType: ENTRY_TYPE, data: { threadId: "thread-fake-1", cwd: process.cwd(), sessionId: "session-A" } }]);
+			const threadEntries = () => b.entries.filter((e) => e.customType === ENTRY_TYPE);
+			expect(threadEntries()).toEqual([{ customType: ENTRY_TYPE, data: { threadId: "thread-fake-1", cwd: process.cwd(), sessionId: "session-A" } }]);
 			b.branch.push({ type: "custom", customType: ENTRY_TYPE, data: b.entries[0].data });
 			await b.turn("second");
 			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
 			expect(methods().filter((m) => m === "thread/resume")).toHaveLength(1);
 			expect(sent().find((m) => m.method === "thread/resume")!.params).toMatchObject({ threadId: "thread-fake-1", excludeTurns: true });
-			expect(b.entries).toHaveLength(1);
+			expect(threadEntries()).toHaveLength(1);
 		});
 
 		it("ignores an entry copied from another session and starts a new thread", async () => {
@@ -291,12 +339,10 @@ describe("rbf-codex", () => {
 	});
 
 	describe("streaming and activity", () => {
-		it("commands, exit codes, reasoning, and commentary become thinking; final_answer streams as text; working line follows", async () => {
+		it("reasoning becomes thinking; commentary and final_answer stream as text; the working line is never touched (v0.21.1)", async () => {
 			scenario({
 				turn: [
-					{ kind: "command", id: "c1", command: "pwd" },
 					{ kind: "reasoning", delta: "thinking about it " },
-					{ kind: "command", id: "c2", command: "false", exitCode: 1 },
 					{ kind: "commentary", id: "m1", text: "Looking at the repo now" },
 					{ kind: "answer", id: "m2", text: "PWD=/tmp", phase: "final_answer" },
 					{ kind: "complete" },
@@ -305,29 +351,29 @@ describe("rbf-codex", () => {
 			const b = await boot();
 			const r = await b.turn("Run pwd");
 			expect(r.final?.stopReason).toBe("stop");
-			expect(r.text).toBe("PWD=/tmp");
-			expect(r.thinking).toBe("$ pwd\nthinking about it $ false\n→ exit 1\nLooking at the repo now ");
-			const calls = b.setWorkingMessage.mock.calls.map((c) => c[0]);
-			expect(calls[0]).toBe("$ pwd");
-			expect(calls).toContain("$ false → exit 1");
-			expect(calls).toContain("Looking at the repo now");
-			expect(calls[calls.length - 1]).toBeUndefined();
+			expect(r.text).toBe("Looking at the repo now PWD=/tmp");
+			expect(r.thinking).toBe("thinking about it ");
+			expect(b.setWorkingMessage).not.toHaveBeenCalled();
 			const kinds = r.events.map((e) => e.type);
 			expect(kinds[0]).toBe("start");
 			expect(kinds).toContain("thinking_start");
 			expect(kinds).toContain("text_delta");
 			expect(kinds[kinds.length - 1]).toBe("done");
+			expect(b.entries).toContainEqual({ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "completed" } });
 		});
 
-		it("strips Codex's login-shell wrapper from the working line and the thinking record", async () => {
+		it("a turn that ends with commentary and no final answer shows the commentary as the answer", async () => {
+			scenario({ turn: [{ kind: "commentary", id: "m1", text: "Nothing else to do" }, { kind: "complete" }] });
+			const b = await boot();
+			const r = await b.turn("hi");
+			expect(r.final?.stopReason).toBe("stop");
+			expect(r.text).toBe("Nothing else to do ");
+		});
+
+		it("strips Codex's login-shell wrapper for display", () => {
 			expect(displayCommand("/bin/zsh -lc pwd")).toBe("pwd");
 			expect(displayCommand("/bin/zsh -lc '/bin/sleep 20'")).toBe("/bin/sleep 20");
 			expect(displayCommand("ls -la")).toBe("ls -la");
-			scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc pwd" }, { kind: "answer", id: "m1", text: "OK" }, { kind: "complete" }] });
-			const b = await boot();
-			const r = await b.turn("Run pwd");
-			expect(r.thinking).toBe("$ pwd\n");
-			expect(b.setWorkingMessage.mock.calls[0][0]).toBe("$ pwd");
 		});
 
 		it("an agent message with null phase streams as the answer and is not repeated at turn end", async () => {
@@ -349,8 +395,8 @@ describe("rbf-codex", () => {
 			expect(r.final?.errorMessage).toBe(COPY["no-answer"]);
 		});
 
-		it("answers a server request with a JSON-RPC error and the turn continues", async () => {
-			scenario({ turn: [{ kind: "serverRequest", method: "item/commandExecution/requestApproval" }, { kind: "answer", id: "m1", text: "DONE" }, { kind: "complete" }] });
+		it("a permissions request is a JSON-RPC error with the declined notice and the turn continues", async () => {
+			scenario({ turn: [{ kind: "serverRequest", method: "item/permissions/requestApproval" }, { kind: "answer", id: "m1", text: "DONE" }, { kind: "complete" }] });
 			const b = await boot();
 			const r = await b.turn("hi");
 			expect(r.text).toBe("DONE");
@@ -359,8 +405,8 @@ describe("rbf-codex", () => {
 			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("approval"), "warning");
 		});
 
-		it("a legacy approval request and a user-input request are declined with the matching notice; other server requests silently", async () => {
-			scenario({ turn: [{ kind: "serverRequest", method: "execCommandApproval" }, { kind: "serverRequest", method: "item/tool/requestUserInput" }, { kind: "serverRequest", method: "attestation/generate" }, { kind: "answer", id: "m1", text: "DONE" }, { kind: "complete" }] });
+		it("a legacy approval, a human request for another turn, and other server requests are errors at arrival; only human kinds get a notice", async () => {
+			scenario({ turn: [{ kind: "serverRequest", method: "execCommandApproval" }, { kind: "serverRequest", method: "item/tool/requestUserInput", params: { turnId: "turn-elsewhere" } }, { kind: "serverRequest", method: "attestation/generate" }, { kind: "answer", id: "m1", text: "DONE" }, { kind: "complete" }] });
 			const b = await boot();
 			expect((await b.turn("hi")).text).toBe("DONE");
 			expect(sent().filter((m) => m.id !== undefined && !m.method && (m as { error?: unknown }).error)).toHaveLength(3);
@@ -377,7 +423,7 @@ describe("rbf-codex", () => {
 			expect(sent().find((m) => m.method === "turn/start")!.params).toMatchObject({ input: [{ type: "text", text: "first\n\nsteer text\n\nthird", text_elements: [] }] });
 		});
 
-		it("sends exactly one turn/start per streamSimple call across success, failure, and interruption", async () => {
+		it("sends exactly one turn/start per user prompt across success, failure, and interruption", async () => {
 			const b = await boot();
 			await b.turn("one");
 			await b.turn("two");
@@ -399,6 +445,528 @@ describe("rbf-codex", () => {
 		});
 	});
 
+	describe("tool rows (Scenario 7)", () => {
+		const diffA = "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,4 @@\n line\n-old\n+new1\n+new2\n+new3\n";
+
+		it("a Codex command becomes one Pi tool call, the tool returns its output, and the next call attaches with one turn/start", async () => {
+			scenario({ turn: [{ kind: "reasoning", delta: "look " }, { kind: "command", id: "c1", command: "/bin/zsh -lc 'ls -la'", output: ["a.ts\n", "b.ts\n"] }, { kind: "answer", id: "m1", text: "two files" }, { kind: "complete" }] });
+			const b = await boot();
+			const updates: string[] = [];
+			const r = await b.round([userMessage("list files")], model(), { onUpdate: (p) => updates.push(p.content[0].text) });
+			expect(r.first.final?.stopReason).toBe("toolUse");
+			expect(r.first.thinking).toBe("look ");
+			expect(r.first.events.map((e) => e.type).slice(-3)).toEqual(["toolcall_start", "toolcall_end", "done"]);
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: { itemId: "c1", command: "/bin/zsh -lc 'ls -la'", cwd: process.cwd() } });
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "a.ts\nb.ts" }], details: { itemId: "c1", exitCode: 0, status: "completed" }, isError: false });
+			expect(updates).toEqual(["", "a.ts\n", "a.ts\nb.ts\n"]); // the empty first update opens the row with `Elapsed`, as Pi's bash row does
+			expect(r.next!.final?.stopReason).toBe("stop");
+			expect(r.next!.text).toBe("two files");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "completed" } }]);
+		});
+
+		it("a nonzero exit ends the result with the code and isError", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "false", exitCode: 2, output: ["boom\n"] }, { kind: "answer", id: "m1", text: "failed" }, { kind: "complete" }] });
+			const b = await boot();
+			const r = await b.round([userMessage("run it")]);
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "boom\n\nexit 2" }], isError: true }); // a thrown error row carries no structured details, exactly as Pi's createErrorToolResult
+			expect(r.next!.text).toBe("failed");
+		});
+
+		it("a file change becomes a codex_patch call with flattened changes and an applied result", async () => {
+			scenario({ turn: [{ kind: "patch", id: "p1", changes: [{ path: "src/a.ts", kind: { type: "update", move_path: null }, diff: diffA }, { path: "src/b.ts", kind: { type: "add" }, diff: "x\ny\n" }] }, { kind: "answer", id: "m1", text: "edited" }, { kind: "complete" }] });
+			const b = await boot();
+			const r = await b.round([userMessage("edit it")]);
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-p1", name: TOOL_PATCH, arguments: { itemId: "p1", changes: [{ path: "src/a.ts", kind: "update", diff: " 1 line\n-2 old\n+2 new1\n+3 new2\n+4 new3" }, { path: "src/b.ts", kind: "add", diff: "+1 x\n+2 y" }] } }); // Codex sends the file content as an add's diff; Pi's rows read numbered +/- lines
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "applied 2 file(s): src/a.ts, src/b.ts" }], details: { itemId: "p1", status: "completed" }, isError: false });
+			expect(r.next!.text).toBe("edited");
+			expect(flattenChanges([{ path: "x", kind: { type: "update", move_path: "y" }, diff: "" }])).toEqual([{ path: "x", kind: "update", movePath: "y", diff: "" }]);
+			// Pi's numbered diff format (`edit-diff.js`): the glance tints and `renderDiff` colors only lines shaped `+N text` / `-N text`.
+			expect(toPreviewDiff("delete", "a\nb")).toBe("-1 a\n-2 b");
+			expect(toPreviewDiff("add", "")).toBe("");
+			expect(toPreviewDiff("add", "ROW\n")).toBe("+1 ROW");
+			expect(toPreviewDiff("update", "@@ -1 +1,2 @@\n ONE\n+TINT\n")).toBe(" 1 ONE\n+2 TINT"); // a real Codex update: bare hunk, no file headers
+			expect(toPreviewDiff("update", "@@ -8,3 +8,3 @@\n a\n-b\n+B\n c\n@@ -20,2 +20,3 @@\n d\n+e\n f\n\\ No newline at end of file\n")).toBe("  8 a\n- 9 b\n+ 9 B\n 10 c\n    ...\n 20 d\n+21 e\n 21 f"); // two hunks: numbers padded to the widest, ` ...` between, the no-newline marker dropped
+		});
+
+		it("shows Codex's absolute paths the way Pi's rows show the model's: relative to the working directory, else under ~ (#pi-10.3 human Scenario 1)", () => {
+			expect(displayPath("/w/src/a.ts", "/w")).toBe("src/a.ts");
+			expect(displayPath("src/a.ts", "/w")).toBe("src/a.ts");
+			expect(displayPath(`${homedir()}/notes.md`, "/w")).toBe("~/notes.md");
+			expect(displayPath("/etc/hosts", "/w")).toBe("/etc/hosts");
+			expect(patchRowLine({ path: `${process.cwd()}/pi10-row.txt`, kind: "add", diff: "+ROW\n" })).toBe("write pi10-row.txt (+1 −0)");
+		});
+
+		it("execute with an itemId no active turn holds returns an error result and sends nothing", async () => {
+			const b = await boot();
+			const r = await b.exec({ type: "toolCall", id: "codex-nope", name: TOOL_COMMAND, arguments: { itemId: "nope", command: "rm -rf /", cwd: "/" } });
+			expect(r.isError).toBe(true);
+			expect(sent()).toEqual([]);
+		});
+
+		it("the late-completion gap: the turn ends before Pi's next call, which still attaches and drains", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "pwd", output: ["/tmp\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+			const b = await boot();
+			const r = await b.round([userMessage("go")], model(), { gapMs: 150 });
+			expect(r.next!.final?.stopReason).toBe("stop");
+			expect(r.next!.text).toBe("done");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toHaveLength(1);
+			// The following prompt is a fresh turn.
+			await b.turn("again");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(2);
+		});
+
+		it("two commands in one turn are two rows in order", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "command", id: "c2", command: "two" }, { kind: "answer", id: "m1", text: "both" }, { kind: "complete" }] });
+			const b = await boot();
+			const r1 = await b.round([userMessage("go")]);
+			expect(r1.first.toolCall?.arguments.command).toBe("one");
+			expect(r1.next!.toolCall?.arguments.command).toBe("two");
+			const result2 = await b.exec(r1.next!.toolCall!);
+			const r3 = await b.turn([...r1.messages, r1.next!.final!, toolResultMessage(r1.next!.toolCall!, result2)]);
+			expect(r3.text).toBe("both");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		it("renderCall draws Pi's shell and edit rows; the patch row is a Box with a preview diff for rbf-edit-glance", async () => {
+			initTheme(); // renderDiff reads the active theme
+			const b = await boot();
+			const cmd = b.tools.get(TOOL_COMMAND)!;
+			const rc = (executionStarted = false) => ({ state: {} as Record<string, unknown>, executionStarted, invalidate: () => {} });
+			expect(cmd.renderCall({ itemId: "c1", command: "/bin/zsh -lc 'ls -la'", cwd: "/" }, fakeTheme, rc()).text).toBe("$ ls -la");
+			expect(cmd.renderCall({ itemId: "c1", command: "", cwd: "/" }, fakeTheme, rc()).text).toBe("$ (pending)");
+			const out = cmd.renderResult({ content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: false, ...rc() });
+			expect(out.text).toContain("... (2 earlier lines)");
+			expect(out.text).toContain("3\n4\n5\n6\n7");
+			expect(out.text).not.toContain("Took"); // no start time recorded: nothing to time
+			expect(cmd.renderResult({ content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} }, { expanded: true, isPartial: false }, fakeTheme, { isError: false, ...rc() }).text).toContain("1\n2\n3");
+			// Pi's bash row: the start time is kept in the row state once execution starts; `Elapsed` while partial, `Took` once final, and the ticking interval is cleared at the end.
+			const timed = rc(true);
+			cmd.renderCall({ itemId: "c1", command: "sleep 1", cwd: "/" }, fakeTheme, timed);
+			expect(typeof timed.state.startedAt).toBe("number");
+			expect(cmd.renderResult({ content: [], details: {} }, { expanded: false, isPartial: true }, fakeTheme, { isError: false, ...timed }).text).toMatch(/^\nElapsed \d+\.\ds$/);
+			expect(timed.state.interval).toBeDefined();
+			expect(cmd.renderResult({ content: [{ type: "text", text: "done" }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: false, ...timed }).text).toMatch(/^\ndone\nTook \d+\.\ds$/);
+			expect(timed.state.interval).toBeUndefined();
+			const patch = b.tools.get(TOOL_PATCH)!;
+			const bgs: string[] = [];
+			const bgTheme = { ...fakeTheme, bg: (c: string, t: string) => (bgs.push(c), t) };
+			const box = patch.renderCall({ itemId: "p1", changes: [{ path: "src/a.ts", kind: "update", diff: diffA }, { path: "src/b.ts", kind: "delete", diff: "-gone\n" }, { path: "src/c.ts", kind: "update", movePath: "src/d.ts", diff: "" }] }, bgTheme, rc());
+			expect(box).toBeInstanceOf(Box);
+			expect(box.preview.diff).toBe(`${diffA}\n-gone\n`);
+			const header = box.children[0].text as string;
+			expect(header).toBe("edit src/a.ts (+3 −1)\ndelete src/b.ts (+0 −1)\nedit src/c.ts → src/d.ts (+0 −0)");
+			box.render(80);
+			const pending = patch.renderCall({ itemId: "p2", changes: [] }, bgTheme, rc());
+			expect(pending.children[0].text).toBe("edit (pending)");
+			pending.render(80);
+			expect([...new Set(bgs)]).toEqual(["toolSuccessBg", "toolPendingBg"]); // Pi's edit row: success color once the diff is known, pending before (one call per rendered line)
+			// Reuse the same box instance across renders, as Pi's edit row does, so rbf-edit-glance's paddingX=0 survives instead of a fresh paddingX=1 box.
+			const reused = patch.renderCall({ itemId: "p1", changes: [{ path: "src/a.ts", kind: "update", diff: diffA }] }, fakeTheme, { state: {}, executionStarted: false, invalidate: () => {}, lastComponent: box });
+			expect(reused).toBe(box);
+			expect(reused.children[0].text).toBe("edit src/a.ts (+3 −1)"); // cleared and rebuilt, not appended
+			expect(diffCounts(diffA)).toEqual({ added: 3, removed: 1 });
+			expect(patchRowLine({ path: "n.ts", kind: "add", diff: "+a\n+b\n" })).toBe("write n.ts (+2 −0)");
+			const q = b.tools.get(TOOL_QUESTION)!;
+			expect(q.renderCall({ itemId: "q1", questions: [{ id: "a", header: "Color", question: "Which?" }] }, fakeTheme, rc()).text).toBe("? Color");
+		});
+	});
+
+	describe("requests (Scenario 8)", () => {
+		const diffA = "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,4 @@\n line\n-old\n+new1\n+new2\n+new3\n";
+		const replies = () => sent().filter((m) => m.id !== undefined && !m.method) as { id: number; result?: any; error?: any }[];
+
+		it("an approval before item/started opens the row from the request; each choice answers by name once, and no second row opens", async () => {
+			let starts = 0;
+			for (const [answer, decision] of [["Yes", "accept"], ["Yes for this session", "acceptForSession"], [undefined, "cancel"]] as const) {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo hi'", output: ["hi\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'echo hi'", reason: "needs network" }] }, { kind: "answer", id: "m1", text: "said hi" }, { kind: "complete" }] });
+				const b = await boot();
+				b.answers.push(answer);
+				const r = await b.round([userMessage("say hi")]);
+				expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: { itemId: "c1", command: "/bin/zsh -lc 'echo hi'", cwd: process.cwd() } });
+				expect(b.dialogs).toEqual([{ kind: "select", title: "Codex wants to run: echo hi — needs network", options: [...APPROVAL_CHOICES], signal: expect.any(AbortSignal) }]);
+				expect(replies().at(-1)?.result).toEqual({ decision }); // the log spans the three boots of this test
+				if (decision === "cancel") {
+					expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+					expect(r.next!.final?.stopReason).toBe("aborted");
+					expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
+				} else {
+					expect(r.result).toMatchObject({ content: [{ type: "text", text: "hi" }], isError: false });
+					expect(r.next!.toolCall).toBeUndefined(); // item/started for c1 opened no second row
+					expect(r.next!.text).toBe("said hi");
+				}
+				expect(methods().filter((m) => m === "turn/start")).toHaveLength(++starts); // one per boot in this test
+			}
+		});
+
+		it("an approval that arrives while execute already waits opens the dialog from that execute; two callbacks for one item open two dialogs in order", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "curl x", output: ["ok\n"], approvals: [{ when: "after", approvalId: "a1", command: "curl x" }, { when: "after", approvalId: "a2", kind: "writeStdin", command: "curl x" }] }, { kind: "answer", id: "m1", text: "fetched" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("Yes", "Yes");
+			const r = await b.round([userMessage("fetch")]);
+			expect(b.dialogs.map((d) => d.title)).toEqual(["Codex wants to run: curl x", "Codex wants to send input to: curl x"]);
+			expect(replies().map((m) => m.result)).toEqual([{ decision: "accept" }, { decision: "accept" }]);
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "ok" }], isError: false });
+			expect(r.next!.text).toBe("fetched");
+		});
+
+		it("a request with command null opens the row as pending and titles the dialog (pending)", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "later", approvals: [{ when: "before", command: null }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("Yes");
+			const r = await b.round([userMessage("go")]);
+			expect(r.first.toolCall?.arguments).toEqual({ itemId: "c1", command: "", cwd: process.cwd() });
+			expect(b.tools.get(TOOL_COMMAND)!.renderCall(r.first.toolCall!.arguments, fakeTheme, { state: {}, executionStarted: false }).text).toBe("$ (pending)");
+			expect(b.dialogs[0].title).toBe("Codex wants to run: (pending)");
+		});
+
+		it("a file change started first and then approved opens the patch dialog titled with paths and counts", async () => {
+			scenario({ turn: [{ kind: "patch", id: "p1", changes: [{ path: "src/a.ts", kind: { type: "update" }, diff: diffA }], approvals: [{ when: "after" }] }, { kind: "answer", id: "m1", text: "edited" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("Yes");
+			const r = await b.round([userMessage("edit")]);
+			expect(r.first.toolCall?.name).toBe(TOOL_PATCH);
+			expect(b.dialogs[0].title).toBe("Codex wants to edit: src/a.ts (+3 −1)");
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "applied 1 file(s): src/a.ts" }], isError: false });
+		});
+
+		it("a patch approval before its item opens the row pending and titles the dialog without paths", async () => {
+			scenario({ turn: [{ kind: "patch", id: "p1", changes: [{ path: "src/a.ts", kind: { type: "update" }, diff: diffA }], approvals: [{ when: "before", reason: "outside the sandbox" }] }, { kind: "answer", id: "m1", text: "edited" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("Yes");
+			const r = await b.round([userMessage("edit")]);
+			expect(r.first.toolCall?.arguments).toEqual({ itemId: "p1", changes: [] });
+			expect(b.dialogs[0].title).toBe("Codex wants to edit files — outside the sandbox");
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "applied 1 file(s): src/a.ts" }] });
+		});
+
+		it("a question becomes a codex_question row; options render as label — description and the label goes back; Escape sends no answer", async () => {
+			const questions = [{ id: "q1", header: "Color", question: "Which color?", options: [{ label: "RED", description: "warm" }, { label: "BLUE", description: "cool" }], isOther: true }, { id: "q2", header: "Name", question: "Call it?" }];
+			scenario({ turn: [{ kind: "question", id: "u1", questions }, { kind: "answer", id: "m1", text: "noted" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("BLUE — cool", "widget");
+			const r = await b.round([userMessage("ask me")]);
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-u1", name: TOOL_QUESTION, arguments: { itemId: "u1", questions } });
+			expect(b.dialogs).toEqual([{ kind: "select", title: "Color: Which color?", options: ["RED — warm", "BLUE — cool", OTHER_CHOICE], signal: expect.any(AbortSignal) }, { kind: "input", title: "Name: Call it?", signal: expect.any(AbortSignal) }]);
+			expect(replies().at(-1)?.result).toEqual({ answers: { q1: { answers: ["BLUE"] }, q2: { answers: ["widget"] } } });
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "Color: BLUE\nName: widget" }], isError: false });
+			expect(r.next!.text).toBe("noted");
+
+			scenario({ turn: [{ kind: "question", id: "u1", questions: [questions[0]] }, { kind: "answer", id: "m1", text: "noted" }, { kind: "complete" }] });
+			const b2 = await boot();
+			b2.answers.push(OTHER_CHOICE, "PINK");
+			const r2 = await b2.round([userMessage("ask me")]);
+			expect(b2.dialogs.map((d) => d.kind)).toEqual(["select", "input"]);
+			expect(r2.result).toMatchObject({ content: [{ type: "text", text: "Color: PINK" }] });
+
+			const b3 = await boot();
+			b3.answers.push(undefined);
+			const r3 = await b3.round([userMessage("ask me")]);
+			expect(replies().at(-1)?.result).toEqual({ answers: { q1: { answers: [] } } });
+			expect(r3.result).toMatchObject({ content: [{ type: "text", text: `Color: ${ROW_STATUS.declined}` }] });
+
+			// Codex sends `options: null` on a free-text question; the persisted argument drops it so Pi's validator and renderCall see a clean shape.
+			scenario({ turn: [{ kind: "question", id: "u1", questions: [{ id: "q9", header: "Name", question: "Call it?", options: null, isOther: false, isSecret: false }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const b4 = await boot();
+			b4.answers.push("gizmo");
+			const r4 = await b4.round([userMessage("ask me")]);
+			expect(r4.first.toolCall?.arguments.questions[0]).not.toHaveProperty("options");
+			expect(b4.dialogs.map((d) => d.kind)).toEqual(["input"]);
+			expect(r4.result).toMatchObject({ content: [{ type: "text", text: "Name: gizmo" }] });
+		});
+
+		it("a secret question declines the whole request with the secret notice; without a UI every request is declined with the notice", async () => {
+			const questions = [{ id: "q1", header: "Token", question: "Paste it", isSecret: true }];
+			scenario({ turn: [{ kind: "question", id: "u1", questions }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const b = await boot();
+			const r = await b.round([userMessage("go")]);
+			expect(b.dialogs).toEqual([]);
+			expect(replies()[0].error).toBeDefined();
+			expect(b.notify).toHaveBeenCalledWith(NOTICE.secret, "warning");
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+
+			scenario({ turn: [{ kind: "command", id: "c1", command: "ls", approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const p = await boot({ mode: "print" });
+			const rp = await p.round([userMessage("go")]);
+			expect(p.select).not.toHaveBeenCalled();
+			expect(replies()[0].error).toBeDefined();
+			expect(rp.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+		});
+
+		it("a dialog still open when the turn ends is closed through its signal and answered decline", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "ls", approvals: [{ when: "after" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal }); // no answer queued: the dialog stays open
+			await vi.waitFor(() => expect(b.dialogs).toHaveLength(1));
+			ac.abort(); // Escape on the row: interrupt → the fake ends the turn → the dialog closes
+			await expect(p).rejects.toThrow("aborted");
+			expect(b.dialogs[0].signal?.aborted).toBe(true);
+			await vi.waitFor(() => expect(replies().map((m) => m.result)).toEqual([{ decision: "decline" }]));
+		});
+
+		it("after Yes for this session, a respawn in the same process notifies the reset once; a fresh session_start notifies nothing", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "ls", approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }], laterTurns: [{ kind: "die" }] });
+			const b = await boot();
+			b.answers.push("Yes for this session");
+			await b.round([userMessage("go")]);
+			expect((await b.turn("two")).final?.errorMessage).toBe(COPY["codex-stopped"]);
+			delete process.env.RBF_FAKE_SCENARIO;
+			expect((await b.turn("three")).text).toBe("FAKE_OK");
+			expect(b.notify.mock.calls.filter((c) => c[0] === NOTICE.restarted)).toHaveLength(1);
+			await b.turn("four");
+			expect(b.notify.mock.calls.filter((c) => c[0] === NOTICE.restarted)).toHaveLength(1);
+			const fresh = await boot();
+			await fresh.turn("one");
+			expect(fresh.notify).not.toHaveBeenCalledWith(NOTICE.restarted, "warning");
+		});
+
+		it("a request queued for a row Pi never executes is answered with an error when the turn ends", async () => {
+			// The approval opens the row; the test ends the turn by aborting the provider call instead of executing the tool.
+			scenario({ turn: [{ kind: "command", id: "c1", command: "ls", approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			expect(first.toolCall?.name).toBe(TOOL_COMMAND);
+			const ac = new AbortController();
+			ac.abort();
+			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			await vi.waitFor(() => expect(replies().filter((m) => m.error)).toHaveLength(1));
+			await sleep(150); // let any second reply for the same id land before asserting exactly once
+			const errors = replies().filter((m) => m.error);
+			expect(errors).toHaveLength(1);
+			expect(new Set(replies().map((m) => m.id)).size).toBe(replies().length);
+		});
+
+		it("truncates a dialog title to the width: reason first, then trailing paths, then an ellipsis", () => {
+			expect(truncateTitle("Codex wants to run: ls — a very long reason", 30)).toBe("Codex wants to run: ls");
+			expect(truncateTitle("Codex wants to edit: a.ts (+1 −0), b.ts (+2 −0), c.ts (+3 −0)", 40)).toBe("Codex wants to edit: a.ts (+1 −0)");
+			expect(truncateTitle("Codex wants to run: a-command-that-is-very-long-indeed", 30)).toBe("Codex wants to run: a-command…");
+			expect(truncateTitle("short", 30)).toBe("short");
+		});
+	});
+
+	describe("branches (Scenario 9)", () => {
+		const T = (sessionId: string, threadId = "thread-fake-1") => ({ type: "custom", customType: ENTRY_TYPE, data: { threadId, cwd: process.cwd(), sessionId } });
+		const U = (turnId: string, status = "completed") => ({ type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId, status } });
+		const threadEntries = (b: { entries: { customType: string; data: unknown }[] }) => b.entries.filter((e) => e.customType === ENTRY_TYPE).map((e) => e.data);
+
+		it("(a) own thread, turn entry, nothing newer on Codex: resume with turns, no fork", async () => {
+			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+			await b.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
+			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1" });
+			expect(threadEntries(b)).toEqual([]);
+		});
+
+		it("(b) Codex completed a turn this branch never saw: fork at the branch's last turn, one new thread entry, turn/start on the fork", async () => {
+			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "completed" }] });
+			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+			await b.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/fork", "turn/start"]);
+			expect(sent().find((m) => m.method === "thread/fork")!.params).toEqual({ threadId: "thread-fake-1", lastTurnId: "turn-1", cwd: process.cwd(), ephemeral: false });
+			expect(threadEntries(b)).toEqual([{ threadId: "thread-fake-fork-1", cwd: process.cwd(), sessionId: "A" }]);
+			expect(sent().find((m) => m.method === "turn/start")!.params).toMatchObject({ threadId: "thread-fake-fork-1" });
+		});
+
+		it("(c, j) another session's thread with a turn entry: fork directly, no resume first", async () => {
+			const b = await boot({ sessionId: "B", branch: [T("A"), U("turn-1")] });
+			await b.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/fork", "turn/start"]);
+			expect(threadEntries(b)).toEqual([{ threadId: "thread-fake-fork-1", cwd: process.cwd(), sessionId: "B" }]);
+		});
+
+		it("(d, f) another session's thread with no turn entry, or no thread at all: thread/start", async () => {
+			const b = await boot({ sessionId: "B", branch: [T("A")] });
+			await b.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/start", "turn/start"]);
+			const c = await boot({ branch: [] });
+			await c.turn("hi");
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(2);
+		});
+
+		it("(e, k) only interrupted, failed, or inProgress turns after the branch's last turn: resume, no fork", async () => {
+			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "interrupted" }, { id: "turn-3", status: "failed" }, { id: "turn-4", status: "inProgress" }] });
+			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+			await b.turn("hi");
+			expect(methods()).not.toContain("thread/fork");
+			expect(threadEntries(b)).toEqual([]);
+		});
+
+		it("an interrupted turn entry after the completed one is never a fork's lastTurnId; with no completed entry a foreign thread starts cold", async () => {
+			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "interrupted" }, { id: "turn-3", status: "completed" }] });
+			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1"), U("turn-2", "interrupted")] });
+			await b.turn("hi");
+			expect(sent().find((m) => m.method === "thread/fork")!.params).toMatchObject({ lastTurnId: "turn-1" });
+			const c = await boot({ sessionId: "B", branch: [T("A"), U("turn-2", "interrupted")] });
+			await c.turn("hi");
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+		});
+
+		it("(g) completed and interrupted turns each append one turn entry", async () => {
+			scenario({ turn: [{ kind: "complete", status: "interrupted" }] });
+			const b = await boot();
+			const r = await b.turn("hi");
+			expect(r.final?.stopReason).toBe("aborted");
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
+		});
+
+		it("(h) a thread/fork error ends the call with turn-failed and sends no turn/start", async () => {
+			scenario({ forkError: "no such turn" });
+			const b = await boot({ sessionId: "B", branch: [T("A"), U("turn-1")] });
+			const r = await b.turn("hi");
+			expect(r.final?.errorMessage).toBe(COPY["turn-failed"]);
+			expect(methods()).not.toContain("turn/start");
+		});
+
+		it("(i) own thread with no turn entry after it: resume without turns, never fork, even when Codex lists completed turns", async () => {
+			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "completed" }] });
+			const b = await boot({ sessionId: "A", branch: [T("A")] });
+			await b.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
+			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1", excludeTurns: true });
+		});
+	});
+
+	describe("steer (Scenario 10)", () => {
+		it("a user message during an active turn is one turn/steer with the active turn id and no turn/start", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			const result = await b.exec(first.toolCall!);
+			const r = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result), userMessage("also check b")]);
+			expect(r.final?.stopReason).toBe("stop");
+			expect(r.text).toBe("woke");
+			expect(sent().filter((m) => m.method === "turn/steer").map((m) => m.params)).toEqual([{ threadId: "thread-fake-1", expectedTurnId: "turn-fake-1", input: [{ type: "text", text: "also check b", text_elements: [] }] }]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		it("a refused steer becomes exactly one turn/start after the turn ends, carrying the steer text and images", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "turn already ended" });
+			const b = await boot();
+			const m = model("gpt-fake-2");
+			m.input = ["text", "image"];
+			const first = await b.turn("go", m);
+			const result = await b.exec(first.toolCall!);
+			const steer = { role: "user" as const, content: [{ type: "text" as const, text: "and this" }, { type: "image" as const, data: "AAAA", mimeType: "image/png" }], timestamp: Date.now() };
+			const r = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result), steer], m);
+			expect(r.final?.stopReason).toBe("stop");
+			expect(r.text).toBe("woketook the steer"); // the ended turn's answer, then the new turn's, in one Pi message
+			expect(methods().filter((m) => m === "turn/steer")).toHaveLength(1);
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
+			expect(starts).toHaveLength(2);
+			expect(starts[1]).toMatchObject({ threadId: "thread-fake-1", input: [{ type: "text", text: "and this", text_elements: [] }, { type: "image", url: "data:image/png;base64,AAAA" }] });
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toHaveLength(2);
+		});
+
+		it("a refused steer survives a row that opens before the turn ends, and is sent exactly once", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "command", id: "c2", command: "two" }, { kind: "answer", id: "m1", text: "both" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "refused" });
+			const b = await boot();
+			const first = await b.turn("go");
+			const result1 = await b.exec(first.toolCall!);
+			const second = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result1), userMessage("later")]); // steer refused; this call ends on row c2
+			expect(second.toolCall?.arguments.command).toBe("two");
+			const result2 = await b.exec(second.toolCall!);
+			const third = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result1), userMessage("later"), second.final!, toolResultMessage(second.toolCall!, result2)]);
+			expect(third.text).toBe("bothtook the steer");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
+			expect(starts).toHaveLength(2);
+			expect(starts[1]).toMatchObject({ input: [{ type: "text", text: "later", text_elements: [] }] });
+		});
+
+		it("Escape that lands during the steer round trip still interrupts the turn", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "hang" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			const result = await b.exec(first.toolCall!);
+			const ac = new AbortController();
+			const p = b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result), userMessage("steer")], model(), { signal: ac.signal });
+			ac.abort(); // before turn/steer has answered
+			const r = await p;
+			expect(r.final?.stopReason).toBe("aborted");
+			await vi.waitFor(() => expect(methods()).toContain("turn/interrupt"));
+		});
+	});
+
+	describe("images (Scenario 11)", () => {
+		it("an image on an image-capable model travels as a data URL after the text; text-only models and the bootstrap row refuse it", async () => {
+			const b = await boot();
+			const m = model("gpt-fake-2");
+			m.input = ["text", "image"];
+			await b.turn([{ role: "user", content: [{ type: "text", text: "what is this" }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }], timestamp: Date.now() } as any], m);
+			expect(sent().find((x) => x.method === "turn/start")!.params).toMatchObject({ input: [{ type: "text", text: "what is this", text_elements: [] }, { type: "image", url: "data:image/png;base64,iVBORw0KGgo=" }] });
+			const t = await b.turn([{ role: "user", content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], timestamp: Date.now() } as any], model("gpt-fake-1"));
+			expect(t.final?.errorMessage).toBe(COPY["unsupported-input"]);
+			expect(methods().filter((x) => x === "turn/start")).toHaveLength(1);
+			expect(COPY["unsupported-input"]).toBe("This Codex model accepts plain text only. Remove the image, or pick an image-capable Codex model.");
+		});
+	});
+
+	describe("abort during a row (Scenario 12)", () => {
+		it("aborting the tool's signal sends one turn/interrupt, rejects execute with aborted, and Pi's re-call with the aborted signal finishes the turn silently", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow("aborted");
+			await vi.waitFor(() => expect(methods().filter((m) => m === "turn/interrupt")).toHaveLength(1));
+			const before = sent().length;
+			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			expect(recall.events.map((e) => e.type)).toEqual(["error"]);
+			expect(sent().length).toBe(before);
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
+			delete process.env.RBF_FAKE_SCENARIO;
+			await b.turn("next");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(2);
+		});
+
+		it("with the interrupt ignored, the child is closed after 3 s and the next prompt spawns a new one", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], ignoreInterrupt: true });
+			const b = await boot();
+			const first = await b.turn("go");
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow("aborted");
+			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			delete process.env.RBF_FAKE_SCENARIO;
+			await vi.waitFor(() => expect(sent().filter((m) => m.method === "initialize")).toHaveLength(1));
+			expect((await b.turn("again")).text).toBe("FAKE_OK");
+			expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+		}, 15_000);
+
+		it("child death during a row ends the row as Codex stopped and the next call as codex-stopped; under the shutdown flag both end aborted", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			const result = await b.exec(first.toolCall!);
+			expect(result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
+			const next = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result)]);
+			expect(next.final?.errorMessage).toBe(COPY["codex-stopped"]);
+			delete process.env.RBF_FAKE_SCENARIO;
+			expect((await b.turn("again")).text).toBe("FAKE_OK"); // activeTurn was nulled; a fresh child and turn
+
+			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
+			const s = await boot();
+			const f = await s.turn("go");
+			const p = s.exec(f.toolCall!);
+			await sleep(50);
+			await s.shutdown();
+			expect(await p).toMatchObject({ isError: true });
+			const after = await s.turn([userMessage("go"), f.final!, toolResultMessage(f.toolCall!, await p)]);
+			expect(after.final?.stopReason).toBe("aborted");
+		});
+	});
+
 	describe("cancellation and child loss", () => {
 		it("Escape sends turn/interrupt and ends aborted when Codex reports interrupted", async () => {
 			scenario({ turn: [{ kind: "hang" }] });
@@ -409,7 +977,9 @@ describe("rbf-codex", () => {
 			ac.abort();
 			const r = await p;
 			expect(r.final?.stopReason).toBe("aborted");
-			expect(methods()).toContain("turn/interrupt");
+			const interrupt = sent().find((m) => m.method === "turn/interrupt")!;
+			expect(typeof interrupt.id).toBe("number"); // a request, not a notification: real Codex ignores the latter
+			expect(interrupt.params).toEqual({ threadId: "thread-fake-1", turnId: "turn-fake-1" });
 			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
 		});
 
@@ -460,7 +1030,7 @@ describe("rbf-codex", () => {
 			const r = await b.turn("hi");
 			expect(r.final?.errorMessage).toBe(COPY["codex-logged-out"]);
 			expect(Date.now() - started).toBeLessThan(3000);
-			expect(methods()).toContain("turn/interrupt");
+			await vi.waitFor(() => expect(methods()).toContain("turn/interrupt")); // the fake logs the line when it reads it
 		});
 
 		it("a missing Codex binary ends with codex-missing; an auth error on initialize ends with codex-logged-out", async () => {
@@ -514,6 +1084,9 @@ describe("rbf-codex", () => {
 			expect(forked.notify).not.toHaveBeenCalled();
 			const answered = await boot({ branch: [entry, { type: "message", message: { role: "user", content: "x" } }, { type: "message", message: { role: "assistant", content: "y" } }] });
 			expect(answered.notify).not.toHaveBeenCalled();
+			// Pi died mid-row: the branch ends in the assistant message that opened the row, with no tool result after it.
+			const midRow = await boot({ sessionId: "session-A", branch: [entry, { type: "message", message: { role: "user", content: "x" } }, { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: {} }], stopReason: "toolUse" } as any }] });
+			expect(midRow.notify).toHaveBeenCalledWith(NOTICE.interrupted, "warning");
 			const unbound = await boot({ branch: [{ type: "message", message: { role: "user", content: "x" } }] });
 			expect(unbound.notify).not.toHaveBeenCalled();
 		});

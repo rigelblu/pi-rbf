@@ -536,7 +536,7 @@ export function applyEditGlance(): boolean {
 	proto.updateDisplay = function (this: any): void {
 		originalUpdateDisplay.call(this);
 
-		if (this.toolName === "edit") {
+		if (this.toolName === "edit" || this.toolName === "codex_patch") {
 			patchEditComponent(this);
 		}
 	};
