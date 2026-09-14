@@ -4,12 +4,14 @@
 // Why this exists: pi-10.3's human run found seven rendering defects that 586 green tests and
 // three cold reviews had passed, because the fake app-server returns whatever the extension
 // expects and no test ever looked at the bytes Pi draws. This test does. Per configuration it
-// launches Pi six times: once with a scripted provider that makes Pi run its own `bash` and
-// `edit` (the reference), and five times with `rbf-codex` pointed at the fake app-server (the
+// launches Pi seven times: once with a scripted provider that makes Pi run its own `bash` and
+// `edit` (the reference), five times with `rbf-codex` pointed at the fake app-server (the
 // candidate: the row set, a declined command, a row Codex stopped, an answered question, a
-// declined question). It then asserts the terminal bytes of matching lines are identical, or
-// identical column for column with the text blanked where the text differs by design (an added
-// file has no Pi twin; a question row has none either).
+// skipped question, a secret question), and once with both, the scripted provider calling
+// `codex_command` by hand. It replays each raw stream into a final screen, then asserts the
+// screen rows of matching lines are identical, or identical column for column with the text
+// blanked where the text differs by design (an added file has no Pi twin; a question row has
+// none either), and that the blank rows between a row's lines match.
 //
 // Runs in two configurations: bare Pi, and Pi with the daily extensions that touch rows
 // (`rbf-tool-execution-blended`, `rbf-edit-glance`), because three of the seven defects showed only
@@ -41,33 +43,95 @@ type Capture = { raw: Buffer; lines: Buffer[] };
 
 const READY_STEPS: Step[] = [{ wait: "ctrl\\+o more" }, { paste: "go" }, { key: "enter" }];
 
-/** Pi's TUI redraws a line as `ESC[2K` (erase line) then the content, ending in CR; the last redraw of a line is its final state. */
-function renderedLines(raw: Buffer): Buffer[] {
-	const lines: Buffer[] = [];
-	const ERASE = Buffer.from("\x1b[2K");
-	let at = raw.indexOf(ERASE);
-	while (at !== -1) {
-		const start = at + ERASE.length;
-		const next = raw.indexOf(ERASE, start);
-		let end = next === -1 ? raw.length : next;
-		for (const stop of ["\r", "\n"]) {
-			const i = raw.indexOf(stop, start);
-			if (i !== -1 && i < end) end = i;
+/**
+ * The final screen, one entry per terminal row with its escapes kept: a line-level terminal emulator for what Pi's
+ * TUI emits. Pi redraws a row as `ESC[2K` (erase line) then its full content, moves with relative cursor sequences,
+ * and rewrites only the rows that changed, so the last redraw of a row in the stream is its final state but the
+ * stream's order is not the screen's; replaying the stream is. Rows scrolled off the top are kept.
+ */
+function screen(raw: Buffer): Buffer[] {
+	const rows: string[] = [""];
+	let row = 0;
+	let restart = false; // after CR, LF, or a move to column 1 the next thing written replaces the row
+	const begin = () => {
+		if (restart) {
+			rows[row] = "";
+			restart = false;
 		}
-		lines.push(raw.subarray(start, end));
-		at = next;
+	};
+	const tokens = raw.toString("latin1").match(/\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[^[\]]|[^\x1b]+/g) ?? [];
+	for (const t of tokens) {
+		if (t.startsWith("\x1b[")) {
+			const m = /^\x1b\[([0-9;?<>=]*)[ -/]*([@-~])$/.exec(t)!;
+			const n = parseInt(m[1]!, 10);
+			switch (m[2]) {
+				case "A": // cursor up
+					row = Math.max(0, row - (n || 1));
+					restart = false;
+					break;
+				case "B": // cursor down
+					row += n || 1;
+					while (rows.length <= row) rows.push("");
+					restart = false;
+					break;
+				case "G": // column
+					if (!n || n === 1) restart = true;
+					break;
+				case "K": // erase line
+					if (n === 2) {
+						rows[row] = "";
+						restart = false;
+					}
+					break;
+				case "J": // erase below
+					if (!n) rows.length = row + 1;
+					break;
+				case "m": // SGR: part of the row
+					begin();
+					rows[row] += t;
+					break;
+				default: // cursor show/hide, synchronized output, keyboard protocol: no effect on rows
+					break;
+			}
+		} else if (t.startsWith("\x1b]")) {
+			begin();
+			rows[row] += t; // OSC (hyperlink boundaries): part of the row
+		} else if (t.startsWith("\x1b")) {
+			// ESC + one char (charset, keypad): no effect on rows
+		} else {
+			for (const ch of t) {
+				if (ch === "\r") restart = true;
+				else if (ch === "\n") {
+					row++;
+					while (rows.length <= row) rows.push("");
+					restart = true;
+				} else {
+					begin();
+					rows[row] += ch;
+				}
+			}
+		}
 	}
-	return lines;
+	return rows.map((r) => Buffer.from(r, "latin1"));
 }
 
-/** The final redraw of the line carrying `marker`; `not` skips lines that also carry another text (a row's title repeats its command). Markers are unique per row, so the hits are redraws of one line. */
+/** The screen row carrying `marker`; `not` skips rows that also carry another text (a row's title repeats its command). Markers are unique per row; where they are not, `distinct` compares the set. */
 function line(cap: Capture, marker: string, not?: string): Buffer {
 	const hits = cap.lines.filter((l) => l.includes(marker) && !(not && l.includes(not)));
-	if (hits.length === 0) throw new Error(`no rendered line carries ${JSON.stringify(marker)}`);
+	if (hits.length === 0) throw new Error(`no screen row carries ${JSON.stringify(marker)}`);
 	return hits[hits.length - 1]!;
 }
 /** A command row's output line: the command's echo, not the `$ …` title that also names it. */
 const output = (cap: Capture, text: string) => line(cap, text, "$ ");
+/** How many empty screen rows sit directly above the row carrying `marker`: the row's vertical shape, which single-line equality cannot see. */
+function blanksAbove(cap: Capture, marker: string, not?: string): number {
+	let i = cap.lines.length - 1;
+	while (i >= 0 && !(cap.lines[i]!.includes(marker) && !(not && cap.lines[i]!.includes(not)))) i--;
+	if (i < 0) throw new Error(`no screen row carries ${JSON.stringify(marker)}`);
+	let blanks = 0;
+	while (i > 0 && cap.lines[--i]!.toString("latin1").replace(/\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g, "").trim() === "") blanks++;
+	return blanks;
+}
 
 const show = (b: Buffer) => JSON.stringify(b.toString("latin1"));
 /** Bytes with only the timing digits neutralised, so `Took 0.0s` and `Took 0.1s` compare equal. */
@@ -148,7 +212,7 @@ function drive(ws: Workspace, run: Run): Promise<Capture> {
 				return reject(new Error(`row-gate driver exited ${code}: ${stderr.trim()} (raw bytes kept in ${out})`));
 			}
 			const raw = readFileSync(out);
-			resolvePromise({ raw, lines: renderedLines(raw) });
+			resolvePromise({ raw, lines: screen(raw) });
 		});
 		child.stdin.end(JSON.stringify(plan));
 	});
@@ -170,6 +234,12 @@ function piRun(ws: Workspace, extensions: string[]): Run {
 		{ text: "GATE_DONE" },
 	];
 	return { extensions: [...extensions, PROVIDER], model: "rbf-gate/gate", env: { RBF_ROW_GATE_SCRIPT: JSON.stringify(script) }, steps: [...READY_STEPS, { wait: "GATE_DONE" }] };
+}
+
+/** A model calling `codex_command` by hand (Pi's `registerTool` is global, so every model sees it): the row must refuse as an error. */
+function directCallRun(ws: Workspace, extensions: string[]): Run {
+	const script = [{ tool: "codex_command", args: { itemId: "by-hand", command: "echo GATE_DIRECT", cwd: ws.work } }, { text: "GATE_DONE" }];
+	return { extensions: [...extensions, CODEX, PROVIDER], model: "rbf-gate/gate", env: { RBF_ROW_GATE_SCRIPT: JSON.stringify(script) }, steps: [...READY_STEPS, { wait: "GATE_DONE" }] };
 }
 
 function codexRun(ws: Workspace, extensions: string[], scenario: FakeScenario, steps: Step[]): Run {
@@ -235,6 +305,7 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 				question: (ws) => codexRun(ws, config.extensions, QUESTION, [{ wait: "Choose BLUE" }, { key: "down" }, { key: "enter" }, { wait: "GATE_DONE" }]),
 				"question-skipped": (ws) => codexRun(ws, config.extensions, QUESTION, [{ wait: "Choose BLUE" }, { key: "escape" }, { wait: "GATE_DONE" }]),
 				"question-secret": (ws) => codexRun(ws, config.extensions, QUESTION_SECRET, [{ wait: "GATE_DONE" }]),
+				direct: (ws) => directCallRun(ws, config.extensions),
 			};
 			for (const [name, make] of Object.entries(runs)) {
 				const ws = new Workspace();
@@ -283,8 +354,14 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 		it("a failed command's output line is Pi's failed bash output line", () => {
 			expect(exact(output(codex(), "GATE_ERR"))).toBe(exact(output(pi(), "GATE_ERR")));
 		});
-		it("a failed command's exit-code line is Pi's", () => {
+		it("a failed command's exit-code line is Pi's, blank lines above it included", () => {
 			expect(exact(line(codex(), "Command exited with code 3"))).toBe(exact(line(pi(), "Command exited with code 3")));
+			expect(blanksAbove(codex(), "Command exited with code 3")).toBe(blanksAbove(pi(), "Command exited with code 3"));
+			expect(blanksAbove(pi(), "Command exited with code 3")).toBeGreaterThan(0); // Pi's bash leaves the output's trailing newline in, then a blank line, then the status
+		});
+		it("a row's vertical shape is Pi's: the blank lines above the output and above Took", () => {
+			for (const marker of ["GATE_CMD", "GATE_ERR"]) expect(blanksAbove(codex(), marker, "$ ")).toBe(blanksAbove(pi(), marker, "$ "));
+			expect(blanksAbove(codex(), "Took ")).toBe(blanksAbove(pi(), "Took "));
 		});
 		it("a long output's collapsed preview is Pi's: the earlier-lines hint and the first shown line", () => {
 			expect(exact(line(codex(), "earlier lines"))).toBe(exact(line(pi(), "earlier lines")));
@@ -308,6 +385,11 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 			const q = cap(name, "question-skipped");
 			expect(styling(line(q, "? Choice"), "? Choice")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
 			expect(styling(line(q, "Choice: Declined"), "Choice: Declined")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+		});
+		it("a codex_command called by hand refuses as Pi's failed bash row, column for column", () => {
+			const d = cap(name, "direct");
+			expect(styling(line(d, "$ echo GATE_DIRECT"), "$ echo GATE_DIRECT")).toBe(styling(line(pi(), "$ echo GATE_ERR"), "$ echo GATE_ERR; exit 3"));
+			expect(styling(line(d, "cannot be called directly"), "No active Codex turn holds this item; this tool cannot be called directly.")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
 		});
 		it("a secret question is declined whole and reads as Pi's failed bash row, column for column", () => {
 			const q = cap(name, "question-secret");

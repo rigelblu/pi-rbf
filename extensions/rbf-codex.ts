@@ -1155,8 +1155,9 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		function commandResult(itemId: string, item: Rec, output: string): ToolResult {
 			const exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
 			const status = String(item.status ?? "completed");
-			// Pi's bash appends `Command exited with code N` after a blank line (`bash.js` appendStatus); the same copy, so the row and the transcript read as Pi's.
-			const text = `${String(item.aggregatedOutput ?? output).trimEnd()}${exitCode ? `\n\nCommand exited with code ${exitCode}` : ""}`.trim();
+			// Pi's bash appends `Command exited with code N` after a blank line to the *untrimmed* output (`bash.js` appendStatus), so a
+			// trailing newline in the output becomes a second blank line in the row; the same copy and the same shape, so the row and the transcript read as Pi's.
+			const text = `${String(item.aggregatedOutput ?? output)}${exitCode ? `\n\nCommand exited with code ${exitCode}` : ""}`.trim();
 			return textResult(text || (status === "declined" ? ROW_STATUS.declined : ""), { itemId, exitCode, durationMs: item.durationMs ?? null, status }, (exitCode ?? 0) !== 0 || status === "declined" || status === "failed");
 		}
 		function patchResult(itemId: string, item: Rec, changes: PatchChangeArg[]): ToolResult {
@@ -1214,7 +1215,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		async function executeRow(kind: RowKind, itemId: string, signal: AbortSignal | undefined, onUpdate: ((partial: ToolResult) => void) | undefined, ctx: ExtensionContext): Promise<ToolResult> {
 			const turn = state.activeTurn;
 			const it = turn?.items.get(itemId);
-			if (!turn || !it) return textResult("No active Codex turn holds this item; this tool cannot be called directly.", { itemId, status: "refused" }, true);
+			// Thrown, not returned: Pi tints only a thrown error and hands the model an error result, so a model that calls this tool by hand learns at once (human check 2026-09-14: a returned `isError` drew as success).
+			if (!turn || !it) throw new RowError("No active Codex turn holds this item; this tool cannot be called directly.");
 			const onAbort = () => void turn.interrupt();
 			signal?.addEventListener("abort", onAbort, { once: true });
 			if (kind === "commandExecution") onUpdate?.(textResult("", { itemId, status: "inProgress" })); // Pi's bash row does the same, so `Elapsed` shows before any output
