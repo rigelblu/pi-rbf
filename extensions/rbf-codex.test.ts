@@ -536,18 +536,22 @@ describe("rbf-codex", () => {
 			const rc = (executionStarted = false) => ({ state: {} as Record<string, unknown>, executionStarted, invalidate: () => {} });
 			expect(cmd.renderCall({ itemId: "c1", command: "/bin/zsh -lc 'ls -la'", cwd: "/" }, fakeTheme, rc()).text).toBe("$ ls -la");
 			expect(cmd.renderCall({ itemId: "c1", command: "", cwd: "/" }, fakeTheme, rc()).text).toBe("$ (pending)");
-			const out = cmd.renderResult({ content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: false, ...rc() });
-			expect(out.text).toContain("... (2 earlier lines)");
-			expect(out.text).toContain("3\n4\n5\n6\n7");
-			expect(out.text).not.toContain("Took"); // no start time recorded: nothing to time
-			expect(cmd.renderResult({ content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} }, { expanded: true, isPartial: false }, fakeTheme, { isError: false, ...rc() }).text).toContain("1\n2\n3");
+			// The result is a container built as Pi's bash row: rendered at a width, collapsed output is the last five visual lines behind Pi's hint (with its real key styling).
+			const shown = (result: { content: { type: "text"; text: string }[]; details: Record<string, unknown> }, opts: { expanded: boolean; isPartial: boolean }, ctx: ReturnType<typeof rc>, width = 80) =>
+				cmd.renderResult(result, opts, fakeTheme, { isError: false, ...ctx }).render(width).map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()).join("\n");
+			const out = shown({ content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} }, { expanded: false, isPartial: false }, rc());
+			expect(out).toMatch(/\.\.\. \(2 earlier lines, .*to expand\)/); // the key text is empty outside a running Pi; the row gate sees `ctrl+o`
+			expect(out).toContain("3\n4\n5\n6\n7");
+			expect(out).not.toContain("Took"); // no start time recorded: nothing to time
+			expect(shown({ content: [{ type: "text", text: `${"w".repeat(100)}\n2\n3\n4\n5\n6` }], details: {} }, { expanded: false, isPartial: false }, rc())).toContain("... (2 earlier lines,"); // visual lines: the wide line wraps to two at width 80, as Pi counts
+			expect(shown({ content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} }, { expanded: true, isPartial: false }, rc())).toContain("1\n2\n3");
 			// Pi's bash row: the start time is kept in the row state once execution starts; `Elapsed` while partial, `Took` once final, and the ticking interval is cleared at the end.
 			const timed = rc(true);
 			cmd.renderCall({ itemId: "c1", command: "sleep 1", cwd: "/" }, fakeTheme, timed);
 			expect(typeof timed.state.startedAt).toBe("number");
-			expect(cmd.renderResult({ content: [], details: {} }, { expanded: false, isPartial: true }, fakeTheme, { isError: false, ...timed }).text).toMatch(/^\nElapsed \d+\.\ds$/);
+			expect(shown({ content: [], details: {} }, { expanded: false, isPartial: true }, timed)).toMatch(/^\nElapsed \d+\.\ds$/);
 			expect(timed.state.interval).toBeDefined();
-			expect(cmd.renderResult({ content: [{ type: "text", text: "done" }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: false, ...timed }).text).toMatch(/^\ndone\nTook \d+\.\ds$/);
+			expect(shown({ content: [{ type: "text", text: "done" }], details: {} }, { expanded: false, isPartial: false }, timed)).toMatch(/^\ndone\n\nTook \d+\.\ds$/); // a blank line before Took, as Pi's bash row
 			expect(timed.state.interval).toBeUndefined();
 			const patch = b.tools.get(TOOL_PATCH)!;
 			const bgs: string[] = [];

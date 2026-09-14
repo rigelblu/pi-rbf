@@ -3,15 +3,20 @@
 //
 // Why this exists: pi-10.3's human run found seven rendering defects that 586 green tests and
 // three cold reviews had passed, because the fake app-server returns whatever the extension
-// expects and no test ever looked at the bytes Pi draws. This test does. It drives Pi twice per
-// configuration: once with a scripted provider that makes Pi run its own `bash` and `edit`
-// (the reference), once with `rbf-codex` pointed at the fake app-server (the candidate), then
-// asserts the terminal bytes of matching lines are identical, or carry identical styling where the
-// text differs by design (an added file has no Pi twin; a question row has none either).
+// expects and no test ever looked at the bytes Pi draws. This test does. Per configuration it
+// launches Pi six times: once with a scripted provider that makes Pi run its own `bash` and
+// `edit` (the reference), and five times with `rbf-codex` pointed at the fake app-server (the
+// candidate: the row set, a declined command, a row Codex stopped, an answered question, a
+// declined question). It then asserts the terminal bytes of matching lines are identical, or
+// identical column for column with the text blanked where the text differs by design (an added
+// file has no Pi twin; a question row has none either).
 //
 // Runs in two configurations: bare Pi, and Pi with the daily extensions that touch rows
 // (`rbf-tool-execution-blended`, `rbf-edit-glance`), because three of the seven defects showed only
-// with the glance loaded. Skips when the local `pi` bundle or python3 is missing.
+// with the glance loaded. Limits: one theme (Pi's default dark, where `toolOutput` and `muted`
+// share a gray) and one width (100 columns); it proves rendered bytes, not token names.
+// Needs the local `pi` bundle and python3; their absence fails the first test unless
+// RBF_ROW_GATE_OPTIONAL=1 says a skip is deliberate.
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,7 +60,7 @@ function renderedLines(raw: Buffer): Buffer[] {
 	return lines;
 }
 
-/** The final redraw of the line carrying `marker`; `not` skips lines that also carry another text (a row's title repeats its command). */
+/** The final redraw of the line carrying `marker`; `not` skips lines that also carry another text (a row's title repeats its command). Markers are unique per row, so the hits are redraws of one line. */
 function line(cap: Capture, marker: string, not?: string): Buffer {
 	const hits = cap.lines.filter((l) => l.includes(marker) && !(not && l.includes(not)));
 	if (hits.length === 0) throw new Error(`no rendered line carries ${JSON.stringify(marker)}`);
@@ -67,18 +72,52 @@ const output = (cap: Capture, text: string) => line(cap, text, "$ ");
 const show = (b: Buffer) => JSON.stringify(b.toString("latin1"));
 /** Bytes with only the timing digits neutralised, so `Took 0.0s` and `Took 0.1s` compare equal. */
 const exact = (b: Buffer) => show(b).replace(/(Took|Elapsed) \d+\.\ds/, "$1 N.Ns");
-/** The escapes around a line's text, with the text and its padding removed: what a line looks like, not what it says. */
-const styling = (b: Buffer, text: string) => show(Buffer.from(b.toString("latin1").replace(text, "").replace(/ {2,}/g, " "), "latin1"));
+/** Every distinct final line carrying `marker`, for a marker that several rows share (`Took`, the glance summaries). */
+const distinct = (c: Capture, marker: string) => [...new Set(c.lines.filter((l) => l.includes(marker)).map(exact))].sort();
+/**
+ * What a line looks like, column for column, not what it says. Every escape sequence is listed with where it sits:
+ * a column from the left before the text (`L`), an offset inside it (`T`), right after it before any padding (`E`),
+ * or a column from the right edge once the padding has begun (`R`); plus the text's start column and the line's
+ * visible width. Two lines padded to the pty width with different words compare equal; an extra column anywhere
+ * (the one-column gap of pi-10.3's review row 55) or a moved escape does not.
+ */
+function styling(b: Buffer, text: string): string {
+	const s = b.toString("latin1");
+	const at = s.indexOf(text);
+	if (at === -1) throw new Error(`line does not carry ${JSON.stringify(text)}`);
+	const tokens = s.match(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|[^\x1b]/g) ?? [];
+	const escapes: { esc: string; col: number; zone: "L" | "T" | "E" | "R" }[] = [];
+	let byte = 0;
+	let col = 0;
+	let start = -1;
+	let zone: "L" | "T" | "E" | "R" = "L";
+	for (const t of tokens) {
+		if (t.startsWith("\x1b")) escapes.push({ esc: t, col, zone });
+		else {
+			if (byte === at) {
+				start = col;
+				zone = "T";
+			} else if (zone === "E") zone = "R";
+			col++;
+			if (byte + 1 === at + text.length) zone = "E";
+		}
+		byte += t.length;
+	}
+	const width = col;
+	const anchor = (e: (typeof escapes)[number]) => (e.zone === "L" ? `L${e.col}` : e.zone === "T" ? `T${e.col - start}` : e.zone === "E" ? "E" : `R${width - e.col}`);
+	return JSON.stringify({ left: start, width, escapes: escapes.map((e) => `${anchor(e)} ${JSON.stringify(e.esc)}`) }, null, 1);
+}
 
 class Workspace {
 	readonly dir = mkdtempSync(join(tmpdir(), "rbf-row-gate-"));
 	readonly work = join(this.dir, "work");
+	failed = false;
 	constructor() {
 		mkdirSync(this.work);
 		mkdirSync(join(this.dir, "agent"));
 		mkdirSync(join(this.dir, "sessions"));
 		writeFileSync(join(this.work, "gate.txt"), "GATE_OLD\n");
-		writeFileSync(join(this.work, "gate2.txt"), "GATE_OLD\n");
+		writeFileSync(join(this.work, "gate2.txt"), "GATE_CTX\n");
 	}
 	path(name: string) {
 		return join(this.work, name);
@@ -104,7 +143,10 @@ function drive(ws: Workspace, run: Run): Promise<Capture> {
 		child.stderr.on("data", (d) => (stderr += d));
 		child.on("error", reject);
 		child.on("close", (code) => {
-			if (code !== 0) return reject(new Error(`row-gate driver exited ${code}: ${stderr.trim()} (raw bytes in ${out})`));
+			if (code !== 0) {
+				ws.failed = true; // keep the raw bytes for the post-mortem
+				return reject(new Error(`row-gate driver exited ${code}: ${stderr.trim()} (raw bytes kept in ${out})`));
+			}
 			const raw = readFileSync(out);
 			resolvePromise({ raw, lines: renderedLines(raw) });
 		});
@@ -114,13 +156,17 @@ function drive(ws: Workspace, run: Run): Promise<Capture> {
 
 // ── the two sides of each pair ────────────────────────────────────────────────
 
-/** Pi's own rows: a command, a replacing edit, an appending edit, a failing command, then text. */
+/** Eight output lines, the fourth wider than the 100-column pty, so the collapsed preview and its "earlier lines" hint render. */
+const LONG_LINES = ["GATE_P1", "GATE_P2", "GATE_P3", `GATE_P4_${"w".repeat(110)}`, "GATE_P5", "GATE_P6", "GATE_P7", "GATE_P8"];
+
+/** Pi's own rows: a command, a replacing edit, an appending edit, a failing command, a long-output command, then text. */
 function piRun(ws: Workspace, extensions: string[]): Run {
 	const script = [
 		{ tool: "bash", args: { command: "echo GATE_CMD" } },
 		{ tool: "edit", args: { path: ws.path("gate.txt"), oldText: "GATE_OLD", newText: "GATE_NEW" } },
-		{ tool: "edit", args: { path: ws.path("gate2.txt"), oldText: "GATE_OLD\n", newText: "GATE_OLD\nGATE_APP\n" } },
+		{ tool: "edit", args: { path: ws.path("gate2.txt"), oldText: "GATE_CTX\n", newText: "GATE_CTX\nGATE_APP\n" } },
 		{ tool: "bash", args: { command: "echo GATE_ERR; exit 3" } },
+		{ tool: "bash", args: { command: `printf '%s\\n' ${LONG_LINES.join(" ")}` } },
 		{ text: "GATE_DONE" },
 	];
 	return { extensions: [...extensions, PROVIDER], model: "rbf-gate/gate", env: { RBF_ROW_GATE_SCRIPT: JSON.stringify(script) }, steps: [...READY_STEPS, { wait: "GATE_DONE" }] };
@@ -130,15 +176,16 @@ function codexRun(ws: Workspace, extensions: string[], scenario: FakeScenario, s
 	return { extensions: [...extensions, CODEX], model: "codex-harness/codex", env: { RBF_FAKE_SCENARIO: JSON.stringify(scenario) }, steps: [...READY_STEPS, ...steps] };
 }
 
-/** The Codex twins of the Pi rows, plus an added file, which Pi's edit row cannot produce. */
+/** The Codex twins of the Pi rows, plus an added file, which Pi's edit row cannot produce. The add carries file content as its diff, as real Codex sends it. */
 function codexRows(ws: Workspace): FakeScenario {
 	return {
 		turn: [
 			{ kind: "command", id: "c1", command: "echo GATE_CMD", cwd: ws.work, output: ["GATE_CMD\n"], exitCode: 0 },
 			{ kind: "patch", id: "p1", changes: [{ path: ws.path("gate.txt"), kind: { type: "update" }, diff: "@@ -1 +1 @@\n-GATE_OLD\n+GATE_NEW\n" }] },
-			{ kind: "patch", id: "p2", changes: [{ path: ws.path("gate2.txt"), kind: { type: "update" }, diff: "@@ -1 +1,2 @@\n GATE_OLD\n+GATE_APP\n" }] },
+			{ kind: "patch", id: "p2", changes: [{ path: ws.path("gate2.txt"), kind: { type: "update" }, diff: "@@ -1 +1,2 @@\n GATE_CTX\n+GATE_APP\n" }] },
 			{ kind: "patch", id: "p3", changes: [{ path: ws.path("gate-add.txt"), kind: { type: "add" }, diff: "GATE_ADD\n" }] },
 			{ kind: "command", id: "c2", command: "echo GATE_ERR; exit 3", cwd: ws.work, output: ["GATE_ERR\n"], exitCode: 3 },
+			{ kind: "command", id: "c3", command: `printf '%s\\n' ${LONG_LINES.join(" ")}`, cwd: ws.work, output: [`${LONG_LINES.join("\n")}\n`], exitCode: 0 },
 			{ kind: "answer", id: "a1", text: "GATE_DONE" },
 			{ kind: "complete" },
 		],
@@ -153,11 +200,24 @@ const QUESTION: FakeScenario = {
 		{ kind: "complete" },
 	],
 };
+/** A secret question is declined whole, without a dialog: the one question row that settles as an error (brief Flow #6). */
+const QUESTION_SECRET: FakeScenario = {
+	turn: [
+		{ kind: "question", id: "q1", questions: [{ id: "token", header: "Secret", question: "Paste the token", isSecret: true }] },
+		{ kind: "answer", id: "a1", text: "GATE_DONE" },
+		{ kind: "complete" },
+	],
+};
 
 const CONFIGS = [
 	{ name: "bare Pi", extensions: [] as string[] },
 	{ name: "Pi with the daily row extensions", extensions: DAILY },
 ];
+
+it("the row gate's prerequisites are present (RBF_ROW_GATE_OPTIONAL=1 makes their absence a deliberate skip)", () => {
+	if (process.env.RBF_ROW_GATE_OPTIONAL) return;
+	expect({ pi: existsSync(PI), python3: PYTHON }).toEqual({ pi: true, python3: true });
+});
 
 describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte for byte, in a real Pi under a pty", () => {
 	const workspaces: Workspace[] = [];
@@ -173,6 +233,8 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 				declined: (ws) => codexRun(ws, config.extensions, DECLINED, [{ wait: "Yes for this session" }, { key: "down" }, { key: "down" }, { key: "enter" }, { wait: "Operation aborted" }]),
 				stopped: (ws) => codexRun(ws, config.extensions, STOPPED, [{ wait: "Codex could not complete" }]),
 				question: (ws) => codexRun(ws, config.extensions, QUESTION, [{ wait: "Choose BLUE" }, { key: "down" }, { key: "enter" }, { wait: "GATE_DONE" }]),
+				"question-skipped": (ws) => codexRun(ws, config.extensions, QUESTION, [{ wait: "Choose BLUE" }, { key: "escape" }, { wait: "GATE_DONE" }]),
+				"question-secret": (ws) => codexRun(ws, config.extensions, QUESTION_SECRET, [{ wait: "GATE_DONE" }]),
 			};
 			for (const [name, make] of Object.entries(runs)) {
 				const ws = new Workspace();
@@ -184,8 +246,9 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 	}, 120_000);
 
 	afterAll(() => {
-		if (KEEP) return console.log(`row-gate captures kept:\n${workspaces.map((w) => w.dir).join("\n")}`);
-		for (const ws of workspaces) rmSync(ws.dir, { recursive: true, force: true });
+		const kept = workspaces.filter((w) => KEEP || w.failed);
+		for (const ws of workspaces) if (!kept.includes(ws)) rmSync(ws.dir, { recursive: true, force: true });
+		if (kept.length) console.log(`row-gate captures kept:\n${kept.map((w) => w.dir).join("\n")}`);
 	});
 
 	describe.each(CONFIGS)("$name", ({ name }) => {
@@ -198,17 +261,20 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 		it("a command row's output line is Pi's bash output line", () => {
 			expect(exact(output(codex(), "GATE_CMD"))).toBe(exact(output(pi(), "GATE_CMD")));
 		});
-		it("a command row's Took line is Pi's", () => {
-			expect(exact(line(codex(), "Took "))).toBe(exact(line(pi(), "Took ")));
+		it("every command row's Took line is Pi's (the succeeded and the failed row)", () => {
+			expect(distinct(codex(), "Took ")).toEqual(distinct(pi(), "Took "));
+			expect(distinct(pi(), "Took ").length).toBeGreaterThan(0);
 		});
 		it("a replacing edit's removed and added lines are Pi's edit lines, intra-line highlight included", () => {
 			expect(exact(line(codex(), "GATE_OLD"))).toBe(exact(line(pi(), "GATE_OLD")));
 			expect(exact(line(codex(), "GATE_NEW"))).toBe(exact(line(pi(), "GATE_NEW")));
+			expect(exact(line(pi(), "GATE_OLD"))).toContain("\\u001b[7m"); // the reference really carries the highlight
 		});
-		it("an appending edit's added line is Pi's", () => {
+		it("an appending edit's context and added lines are Pi's", () => {
+			expect(exact(line(codex(), "GATE_CTX"))).toBe(exact(line(pi(), "GATE_CTX")));
 			expect(exact(line(codex(), "GATE_APP"))).toBe(exact(line(pi(), "GATE_APP")));
 		});
-		it("an added file's line is styled as Pi's added line (Pi has no add row; the text differs by design)", () => {
+		it("an added file's line is styled as Pi's added line, column for column (Pi has no add row; the text differs by design)", () => {
 			expect(styling(line(codex(), "GATE_ADD"), "+1 GATE_ADD")).toBe(styling(line(pi(), "GATE_APP"), "+2 GATE_APP"));
 		});
 		it("a failed command's title is Pi's failed bash title", () => {
@@ -220,28 +286,41 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 		it("a failed command's exit-code line is Pi's", () => {
 			expect(exact(line(codex(), "Command exited with code 3"))).toBe(exact(line(pi(), "Command exited with code 3")));
 		});
-		it("a declined row reads as Pi's failed bash row", () => {
+		it("a long output's collapsed preview is Pi's: the earlier-lines hint and the first shown line", () => {
+			expect(exact(line(codex(), "earlier lines"))).toBe(exact(line(pi(), "earlier lines")));
+			expect(exact(line(codex(), "GATE_P8"))).toBe(exact(line(pi(), "GATE_P8")));
+		});
+		it("a declined command reads as Pi's failed bash row, column for column", () => {
 			const d = cap(name, "declined");
 			expect(styling(line(d, "$ echo GATE_ASK"), "$ echo GATE_ASK")).toBe(styling(line(pi(), "$ echo GATE_ERR"), "$ echo GATE_ERR; exit 3"));
 			expect(styling(line(d, "Declined"), "Declined")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
 		});
-		it("a row Codex stopped mid-way reads as Pi's failed bash row", () => {
+		it("a row Codex stopped mid-way reads as Pi's failed bash row, column for column", () => {
 			const s = cap(name, "stopped");
 			expect(styling(line(s, "Codex stopped"), "Codex stopped")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
 		});
-		it("a question row carries the bash title and output styling (Pi has no question row)", () => {
+		it("a question row carries the bash title and output styling, column for column (Pi has no question row)", () => {
 			const q = cap(name, "question");
 			expect(styling(line(q, "? Choice"), "? Choice")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
 			expect(styling(line(q, "Choice: BLUE"), "Choice: BLUE")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+		});
+		it("a question skipped with Escape completes as a row, its answer line styled as bash output (brief Flow #6: skip, not decline)", () => {
+			const q = cap(name, "question-skipped");
+			expect(styling(line(q, "? Choice"), "? Choice")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
+			expect(styling(line(q, "Choice: Declined"), "Choice: Declined")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+		});
+		it("a secret question is declined whole and reads as Pi's failed bash row, column for column", () => {
+			const q = cap(name, "question-secret");
+			expect(styling(line(q, "? Secret"), "? Secret")).toBe(styling(line(pi(), "$ echo GATE_ERR"), "$ echo GATE_ERR; exit 3"));
+			expect(styling(line(q, "Declined"), "Declined")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
 		});
 	});
 
 	it("under the glance, the edit summary lines are Pi's", () => {
 		// The glance styles the counts inside the line, so match on the label and compare every distinct summary drawn:
 		// Pi draws two (the replace, the append) and Codex three (the same two plus the add, whose summary equals the append's).
-		const summaries = (c: Capture) => [...new Set(c.lines.filter((l) => l.includes("Added ")).map(exact))].sort();
 		const name = CONFIGS[1]!.name;
-		expect(summaries(cap(name, "codex"))).toEqual(summaries(cap(name, "pi")));
-		expect(summaries(cap(name, "pi"))).toHaveLength(2);
+		expect(distinct(cap(name, "codex"), "Added ")).toEqual(distinct(cap(name, "pi"), "Added "));
+		expect(distinct(cap(name, "pi"), "Added ")).toHaveLength(2);
 	});
 });

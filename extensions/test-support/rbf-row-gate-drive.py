@@ -25,7 +25,8 @@ import termios
 import time
 
 KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04"}
-ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][A-Za-z0-9]|\x1b[=>]|\r")
+# CSI sequences; OSC sequences ended by BEL or by ST (ESC \), never spanning a later ESC; charset and keypad selects; CR.
+ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|\r")
 
 
 def strip(raw: bytes) -> bytes:
@@ -40,8 +41,13 @@ def main() -> int:
 
     pid, fd = pty.fork()
     if pid == 0:
-        os.chdir(plan["cwd"])
-        os.execvpe(plan["argv"][0], plan["argv"], env)
+        try:
+            os.chdir(plan["cwd"])
+            os.execvpe(plan["argv"][0], plan["argv"], env)
+        except BaseException as e:  # never fall through into the parent's loop with the child's fd
+            print(f"exec failed: {e}", file=sys.stderr)
+        finally:
+            os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
     raw = bytearray()

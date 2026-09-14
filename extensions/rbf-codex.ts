@@ -10,10 +10,10 @@
 // maps to one Codex thread: `rbf-codex-thread/v1` records the binding and
 // `rbf-codex-turn/v1` records each turn, so a branch that diverged gets a `thread/fork`
 // at its last turn. A turn running when Pi exits is not recovered.
-import { parseArgs, renderDiff, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import { keyHint, parseArgs, renderDiff, truncateToVisualLines, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AssistantMessage, AssistantMessageEventStream, Context, Model, RefreshModelsContext, SimpleStreamOptions, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
-import { Box, Spacer, Text } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
@@ -38,7 +38,7 @@ const SETUP_TIMEOUT_MS = 15_000;
 const INTERRUPT_WAIT_MS = 3_000;
 const STDERR_TAIL_LINES = 64;
 const COMMAND_PREVIEW_LINES = 5;
-type CommandRowState = { startedAt?: number; endedAt?: number; interval?: ReturnType<typeof setInterval> };
+type CommandRowState = { startedAt?: number; endedAt?: number; interval?: ReturnType<typeof setInterval>; preview?: { width?: number; styled?: string; visualLines?: string[]; skippedCount?: number } };
 const terminalWidth = () => Math.max(20, process.stdout.columns ?? 120);
 
 export type ThreadEntry = { threadId: string; cwd: string; sessionId: string };
@@ -1269,15 +1269,35 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 						st.interval = undefined;
 					}
 				}
+				// Built as Pi's bash row (`renderers/bash.js`, row gate 2026-09-14): every output line in `toolOutput`, a failed one too (the error
+				// tint is the row's background, never the text); collapsed, the last five *visual* lines behind Pi's "earlier lines" hint with its
+				// expand key, re-truncated when the width changes; the container is reused across renders.
+				const component = (context.lastComponent instanceof Container ? context.lastComponent : new Container()) as Container;
+				component.clear();
 				const text = resultText(result).trim();
-				const lines = text ? text.split("\n") : [];
-				const shown = opts.expanded ? lines : lines.slice(-COMMAND_PREVIEW_LINES);
-				const skipped = lines.length - shown.length;
-				// Pi's bash row keeps `toolOutput` on a failed command too; the error tint is the row's background, never the text (row gate, 2026-09-14).
-				const body = shown.map((l) => theme.fg("toolOutput", l)).join("\n");
-				const output = text ? `\n${skipped > 0 ? `${theme.fg("muted", `... (${skipped} earlier lines)`)}\n` : ""}${body}` : "";
-				const took = st.startedAt === undefined ? "" : `\n${theme.fg("muted", `${opts.isPartial ? "Elapsed" : "Took"} ${(((st.endedAt ?? Date.now()) - st.startedAt) / 1000).toFixed(1)}s`)}`;
-				return new Text(`${output}${took}`, 0, 0);
+				if (text) {
+					const styled = text.split("\n").map((l) => theme.fg("toolOutput", l)).join("\n");
+					if (opts.expanded) component.addChild(new Text(`\n${styled}`, 0, 0));
+					else {
+						const cache = (st.preview ??= {});
+						component.addChild({
+							render: (width: number) => {
+								if (cache.width !== width || cache.styled !== styled) Object.assign(cache, { width, styled, ...truncateToVisualLines(styled, COMMAND_PREVIEW_LINES, width) });
+								if (cache.skippedCount) {
+									const hint = `${theme.fg("muted", `... (${cache.skippedCount} earlier lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+									return ["", truncateToWidth(hint, width, "..."), ...cache.visualLines!];
+								}
+								return ["", ...cache.visualLines!];
+							},
+							invalidate: () => {
+								cache.width = undefined;
+							},
+						});
+					}
+				}
+				if (st.startedAt !== undefined) component.addChild(new Text(`\n${theme.fg("muted", `${opts.isPartial ? "Elapsed" : "Took"} ${(((st.endedAt ?? Date.now()) - st.startedAt) / 1000).toFixed(1)}s`)}`, 0, 0));
+				component.invalidate();
+				return component;
 			},
 		});
 		pi.registerTool({
