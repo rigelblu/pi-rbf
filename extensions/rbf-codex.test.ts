@@ -1246,6 +1246,53 @@ describe("rbf-codex", () => {
 			expect(r.next!.text).toBe("PARENT DONE");
 		});
 
+		it("a child announced only by collabAgentToolCall receiverThreadIds (a code-mode model, gpt-5.6-luna 2026-09-15) is admitted untagged, its approval opens the dialog, and a completed state in a later wait retires it", async () => {
+			scenario({
+				turn: [
+					{ kind: "collab", tool: "spawnAgent", receivers: ["T3"], states: { T3: "pendingInit" } },
+					{ kind: "collab", tool: "wait", receivers: ["T3"], states: { T3: "running" } }, // a live state keeps the thread admitted
+					{ kind: "childTurn", threadId: "T3", turnId: "T3-turn", events: [{ kind: "command", id: "c3", command: "/bin/zsh -lc 'printf ALPHA > /tmp/x'", output: ["ALPHA"], approvals: [{ when: "before", command: "/bin/zsh -lc 'printf ALPHA > /tmp/x'" }] }, { kind: "complete" }] },
+					{ kind: "collab", tool: "wait", receivers: ["T3"], states: { T3: "completed" } },
+					{ kind: "childTurn", threadId: "T3", turnId: "T3-late", events: [{ kind: "command", id: "c4", command: "/bin/zsh -lc 'echo late'", output: ["late\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'echo late'" }] }, { kind: "complete" }] },
+					{ kind: "answer", id: "m1", text: "PARENT DONE" },
+					{ kind: "complete" },
+				],
+			});
+			const b = await boot();
+			b.answers.push("Yes");
+			const r = await b.round([userMessage("delegate")]);
+			expect(r.first.toolCall!.arguments).toMatchObject({ itemId: "c3", threadId: "T3", agentPath: "" });
+			expect(b.dialogs.map((d) => d.title)).toEqual(["Codex wants to run: printf ALPHA > /tmp/x"]); // no name on the wire, so no prefix
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "ALPHA" }], isError: false });
+			expect(r.next!.toolCall).toBeUndefined(); // c4 came after the wait reported T3 completed: retired, declined
+			expect(r.next!.text).toBe("PARENT DONE");
+			expect(replies().filter((m) => m.result?.decision === "accept")).toHaveLength(1);
+			expect(replies().some((m) => m.error)).toBe(true);
+			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("approval"), "warning");
+		});
+
+		const interrupts = () => sent().filter((m) => m.method === "turn/interrupt").map((m) => m.params);
+		it("Escape reaches a collab-announced child whose turn/started beat the spawn's completion (the wire order on gpt-5.6-luna): root first, then the child, one turn/interrupt each", async () => {
+			scenario({
+				turn: [
+					{ kind: "childTurn", threadId: "T3", turnId: "T3-turn", detached: true, events: [{ kind: "sleep", ms: 30 }, { kind: "command", id: "c3", command: "/bin/zsh -lc '/bin/sleep 30'", incomplete: true }, { kind: "hang" }] },
+					{ kind: "sleep", ms: 10 },
+					{ kind: "collab", tool: "spawnAgent", receivers: ["T3"], states: { T3: "pendingInit" } },
+					{ kind: "hang" },
+				],
+			});
+			const b = await boot();
+			const first = await b.turn("delegate");
+			expect(first.toolCall!.arguments).toMatchObject({ itemId: "c3", threadId: "T3", agentPath: "" });
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
+			await vi.waitFor(() => expect(interrupts()).toHaveLength(2));
+			expect(interrupts()).toEqual([{ threadId: "thread-fake-1", turnId: "turn-fake-1" }, { threadId: "T3", turnId: "T3-turn" }]); // the turn id came from turnStarts, seen before the announcement
+		});
+
 		it("No on a child's dialog cancels that command and ends the agent's turn; the parent goes on and no turn/interrupt is sent (Flow #11)", async () => {
 			scenario({
 				turn: [

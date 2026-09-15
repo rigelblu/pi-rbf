@@ -657,7 +657,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			readonly events: ProjectedEvent[] = [];
 			cursor = 0;
 			readonly items = new Map<string, TurnItem>();
-			/** Sub-agent threads admitted by announcement (`subAgentActivity` started or interacted) and retired by `completed` or `interrupted`; never by their own `turn/completed`. */
+			/** Sub-agent threads admitted by announcement (`subAgentActivity` started or interacted, or a `collabAgentToolCall` naming the thread) and retired by `completed` or `interrupted` (or a collab state that is done); never by their own `turn/completed`. */
 			readonly children = new Map<string, ChildThread>();
 			/** `turn/started` seen on threads nobody has announced yet: read back when the announcement lands after it (the probe saw the announcement first, by 2 ms). */
 			private readonly turnStarts = new Map<string, string>();
@@ -779,6 +779,26 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				this.push({ kind: "row", itemId });
 			}
 
+			/** Admit a child thread by announcement; a re-announcement keeps its turn id and name, a `turn/started` seen earlier supplies the turn id. */
+			private admit(threadId: string, agentPath: unknown): void {
+				const known = this.children.get(threadId);
+				this.children.set(threadId, { turnId: known?.turnId ?? this.turnStarts.get(threadId) ?? null, agentPath: String(agentPath ?? known?.agentPath ?? "") });
+			}
+
+			/** A code-mode model (gpt-5.6-luna and -sol on Codex 0.154.0: the probe log `subapproval-luna.jsonl` and Tomek's sol rollouts of 2026-09-15 both spawn through `multi_agent_v1__spawn_agent` inside an `exec` script) announces a child only through `collabAgentToolCall`: `receiverThreadIds` fills on the spawn's completion, `agentsStates` reports each child's state, and no name travels. Runs on `item/started` and `item/completed`; draws nothing. */
+			private admitCollab(item: Rec): void {
+				const receivers = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [];
+				const states = item.agentsStates && typeof item.agentsStates === "object" ? (item.agentsStates as Record<string, Rec | null>) : {};
+				for (const receiver of receivers) {
+					if (typeof receiver !== "string" || receiver === this.threadId) continue;
+					const status = states[receiver]?.status;
+					if (status === "completed" || status === "errored" || status === "shutdown" || status === "notFound" || status === "interrupted") {
+						this.children.delete(receiver);
+						this.turnStarts.delete(receiver); // a re-admission carries a turn id only if a fresh turn/started arrives
+					} else this.admit(receiver, undefined);
+				}
+			}
+
 			/** Admission (Decision 2026-09-14): the root's own turn by its id (its thread until the id is known), and every announced child's thread. Anything else, a Codex-internal agent included, stays dropped. */
 			admits(m: JsonRpc, p: Rec): boolean {
 				const completedId = m.method === "turn/completed" && !!p.turn && typeof p.turn === "object" ? (p.turn as Rec).id : undefined;
@@ -823,14 +843,13 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 							describeToolCall(it, item);
 							this.openRow(id);
 						} else if (item.type === "subAgentActivity") {
-							// Admission by announcement; `collabAgentToolCall` (`wait` included) and the announcement itself draw nothing.
+							// Admission by announcement; the announcement itself draws nothing.
 							const agentThreadId = typeof item.agentThreadId === "string" ? item.agentThreadId : "";
 							if (!agentThreadId || agentThreadId === this.threadId) break;
-							if (item.kind === "started" || item.kind === "interacted") {
-								const known = this.children.get(agentThreadId);
-								this.children.set(agentThreadId, { turnId: known?.turnId ?? this.turnStarts.get(agentThreadId) ?? null, agentPath: String(item.agentPath ?? known?.agentPath ?? "") });
-							} else if (item.kind === "completed" || item.kind === "interrupted") this.children.delete(agentThreadId);
-						} else if (item.type === "agentMessage" && !child) this.phases.set(id, (item.phase as string | null) ?? null);
+							if (item.kind === "started" || item.kind === "interacted") this.admit(agentThreadId, item.agentPath);
+							else if (item.kind === "completed" || item.kind === "interrupted") this.children.delete(agentThreadId);
+						} else if (item.type === "collabAgentToolCall") this.admitCollab(item);
+						else if (item.type === "agentMessage" && !child) this.phases.set(id, (item.phase as string | null) ?? null);
 						break;
 					}
 					case "item/commandExecution/outputDelta": {
@@ -843,7 +862,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					case "item/completed": {
 						const item = rec(p.item);
 						const id = String(item.id);
-						if (item.type === "commandExecution" || item.type === "fileChange" || item.type === "mcpToolCall") {
+						if (item.type === "collabAgentToolCall") this.admitCollab(item);
+						else if (item.type === "commandExecution" || item.type === "fileChange" || item.type === "mcpToolCall") {
 							const it = this.item(id, item.type as RowKind, p.threadId);
 							if (item.type === "commandExecution") it.command ??= String(item.command ?? "");
 							if (item.type === "fileChange" && !it.changes.length) it.changes = flattenChanges(item.changes);
