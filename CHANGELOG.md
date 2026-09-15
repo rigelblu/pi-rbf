@@ -3,8 +3,13 @@ title: Changelog
 ---
 
 # 🔵⋯ [Unreleased]
+
+---
+
+# 🔵⋯ v0.21.4 (2026-09-15)
+v0.21.3 was not cut: it is reserved for `#pi-11.2`, whose human lane is still pending.
 ## 🟠⋯ Added for End Users
-- 2026-09-14 - feat (codex) | see every tool Codex calls as a Pi row: MCP servers, app connectors, and the code kernel that computer use runs through (the row shows Codex's title for the call and the JavaScript it wrote) draw like Pi's own tool rows, with the result behind Ctrl+O; when Codex wants to use an app on your Mac for the first time, Pi asks you in its own dialog with Codex's words, so computer use works through Pi (before this it was refused without a word); when Codex hands work to a sub-agent, that agent's commands, edits, and tool calls are rows prefixed with its name, its approvals ask you in Pi's dialog with the same prefix, and Escape ends the agent's turn along with yours (a command that was already running finishes on its own, as it always has) (#pi-10)
+- 2026-09-14 - feat (codex) | see every tool Codex calls as a Pi row: MCP servers, app connectors, and the code kernel that computer use runs through (the row shows Codex's title for the call and the JavaScript it wrote) draw like Pi's own tool rows, with the result behind Ctrl+O; when Codex wants to use an app on your Mac for the first time, Pi asks you in its own dialog with Codex's words, so computer use works through Pi (before this it was refused without a word); when Codex hands work to a sub-agent, that agent's commands, edits, and tool calls are rows prefixed with its name when Codex sends one (a code-mode model such as gpt-5.6-luna sends none, so those rows are untagged), its approvals ask you in Pi's dialog with the same prefix, and Escape ends the agent's turn along with yours (a command that was already running finishes on its own, as it always has) (#pi-10)
 
 ## 🟠⋯ Fixed for End Users
 - 2026-09-15 - fix (codex) | a sub-agent spawned by a code-mode model (gpt-5.6-luna and -sol run `spawn_agent` inside their `exec` script) is announced only through the `collabAgentToolCall` item, which Pi did not read, so the agent's approvals were declined with the old notice and the agent gave up; Pi now admits every thread that item names and retires it when the item reports it done (#pi-10)
