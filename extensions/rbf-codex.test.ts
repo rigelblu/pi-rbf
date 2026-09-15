@@ -8,7 +8,7 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import { Box } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TURN_ENTRY_TYPE, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, mapEffort, patchRowLine, RowError, toPreviewDiff, toProviderModel, truncateTitle } from "./rbf-codex.ts";
+import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, loneString, mapEffort, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
@@ -456,7 +456,7 @@ describe("rbf-codex", () => {
 			expect(r.first.final?.stopReason).toBe("toolUse");
 			expect(r.first.thinking).toBe("look ");
 			expect(r.first.events.map((e) => e.type).slice(-3)).toEqual(["toolcall_start", "toolcall_end", "done"]);
-			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: { itemId: "c1", command: "/bin/zsh -lc 'ls -la'", cwd: process.cwd() } });
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: { itemId: "c1", threadId: "", agentPath: "", command: "/bin/zsh -lc 'ls -la'", cwd: process.cwd() } }); // threadId and agentPath are empty for the root thread (v0.21.4)
 			expect(r.result).toMatchObject({ content: [{ type: "text", text: "a.ts\nb.ts" }], details: { itemId: "c1", exitCode: 0, status: "completed" }, isError: false });
 			expect(updates).toEqual(["", "a.ts\n", "a.ts\nb.ts\n"]); // the empty first update opens the row with `Elapsed`, as Pi's bash row does
 			expect(r.next!.final?.stopReason).toBe("stop");
@@ -477,7 +477,7 @@ describe("rbf-codex", () => {
 			scenario({ turn: [{ kind: "patch", id: "p1", changes: [{ path: "src/a.ts", kind: { type: "update", move_path: null }, diff: diffA }, { path: "src/b.ts", kind: { type: "add" }, diff: "x\ny\n" }] }, { kind: "answer", id: "m1", text: "edited" }, { kind: "complete" }] });
 			const b = await boot();
 			const r = await b.round([userMessage("edit it")]);
-			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-p1", name: TOOL_PATCH, arguments: { itemId: "p1", changes: [{ path: "src/a.ts", kind: "update", diff: " 1 line\n-2 old\n+2 new1\n+3 new2\n+4 new3" }, { path: "src/b.ts", kind: "add", diff: "+1 x\n+2 y" }] } }); // Codex sends the file content as an add's diff; Pi's rows read numbered +/- lines
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-p1", name: TOOL_PATCH, arguments: { itemId: "p1", threadId: "", agentPath: "", changes: [{ path: "src/a.ts", kind: "update", diff: " 1 line\n-2 old\n+2 new1\n+3 new2\n+4 new3" }, { path: "src/b.ts", kind: "add", diff: "+1 x\n+2 y" }] } }); // Codex sends the file content as an add's diff; Pi's rows read numbered +/- lines
 			expect(r.result).toMatchObject({ content: [{ type: "text", text: "applied 2 file(s): src/a.ts, src/b.ts" }], details: { itemId: "p1", status: "completed" }, isError: false });
 			expect(r.next!.text).toBe("edited");
 			expect(flattenChanges([{ path: "x", kind: { type: "update", move_path: "y" }, diff: "" }])).toEqual([{ path: "x", kind: "update", movePath: "y", diff: "" }]);
@@ -588,7 +588,7 @@ describe("rbf-codex", () => {
 				const b = await boot();
 				b.answers.push(answer);
 				const r = await b.round([userMessage("say hi")]);
-				expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: { itemId: "c1", command: "/bin/zsh -lc 'echo hi'", cwd: process.cwd() } });
+				expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c1", name: TOOL_COMMAND, arguments: { itemId: "c1", threadId: "", agentPath: "", command: "/bin/zsh -lc 'echo hi'", cwd: process.cwd() } });
 				expect(b.dialogs).toEqual([{ kind: "select", title: "Codex wants to run: echo hi — needs network", options: [...APPROVAL_CHOICES], signal: expect.any(AbortSignal) }]);
 				expect(replies().at(-1)?.result).toEqual({ decision }); // the log spans the three boots of this test
 				if (decision === "cancel") {
@@ -620,7 +620,7 @@ describe("rbf-codex", () => {
 			const b = await boot();
 			b.answers.push("Yes");
 			const r = await b.round([userMessage("go")]);
-			expect(r.first.toolCall?.arguments).toEqual({ itemId: "c1", command: "", cwd: process.cwd() });
+			expect(r.first.toolCall?.arguments).toEqual({ itemId: "c1", threadId: "", agentPath: "", command: "", cwd: process.cwd() });
 			expect(b.tools.get(TOOL_COMMAND)!.renderCall(r.first.toolCall!.arguments, fakeTheme, { state: {}, executionStarted: false }).text).toBe("$ (pending)");
 			expect(b.dialogs[0].title).toBe("Codex wants to run: (pending)");
 		});
@@ -640,7 +640,7 @@ describe("rbf-codex", () => {
 			const b = await boot();
 			b.answers.push("Yes");
 			const r = await b.round([userMessage("edit")]);
-			expect(r.first.toolCall?.arguments).toEqual({ itemId: "p1", changes: [] });
+			expect(r.first.toolCall?.arguments).toEqual({ itemId: "p1", threadId: "", agentPath: "", changes: [] });
 			expect(b.dialogs[0].title).toBe("Codex wants to edit files — outside the sandbox");
 			expect(r.result).toMatchObject({ content: [{ type: "text", text: "applied 1 file(s): src/a.ts" }] });
 		});
@@ -651,7 +651,7 @@ describe("rbf-codex", () => {
 			const b = await boot();
 			b.answers.push("BLUE — cool", "widget");
 			const r = await b.round([userMessage("ask me")]);
-			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-u1", name: TOOL_QUESTION, arguments: { itemId: "u1", questions } });
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-u1", name: TOOL_QUESTION, arguments: { itemId: "u1", threadId: "", agentPath: "", questions } });
 			expect(b.dialogs).toEqual([{ kind: "select", title: "Color: Which color?", options: ["RED — warm", "BLUE — cool", OTHER_CHOICE], signal: expect.any(AbortSignal) }, { kind: "input", title: "Name: Call it?", signal: expect.any(AbortSignal) }]);
 			expect(replies().at(-1)?.result).toEqual({ answers: { q1: { answers: ["BLUE"] }, q2: { answers: ["widget"] } } });
 			expect(r.result).toMatchObject({ content: [{ type: "text", text: "Color: BLUE\nName: widget" }], isError: false });
@@ -714,7 +714,7 @@ describe("rbf-codex", () => {
 			const p = b.exec(first.toolCall!, { signal: ac.signal }); // no answer queued: the dialog stays open
 			await vi.waitFor(() => expect(b.dialogs).toHaveLength(1));
 			ac.abort(); // Escape on the row: interrupt → the fake ends the turn → the dialog closes
-			await expect(p).rejects.toThrow("aborted");
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted); // v0.21.4 row text (Q24)
 			expect(b.dialogs[0].signal?.aborted).toBe(true);
 			await vi.waitFor(() => expect(replies().map((m) => m.result)).toEqual([{ decision: "decline" }]));
 		});
@@ -918,7 +918,7 @@ describe("rbf-codex", () => {
 	});
 
 	describe("abort during a row (Scenario 12)", () => {
-		it("aborting the tool's signal sends one turn/interrupt, rejects execute with aborted, and Pi's re-call with the aborted signal finishes the turn silently", async () => {
+		it("aborting the tool's signal sends one turn/interrupt, rejects execute with the cut-row text, and Pi's re-call with the aborted signal finishes the turn silently", async () => {
 			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
 			const b = await boot();
 			const first = await b.turn("go");
@@ -926,7 +926,7 @@ describe("rbf-codex", () => {
 			const p = b.exec(first.toolCall!, { signal: ac.signal });
 			await sleep(50);
 			ac.abort();
-			await expect(p).rejects.toThrow("aborted");
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted); // v0.21.4: the command was never killed, so the row says so (Q24)
 			await vi.waitFor(() => expect(methods().filter((m) => m === "turn/interrupt")).toHaveLength(1));
 			const before = sent().length;
 			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
@@ -947,7 +947,7 @@ describe("rbf-codex", () => {
 			const p = b.exec(first.toolCall!, { signal: ac.signal });
 			await sleep(50);
 			ac.abort();
-			await expect(p).rejects.toThrow("aborted");
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
 			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
 			expect(recall.final?.stopReason).toBe("aborted");
 			delete process.env.RBF_FAKE_SCENARIO;
@@ -976,6 +976,457 @@ describe("rbf-codex", () => {
 			expect(await p).toMatchObject({ isError: true });
 			const after = await s.turn([userMessage("go"), f.final!, toolResultMessage(f.toolCall!, await p)]);
 			expect(after.final?.stopReason).toBe("aborted");
+		});
+	});
+
+	describe("tool call rows (Scenario 17)", () => {
+		const replies = () => sent().filter((m) => m.id !== undefined && !m.method) as { id: number; result?: any; error?: any }[];
+		const rc = (executionStarted = false, expanded = false) => ({ state: {} as Record<string, unknown>, executionStarted, expanded, invalidate: () => {} });
+		const strip = (l: string) => l.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+		/** A theme whose styling is visible in the text, so bold and color placement can be asserted. */
+		const markTheme = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bg: (_c: string, t: string) => t, bold: (t: string) => `<b>${t}</b>` };
+		const CUA_SUBTITLE = "Allowing ChatGPT to use this app introduces new risks, including those related to prompt injection attacks, such as data theft or loss. Carefully monitor ChatGPT while it uses this app.";
+
+		it("an mcpToolCall becomes one codex_tool row carrying the root's empty thread and agent, the tool returns the joined text, and the next call attaches", async () => {
+			scenario({ turn: [{ kind: "toolCall", id: "t1", server: "bear_app", tool: "list_tags", arguments: {}, result: { content: [{ type: "text", text: '{"tags":["a","b"]}' }] } }, { kind: "answer", id: "m1", text: "two tags" }, { kind: "complete" }] });
+			const b = await boot();
+			const updates: string[] = [];
+			const r = await b.round([userMessage("list tags")], model(), { onUpdate: (p) => updates.push(p.content[0].text) });
+			expect(r.first.final?.stopReason).toBe("toolUse");
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-t1", name: TOOL_TOOL, arguments: { itemId: "t1", threadId: "", agentPath: "", server: "bear_app", tool: "list_tags", arguments: {} } });
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: '{"tags":["a","b"]}' }], details: { itemId: "t1", status: "completed", durationMs: 12 }, isError: false });
+			expect(updates).toEqual([""]); // the empty first update opens the row with `Elapsed`, as Pi's bash row does; no progress updates after it
+			expect(r.next!.text).toBe("two tags");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		it("a failed call is an error row with Codex's message; a refused computer-use call carries its sentence; empty text shows structuredContent as JSON, or nothing; progress changes nothing", async () => {
+			const cases: { ev: Record<string, unknown>; text: string; isError: boolean }[] = [
+				{ ev: { error: "server bear_app is not running" }, text: "server bear_app is not running", isError: true },
+				{ ev: { status: "failed", result: { content: [{ type: "text", text: "Computer Use was not approved to use Safari" }] } }, text: "Computer Use was not approved to use Safari", isError: true },
+				{ ev: { result: { content: [{ type: "text", text: "" }], structuredContent: { value: 42 } } }, text: '{"value":42}', isError: false },
+				{ ev: { result: { content: [{ type: "text", text: "" }] }, progress: true }, text: "", isError: false },
+				{ ev: { result: { content: [{ type: "text", text: "first" }, { type: "image", data: "x" }, { type: "text", text: "second" }], structuredContent: { ignored: true } } }, text: "first\nsecond", isError: false },
+			];
+			for (const c of cases) {
+				scenario({ turn: [{ kind: "toolCall", id: "t1", server: "node_repl", tool: "js", arguments: { code: "21*2" }, ...c.ev } as any, { kind: "answer", id: "m1", text: "42" }, { kind: "complete" }] });
+				const b = await boot();
+				const r = await b.round([userMessage("go")]);
+				expect(r.result).toMatchObject({ content: [{ type: "text", text: c.text }], isError: c.isError });
+				expect(r.next!.text).toBe("42"); // the turn goes on after a failed call; Codex decides what to do next
+			}
+		});
+
+		it("renderCall: bold server.tool as the bash title, the app's name for the server, Codex's call title in output gray, a lone code argument collapsed as output is, other arguments as one JSON line", async () => {
+			initTheme();
+			const b = await boot();
+			const tool = b.tools.get(TOOL_TOOL)!;
+			const cmd = b.tools.get(TOOL_COMMAND)!;
+			const lines = (component: any, width = 80) => component.render(width).map(strip);
+			const args = (server: string, toolName: string, a: unknown) => ({ itemId: "t1", threadId: "", agentPath: "", server, tool: toolName, arguments: a });
+			const marked = (component: any) => component.render(120).map((l: string) => l.trimEnd()); // Text pads its lines to the width
+			expect(marked(tool.renderCall(args("bear_app", "list_tags", {}), markTheme, rc()))).toEqual(["<toolTitle><b>bear_app.list_tags</b></toolTitle>", "<toolOutput>{}</toolOutput>"]);
+			expect(marked(tool.renderCall(args("cua_repl", "js", { code: "await cua.getState();", title: "Inspect current Mac UI state" }), markTheme, rc()))).toEqual(["<toolTitle><b>cua_repl.js</b></toolTitle> <toolOutput>Inspect current Mac UI state</toolOutput>", "<toolOutput>await cua.getState();</toolOutput>"]);
+			expect(lines(tool.renderCall(args("GitHub_connector", "create_issue", { title: "Bug", body: "It fails" }), fakeTheme, rc()))).toEqual(["GitHub_connector.create_issue Bug", "It fails"]); // a title argument is Codex's call title wherever it appears; what is left is judged alone, so one remaining string is lines
+			expect(lines(tool.renderCall(args("cua_repl", "js", { title: "Only a title" }), fakeTheme, rc()))).toEqual(["cua_repl.js Only a title"]); // the title was the whole call: no `{}` line under it (review 2026-09-14)
+			expect(lines(tool.renderCall(args("GitHub_connector", "create_issue", { title: "Bug", body: "It fails", labels: ["a"] }), fakeTheme, rc()))).toEqual(["GitHub_connector.create_issue Bug", '{"body":"It fails","labels":["a"]}']);
+			expect(lines(tool.renderCall(args("bear_app", "search_notes", { term: "x".repeat(120) }), fakeTheme, rc()), 40)[1]).toHaveLength(40); // one JSON line, cut to the width
+			const three = "let a = 1;\nlet b = 2;\na + b;";
+			expect(lines(tool.renderCall(args("node_repl", "js", { code: three }), fakeTheme, rc()))).toEqual(["node_repl.js", "let a = 1;", "let b = 2;", "a + b;"]); // three lines: no hint, no blank line between title and code
+			const eight = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join("\n");
+			const call = lines(tool.renderCall(args("node_repl", "js", { code: `${eight}\n` }), fakeTheme, rc()));
+			expect(call[0]).toBe("node_repl.js");
+			expect(call[1]).toMatch(/^\.\.\. \(3 earlier lines, .*to expand\)$/);
+			expect(call.slice(2)).toEqual(["line 4", "line 5", "line 6", "line 7", "line 8"]);
+			const expanded = lines(tool.renderCall(args("node_repl", "js", { code: eight }), fakeTheme, rc(false, true)));
+			expect(expanded.slice(1)).toEqual(eight.split("\n"));
+			// The code argument and a command's output are the same bytes for the same lines: both go through the one preview helper.
+			const asOutput = cmd.renderResult({ content: [{ type: "text", text: eight }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: false, ...rc() }).render(80) as string[];
+			expect(asOutput[0]).toBe(""); // bash's blank line between the title and its output; a code argument sits directly under the title
+			expect(tool.renderCall(args("node_repl", "js", { code: eight }), fakeTheme, rc()).render(80).slice(1)).toEqual(asOutput.slice(1));
+			// renderResult is the command row's function, so a tool result renders byte for byte as the same command output would.
+			const result = { content: [{ type: "text", text: "1\n2\n3\n4\n5\n6\n7" }], details: {} };
+			for (const expandedView of [false, true]) {
+				const opts = { expanded: expandedView, isPartial: false };
+				expect(tool.renderResult(result, opts, fakeTheme, { isError: false, ...rc() }).render(80)).toEqual(cmd.renderResult(result, opts, fakeTheme, { isError: false, ...rc() }).render(80));
+			}
+			// The app's name replaces the server while the turn holds the item (display only; the persisted argument keeps the server).
+			scenario({ turn: [{ kind: "toolCall", id: "t1", server: "codex_apps", tool: "create_issue", arguments: { title: "Bug" }, appContext: { connectorId: "gh", appName: "GitHub" }, incomplete: true }, { kind: "hang" }] });
+			const live = await boot();
+			const first = await live.turn("file it");
+			expect(first.toolCall!.arguments).toEqual({ itemId: "t1", threadId: "", agentPath: "", server: "codex_apps", tool: "create_issue", arguments: { title: "Bug" } });
+			expect(lines(live.tools.get(TOOL_TOOL)!.renderCall(first.toolCall!.arguments, fakeTheme, rc()))).toEqual(["GitHub.create_issue Bug"]);
+			// The timing state is bash's: `Elapsed` while partial, `Took` once final.
+			const timed = rc(true);
+			tool.renderCall(args("bear_app", "list_tags", {}), fakeTheme, timed);
+			expect(typeof timed.state.startedAt).toBe("number");
+			expect(lines(tool.renderResult({ content: [], details: {} }, { expanded: false, isPartial: true }, fakeTheme, { isError: false, ...timed })).join("\n")).toMatch(/^\nElapsed \d+\.\ds$/);
+			expect(lines(tool.renderResult({ content: [{ type: "text", text: "done" }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: false, ...timed })).join("\n")).toMatch(/^\ndone\n\nTook \d+\.\ds$/);
+			expect(splitTitle("not an object")).toEqual({ rest: "not an object" });
+			expect(loneString({ code: "" })).toBeUndefined();
+			expect(loneString(["x"])).toBeUndefined();
+		});
+
+		it("the computer-use app question during the row: Codex's message titles the select; Yes accepts, Yes for this session persists, Escape cancels and the call fails with Codex's sentence; the risk notice once per session", async () => {
+			const elicitation = { message: 'Allow Computer Use to use "Safari"?', app: "Safari", subtitle: CUA_SUBTITLE };
+			for (const [answer, reply] of [["Yes", { action: "accept", content: {} }], ["Yes for this session", { action: "accept", content: {}, _meta: { persist: "session" } }], [undefined, { action: "cancel" }]] as const) {
+				scenario({ turn: [{ kind: "toolCall", id: "t1", server: "cua_repl", tool: "js", arguments: { code: "await cua.getApp('com.apple.Safari');", title: "Open Safari" }, result: { content: [{ type: "text", text: "ok" }] }, elicitations: [elicitation] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+				const b = await boot();
+				b.answers.push(answer);
+				const r = await b.round([userMessage("read the tab")]);
+				expect(b.dialogs).toEqual([{ kind: "select", title: 'Allow Computer Use to use "Safari"?', options: [...APPROVAL_CHOICES], signal: expect.any(AbortSignal) }]);
+				expect(replies().at(-1)?.result).toEqual(reply);
+				expect(b.notify).toHaveBeenCalledWith(CUA_SUBTITLE, "warning");
+				if (answer === undefined) expect(r.result).toMatchObject({ content: [{ type: "text", text: "Computer Use was not approved to use Safari" }], isError: true });
+				else expect(r.result).toMatchObject({ content: [{ type: "text", text: "ok" }], isError: false });
+				expect(r.next!.text).toBe("done"); // cancel fails the call; the turn goes on either way
+				expect(b.notify.mock.calls.filter((c) => c[0] === CUA_SUBTITLE)).toHaveLength(1);
+			}
+			// Two app questions in one session: one risk notice; without `session` in persist the middle choice is not offered.
+			scenario({ turn: [{ kind: "toolCall", id: "t1", server: "cua_repl", tool: "js", arguments: { code: "1" }, elicitations: [elicitation] }, { kind: "toolCall", id: "t2", server: "cua_repl", tool: "js", arguments: { code: "2" }, elicitations: [{ message: 'Allow Computer Use to use "Notes"?', app: "Notes", subtitle: CUA_SUBTITLE, persist: ["always"] }] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+			const b = await boot();
+			b.answers.push("Yes", "Yes");
+			const r1 = await b.round([userMessage("go")]);
+			expect(r1.next!.toolCall!.arguments).toMatchObject({ itemId: "t2" }); // the attach call ends with the second row
+			const second = await b.exec(r1.next!.toolCall!);
+			const last = await b.turn([...r1.messages, r1.next!.final!, toolResultMessage(r1.next!.toolCall!, second)]);
+			expect(b.dialogs.map((d) => [d.title, d.options])).toEqual([['Allow Computer Use to use "Safari"?', [...APPROVAL_CHOICES]], ['Allow Computer Use to use "Notes"?', ["Yes", "No, tell Codex what to do instead"]]]);
+			expect(b.notify.mock.calls.filter((c) => c[0] === CUA_SUBTITLE)).toHaveLength(1);
+			expect(last.text).toBe("done");
+		});
+
+		it("an elicitation that is a real form, a URL prompt, or not a tool-call approval is declined with the notice; the call fails and the turn goes on", async () => {
+			for (const shape of [{ properties: { name: { type: "string" } } }, { mode: "url" }, { approvalKind: null }, { approvalKind: "other" }]) {
+				scenario({ turn: [{ kind: "toolCall", id: "t1", server: "cua_repl", tool: "js", arguments: { code: "1" }, elicitations: [{ message: "Fill this in", app: "Safari", ...shape }] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+				const b = await boot();
+				const r = await b.round([userMessage("go")]);
+				expect(b.dialogs).toEqual([]);
+				expect(replies().at(-1)?.error).toBeDefined();
+				expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("input"), "warning");
+				expect(r.result).toMatchObject({ isError: true });
+				expect(r.next!.text).toBe("done");
+			}
+			expect(isAppApproval({ mode: "form", _meta: { codex_approval_kind: "mcp_tool_call" }, requestedSchema: { type: "object" } })).toBe(true); // no `properties` at all counts as empty
+			// Print and RPC modes have no dialog: the app question is declined with the notice and the call fails with Codex's sentence (Flow #13).
+			scenario({ turn: [{ kind: "toolCall", id: "t1", server: "cua_repl", tool: "js", arguments: { code: "1" }, elicitations: [{ message: 'Allow Computer Use to use "Safari"?', app: "Safari" }] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+			const p = await boot({ mode: "print" });
+			const rp = await p.round([userMessage("go")]);
+			expect(p.dialogs).toEqual([]);
+			expect(p.notify).not.toHaveBeenCalled(); // notices are suppressed outside the TUI
+			expect(rp.result).toMatchObject({ content: [{ type: "text", text: "Computer Use was not approved to use Safari" }], isError: true });
+			expect(rp.next!.text).toBe("done");
+		});
+
+		it("an MCP server that fails to start is one warning notice per child process, naming the reason", async () => {
+			scenario({ turn: [{ kind: "startupStatus", name: "bear_app", status: "starting" }, { kind: "startupStatus", name: "bear_app", status: "failed", failureReason: "spawn bearcli ENOENT" }, { kind: "startupStatus", name: "bear_app", status: "failed", failureReason: "spawn bearcli ENOENT" }, { kind: "startupStatus", name: "node_repl", status: "failed", error: "exit 1" }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }], laterTurns: [{ kind: "startupStatus", name: "bear_app", status: "failed", failureReason: "spawn bearcli ENOENT" }, { kind: "answer", id: "m2", text: "ok" }, { kind: "complete" }] });
+			const b = await boot();
+			await b.turn("hi");
+			await b.turn("again");
+			const startFailures = b.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex MCP server"));
+			expect(startFailures).toEqual([[NOTICE.mcpStartFailed("bear_app", "spawn bearcli ENOENT"), "warning"], [NOTICE.mcpStartFailed("node_repl", "exit 1"), "warning"]]);
+		});
+	});
+
+	describe("sub-agents (Scenario 18)", () => {
+		const replies = () => sent().filter((m) => m.id !== undefined && !m.method) as { id: number; result?: any; error?: any }[];
+		const rc = () => ({ state: {} as Record<string, unknown>, executionStarted: false, expanded: false, invalidate: () => {} });
+		const markTheme = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bg: (_c: string, t: string) => t, bold: (t: string) => `<b>${t}</b>` };
+		const alpha = { kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" } as const;
+
+		it("an announced child's command is a row carrying its thread and agent, tagged with its name; its dialog is prefixed; its text and reasoning never reach the parent; an unannounced thread opens nothing and is declined", async () => {
+			scenario({
+				turn: [
+					alpha,
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", events: [{ kind: "reasoning", delta: "child thinks " }, { kind: "command", id: "c2", command: "/bin/zsh -lc 'pytest -x'", output: ["1 passed\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'pytest -x'", reason: "runs tests" }] }, { kind: "answer", id: "m2", text: "CHILD DONE" }, { kind: "complete" }] },
+					{ kind: "childTurn", threadId: "T3", turnId: "T3-turn-1", events: [{ kind: "command", id: "c3", command: "/bin/zsh -lc 'rm -rf x'", output: ["gone\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'rm -rf x'" }] }, { kind: "complete" }] },
+					{ kind: "collab" },
+					{ kind: "answer", id: "m1", text: "PARENT DONE" },
+					{ kind: "complete" },
+				],
+			});
+			const b = await boot();
+			b.answers.push("Yes");
+			const r = await b.round([userMessage("delegate")]);
+			expect(r.first.toolCall).toEqual({ type: "toolCall", id: "codex-c2", name: TOOL_COMMAND, arguments: { itemId: "c2", threadId: "T2", agentPath: "/root/alpha", command: "/bin/zsh -lc 'pytest -x'", cwd: process.cwd() } });
+			expect(r.first.thinking).toBe(""); // the child's reasoning is not the parent's
+			expect(b.dialogs).toEqual([{ kind: "select", title: "alpha: Codex wants to run: pytest -x — runs tests", options: [...APPROVAL_CHOICES], signal: expect.any(AbortSignal) }]);
+			expect(replies().filter((m) => m.result?.decision === "accept")).toHaveLength(1); // the child's own request id, answered once
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "1 passed" }], isError: false });
+			expect(r.next!.toolCall).toBeUndefined(); // T3 was never announced: no row
+			expect(r.next!.text).toBe("PARENT DONE");
+			expect(r.next!.thinking).toBe("");
+			expect(replies().some((m) => m.error)).toBe(true); // T3's approval was declined with a JSON-RPC error
+			expect(b.notify).toHaveBeenCalledWith(NOTICE.declined("approval"), "warning");
+			// The row wears the agent's name as a muted tag before the unchanged bold title; the patch, question, and tool rows the same, one tag per line.
+			initTheme(); // the patch row's renderDiff reads the active theme
+			const cmd = b.tools.get(TOOL_COMMAND)!;
+			expect(cmd.renderCall(r.first.toolCall!.arguments, markTheme, rc()).render(120)[0].trimEnd()).toBe("<muted>alpha </muted><toolTitle><b>$ pytest -x</b></toolTitle>");
+			expect(cmd.renderCall({ ...r.first.toolCall!.arguments, agentPath: "" }, markTheme, rc()).render(120)[0].trimEnd()).toBe("<toolTitle><b>$ pytest -x</b></toolTitle>");
+			const beta = { itemId: "x", threadId: "T9", agentPath: "/root/beta" };
+			expect(b.tools.get(TOOL_PATCH)!.renderCall({ ...beta, changes: [{ path: "a.ts", kind: "update", diff: "+1 x" }, { path: "b.ts", kind: "add", diff: "+1 y" }] }, markTheme, rc()).children[0].text).toBe("<muted>beta </muted><toolTitle><b>edit a.ts (+1 −0)</b></toolTitle>\n<muted>beta </muted><toolTitle><b>write b.ts (+1 −0)</b></toolTitle>");
+			expect(b.tools.get(TOOL_QUESTION)!.renderCall({ ...beta, questions: [{ id: "q", header: "Color", question: "Which?" }] }, markTheme, rc()).text).toBe("<muted>beta </muted><toolTitle><b>? Color</b></toolTitle>");
+			expect(b.tools.get(TOOL_TOOL)!.renderCall({ ...beta, server: "bear_app", tool: "list_tags", arguments: {} }, markTheme, rc()).render(120)[0].trimEnd()).toBe("<muted>beta </muted><toolTitle><b>bear_app.list_tags</b></toolTitle>");
+		});
+
+		it("a child's turn ending settles its open row as aborted and keeps the thread; interacted re-drives it on a new turn; completed retires it; an announcement after the root's end is ignored", async () => {
+			scenario({
+				turn: [
+					alpha,
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-a", events: [{ kind: "command", id: "c3", command: "/bin/zsh -lc 'sleep 5'", incomplete: true }, { kind: "complete", status: "interrupted" }] },
+					{ kind: "subAgent", activity: "interacted", agentThreadId: "T2", agentPath: "/root/alpha" },
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-b", events: [{ kind: "command", id: "c4", command: "/bin/zsh -lc 'echo again'", output: ["again\n"] }, { kind: "complete" }] },
+					{ kind: "subAgent", activity: "completed", agentThreadId: "T2", agentPath: "/root/alpha" },
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-c", events: [{ kind: "command", id: "c5", command: "/bin/zsh -lc 'echo late'", output: ["late\n"] }, { kind: "complete" }] },
+					{ kind: "answer", id: "m1", text: "PARENT DONE" },
+					{ kind: "complete", after: [{ kind: "subAgent", activity: "started", agentThreadId: "T9", agentPath: "/root/ghost" }] },
+				],
+				laterTurns: [{ kind: "answer", id: "m9", text: "SECOND" }, { kind: "complete" }],
+			});
+			const b = await boot();
+			const r1 = await b.round([userMessage("delegate")]);
+			expect(r1.first.toolCall!.arguments).toMatchObject({ itemId: "c3", threadId: "T2", agentPath: "/root/alpha" });
+			expect(r1.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.aborted }], isError: true }); // T2's turn ended while c3 was open
+			expect(r1.next!.toolCall!.arguments).toMatchObject({ itemId: "c4", threadId: "T2", agentPath: "/root/alpha" }); // the thread was never retired: the re-drive's row opens
+			const second = await b.exec(r1.next!.toolCall!);
+			expect(second).toMatchObject({ content: [{ type: "text", text: "again" }], isError: false });
+			const last = await b.turn([...r1.messages, r1.next!.final!, toolResultMessage(r1.next!.toolCall!, second)]);
+			expect(last.toolCall).toBeUndefined(); // c5 came after `completed` retired T2
+			expect(last.text).toBe("PARENT DONE");
+			await sleep(60); // the ghost announcement after turn/completed lands on nothing
+			expect((await b.turn("next")).text).toBe("SECOND");
+		});
+
+		it("with the root's own row executing, a child's approval opens its dialog from that execute at once; two pending requests answer in arrival order; the children's rows open next, already complete", async () => {
+			scenario({
+				turn: [
+					{ kind: "command", id: "c1", command: "/bin/zsh -lc 'sleep 3'", incomplete: true },
+					alpha,
+					{ kind: "subAgent", activity: "started", agentThreadId: "T3", agentPath: "/root/beta" },
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-turn", detached: true, events: [{ kind: "command", id: "c2", command: "/bin/zsh -lc 'echo A'", output: ["A\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'echo A'", reason: "alpha asks" }] }, { kind: "complete" }] },
+					{ kind: "childTurn", threadId: "T3", turnId: "T3-turn", detached: true, events: [{ kind: "command", id: "c3", command: "/bin/zsh -lc 'echo B'", output: ["B\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'echo B'", reason: "beta asks" }] }, { kind: "complete" }] },
+					{ kind: "awaitReplies", count: 2 },
+					{ kind: "finishCommand", id: "c1", command: "/bin/zsh -lc 'sleep 3'", aggregatedOutput: "slept\n" },
+					{ kind: "answer", id: "m1", text: "PARENT DONE" },
+					{ kind: "complete" },
+				],
+			});
+			const b = await boot();
+			b.answers.push("Yes", "Yes");
+			const r1 = await b.round([userMessage("delegate")]);
+			expect(r1.first.toolCall!.arguments).toMatchObject({ itemId: "c1", threadId: "", agentPath: "" });
+			expect(b.dialogs.map((d) => d.title)).toEqual(["alpha: Codex wants to run: echo A — alpha asks", "beta: Codex wants to run: echo B — beta asks"]);
+			expect(replies().filter((m) => m.result?.decision === "accept")).toHaveLength(2);
+			expect(r1.result).toMatchObject({ content: [{ type: "text", text: "slept" }], isError: false }); // the root's row completed after both answers
+			expect(r1.next!.toolCall!.arguments).toMatchObject({ itemId: "c2", threadId: "T2", agentPath: "/root/alpha" });
+			const a = await b.exec(r1.next!.toolCall!);
+			expect(a).toMatchObject({ content: [{ type: "text", text: "A" }], isError: false }); // already complete when its row opened
+			expect(b.dialogs).toHaveLength(2); // no second dialog for an answered request
+			const third = await b.turn([...r1.messages, r1.next!.final!, toolResultMessage(r1.next!.toolCall!, a)]);
+			expect(third.toolCall!.arguments).toMatchObject({ itemId: "c3", threadId: "T3", agentPath: "/root/beta" });
+			expect(await b.exec(third.toolCall!)).toMatchObject({ content: [{ type: "text", text: "B" }] });
+			const last = await b.turn([...r1.messages, r1.next!.final!, toolResultMessage(r1.next!.toolCall!, a), third.final!, toolResultMessage(third.toolCall!, await b.exec(third.toolCall!))]);
+			expect(last.text).toBe("PARENT DONE");
+		});
+
+		it("a child's turn/started before its announcement still gives the child its turn id and its rows (announcement order, Known Unknown 2026-09-14)", async () => {
+			scenario({
+				turn: [
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-early", detached: true, events: [{ kind: "sleep", ms: 60 }, { kind: "command", id: "c2", command: "/bin/zsh -lc 'echo early'", output: ["early\n"] }, { kind: "complete" }] },
+					{ kind: "sleep", ms: 20 },
+					alpha,
+					{ kind: "sleep", ms: 120 },
+					{ kind: "answer", id: "m1", text: "PARENT DONE" },
+					{ kind: "complete" },
+				],
+			});
+			const b = await boot();
+			const r = await b.round([userMessage("delegate")]);
+			expect(r.first.toolCall!.arguments).toMatchObject({ itemId: "c2", threadId: "T2", agentPath: "/root/alpha" });
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: "early" }] });
+			expect(r.next!.text).toBe("PARENT DONE");
+		});
+
+		it("No on a child's dialog cancels that command and ends the agent's turn; the parent goes on and no turn/interrupt is sent (Flow #11)", async () => {
+			scenario({
+				turn: [
+					alpha,
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-turn", events: [{ kind: "command", id: "c2", command: "/bin/zsh -lc 'rm -rf dist'", output: ["gone\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'rm -rf dist'", reason: "clean" }] }, { kind: "answer", id: "m2", text: "CHILD DONE" }, { kind: "complete" }] },
+					{ kind: "answer", id: "m1", text: "PARENT DECIDES" },
+					{ kind: "complete" },
+				],
+			});
+			const b = await boot();
+			b.answers.push(undefined); // Escape
+			const r = await b.round([userMessage("delegate")]);
+			expect(b.dialogs[0].title).toBe("alpha: Codex wants to run: rm -rf dist — clean");
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+			expect(r.next!.text).toBe("PARENT DECIDES");
+			expect(r.next!.final?.stopReason).toBe("stop"); // the child's turn ended interrupted; the root's did not
+			expect(methods().filter((m) => m === "turn/interrupt")).toHaveLength(0);
+		});
+
+		it("a child's patch approval and question open the same prefixed dialogs and tagged rows as the parent's", async () => {
+			const diff = "--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-old\n+new\n";
+			scenario({
+				turn: [
+					alpha,
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-turn", events: [{ kind: "patch", id: "p2", changes: [{ path: "/abs/x.ts", kind: { type: "update" }, diff }], approvals: [{ when: "after", reason: "outside the sandbox" }] }, { kind: "question", id: "u2", questions: [{ id: "q1", header: "Color", question: "Which?", options: [{ label: "RED", description: "warm" }] }] }, { kind: "complete" }] },
+					{ kind: "answer", id: "m1", text: "PARENT DONE" },
+					{ kind: "complete" },
+				],
+			});
+			const b = await boot();
+			b.answers.push("Yes", "RED — warm");
+			const r1 = await b.round([userMessage("delegate")]);
+			expect(r1.first.toolCall!.arguments).toMatchObject({ itemId: "p2", threadId: "T2", agentPath: "/root/alpha" });
+			expect(b.dialogs[0].title).toBe("alpha: Codex wants to edit: /abs/x.ts (+1 −1) — outside the sandbox");
+			expect(r1.result).toMatchObject({ isError: false });
+			expect(r1.next!.toolCall!.arguments).toMatchObject({ itemId: "u2", threadId: "T2", agentPath: "/root/alpha" });
+			const answered = await b.exec(r1.next!.toolCall!);
+			expect(b.dialogs[1].title).toBe("alpha: Color: Which?");
+			expect(answered).toMatchObject({ content: [{ type: "text", text: "Color: RED" }] });
+			const last = await b.turn([...r1.messages, r1.next!.final!, toolResultMessage(r1.next!.toolCall!, answered)]);
+			expect(last.text).toBe("PARENT DONE");
+		});
+	});
+
+	describe("abort with a sub-agent (Scenario 19)", () => {
+		const interrupts = () => sent().filter((m) => m.method === "turn/interrupt").map((m) => m.params);
+
+		it("Escape on a child's row interrupts the root, then every announced child with a turn id, one each, in order; a child without a turn/started gets none; the row text says the command still runs", async () => {
+			scenario({
+				turn: [
+					{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+					{ kind: "subAgent", activity: "started", agentThreadId: "T4", agentPath: "/root/gamma" },
+					{ kind: "childTurn", threadId: "T2", turnId: "T2-turn", detached: true, events: [{ kind: "command", id: "c2", command: "/bin/zsh -lc '/bin/sleep 30'", incomplete: true }, { kind: "hang" }] },
+					{ kind: "hang" },
+				],
+			});
+			const b = await boot();
+			const first = await b.turn("delegate");
+			expect(first.toolCall!.arguments).toMatchObject({ itemId: "c2", threadId: "T2", agentPath: "/root/alpha" });
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
+			await vi.waitFor(() => expect(interrupts()).toHaveLength(2));
+			expect(interrupts()).toEqual([{ threadId: "thread-fake-1", turnId: "turn-fake-1" }, { threadId: "T2", turnId: "T2-turn" }]); // the root first, then the child; gamma never started a turn
+			const recall = await b.turn([userMessage("delegate"), first.final!], model(), { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
+			expect(interrupts()).toHaveLength(2); // still one each after the re-call
+		});
+
+		it("a cut command's completion arriving after the turn ended raises exactly one notice and no row; one that never arrives raises none; a command that had ended before Escape raises none", async () => {
+			scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "finishCommand", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", exitCode: 0, aggregatedOutput: "" }, { kind: "finishCommand", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", exitCode: 0 }] });
+			const b = await boot();
+			const first = await b.turn("wait");
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
+			const recall = await b.turn([userMessage("wait"), first.final!], model(), { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			expect(recall.toolCall).toBeUndefined();
+			await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(NOTICE.finishedAfterCancel(0, "/bin/sleep 30"), "info"));
+			await sleep(120); // the duplicate completion the fake sends next raises nothing
+			expect(b.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex's command finished"))).toHaveLength(1);
+			expect(b.tools.get(TOOL_COMMAND)!.renderResult({ content: [{ type: "text", text: ROW_STATUS.aborted }], details: {} }, { expanded: false, isPartial: false }, fakeTheme, { isError: true, state: {}, invalidate: () => {} }).render(80).map((l: string) => l.trimEnd())).toEqual(["", ROW_STATUS.aborted]);
+
+			// Never completes before the child closes: no notice.
+			scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", incomplete: true }, { kind: "hang" }] });
+			const s = await boot();
+			const f = await s.turn("wait");
+			const ac2 = new AbortController();
+			const p2 = s.exec(f.toolCall!, { signal: ac2.signal });
+			await sleep(50);
+			ac2.abort();
+			await expect(p2).rejects.toThrow(ROW_STATUS.aborted);
+			await s.turn([userMessage("wait"), f.final!], model(), { signal: ac2.signal });
+			await s.shutdown();
+			await sleep(100);
+			expect(s.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex's command finished"))).toHaveLength(0);
+
+			// The command ended before Escape (its row returned); a completion echoed later is nobody's cut command.
+			scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo done'", output: ["done\n"] }, { kind: "hang" }], afterInterrupt: [{ kind: "finishCommand", id: "c1", command: "/bin/zsh -lc 'echo done'", exitCode: 0 }] });
+			const e = await boot();
+			const f3 = await e.turn("go");
+			const done = await e.exec(f3.toolCall!);
+			expect(done).toMatchObject({ content: [{ type: "text", text: "done" }] });
+			const ac3 = new AbortController();
+			const tail = e.turn([userMessage("go"), f3.final!, toolResultMessage(f3.toolCall!, done)], model(), { signal: ac3.signal });
+			await sleep(50);
+			ac3.abort();
+			expect((await tail).final?.stopReason).toBe("aborted");
+			await sleep(150);
+			expect(e.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex's command finished"))).toHaveLength(0);
+		});
+	});
+
+	describe("abort with a sub-agent (Scenario 19), review folds 2026-09-14", () => {
+		it("a command row cut by its turn ending under it (a refused request on another item) reads the same and arms the same notice", async () => {
+			scenario({
+				turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", incomplete: true }, { kind: "command", id: "c2", command: "/bin/zsh -lc 'rm -rf dist'", approvals: [{ when: "before", command: "/bin/zsh -lc 'rm -rf dist'" }] }, { kind: "hang" }],
+				afterInterrupt: [{ kind: "finishCommand", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", exitCode: 0 }],
+			});
+			const b = await boot();
+			b.answers.push(undefined); // No on c2's dialog, opened from c1's execute
+			const r = await b.round([userMessage("go")]);
+			expect(r.first.toolCall!.arguments).toMatchObject({ itemId: "c1" });
+			expect(b.dialogs[0].title).toBe("Codex wants to run: rm -rf dist");
+			expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.aborted }], isError: true }); // the turn ended interrupted while c1 still ran
+			expect(r.next!.toolCall!.arguments).toMatchObject({ itemId: "c2" }); // the refused request's own row is its trace
+			const declined = await b.exec(r.next!.toolCall!);
+			expect(declined).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+			const last = await b.turn([...r.messages, r.next!.final!, toolResultMessage(r.next!.toolCall!, declined)]);
+			expect(last.final?.stopReason).toBe("aborted");
+			await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(NOTICE.finishedAfterCancel(0, "/bin/sleep 30"), "info"));
+			expect(b.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex's command finished"))).toHaveLength(1);
+		});
+
+		it("Escape on a tool call row or a question row reads Cancelled, without a command that could still run", async () => {
+			scenario({ turn: [{ kind: "toolCall", id: "t1", server: "cua_repl", tool: "js", arguments: { code: "await cua.getState();" }, incomplete: true }, { kind: "hang" }] });
+			const b = await boot();
+			const first = await b.turn("go");
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(/^Cancelled$/);
+			await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
+			expect(b.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex's command finished"))).toHaveLength(0);
+
+			scenario({ turn: [{ kind: "question", id: "u1", questions: [{ id: "q", header: "Color", question: "Which?", options: [{ label: "RED", description: "warm" }] }] }, { kind: "hang" }] }); // a select waits for Escape; the harness's input returns at once
+			const q = await boot();
+			const f = await q.turn("ask");
+			const ac2 = new AbortController();
+			const pq = q.exec(f.toolCall!, { signal: ac2.signal }); // no answer queued: the dialog stays open until Escape on the row
+			await vi.waitFor(() => expect(q.dialogs).toHaveLength(1));
+			ac2.abort();
+			await expect(pq).rejects.toThrow(/^Cancelled$/); // not `Color: Declined`: Escape cut the row, whatever the closed dialog answered
+		});
+
+		it("a cut command's completion landing while the next turn still waits for its id opens no phantom row", async () => {
+			scenario({
+				turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", incomplete: true }, { kind: "hang" }],
+				afterInterrupt: [{ kind: "sleep", ms: 120 }, { kind: "finishCommand", id: "c1", command: "/bin/zsh -lc '/bin/sleep 30'", exitCode: 0 }],
+				laterTurns: [{ kind: "answer", id: "m2", text: "SECOND" }, { kind: "complete" }],
+				turnStartDelayMs: 300,
+			});
+			const b = await boot();
+			const first = await b.turn("go");
+			const ac = new AbortController();
+			const p = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
+			await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
+			const next = await b.turn("next"); // turn/start answered 300 ms later; c1's completion lands in between
+			expect(next.toolCall).toBeUndefined();
+			expect(next.text).toBe("SECOND");
+			expect(b.notify.mock.calls.filter((c) => String(c[0]).startsWith("Codex's command finished"))).toHaveLength(1);
 		});
 	});
 

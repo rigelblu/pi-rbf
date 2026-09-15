@@ -13,6 +13,11 @@
 // blanked where the text differs by design (an added file has no Pi twin; a question row has
 // none either), and that the blank rows between a row's lines match.
 //
+// v0.21.4 adds, per configuration: a run of tool call rows (`codex_tool`: a text result, a code
+// argument, a failed call) with a sub-agent's tagged command rows, a Codex command row cut by
+// Escape, and Pi's own bash row cut by Escape as its reference; the tag is stripped and the
+// width ignored before a tagged title is compared.
+//
 // Runs in two configurations: bare Pi, and Pi with the daily extensions that touch rows
 // (`rbf-tool-execution-blended`, `rbf-edit-glance`), because three of the seven defects showed only
 // with the glance loaded. Limits: one theme (Pi's default dark, where `toolOutput` and `muted`
@@ -134,6 +139,16 @@ function blanksAbove(cap: Capture, marker: string, not?: string): number {
 }
 
 const show = (b: Buffer) => JSON.stringify(b.toString("latin1"));
+const ESCAPES = /\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+/** The visible text of a screen row. */
+const text = (b: Buffer) => b.toString("latin1").replace(ESCAPES, "").trimEnd();
+/** The `... (N earlier lines,` a collapsed row's hint carries, with its own count, so two hints of different counts compare by styling. */
+function hint(cap: Capture): { line: Buffer; text: string } {
+	const l = line(cap, "earlier lines");
+	const m = /\.\.\. \(\d+ earlier lines,/.exec(text(l));
+	if (!m) throw new Error(`no hint in ${show(l)}`);
+	return { line: l, text: m[0] };
+}
 /** Bytes with only the timing digits neutralised, so `Took 0.0s` and `Took 0.1s` compare equal. */
 const exact = (b: Buffer) => show(b).replace(/(Took|Elapsed) \d+\.\ds/, "$1 N.Ns");
 /** Every distinct final line carrying `marker`, for a marker that several rows share (`Took`, the glance summaries). */
@@ -171,6 +186,19 @@ function styling(b: Buffer, text: string): string {
 	const anchor = (e: (typeof escapes)[number]) => (e.zone === "L" ? `L${e.col}` : e.zone === "T" ? `T${e.col - start}` : e.zone === "E" ? "E" : `R${width - e.col}`);
 	return JSON.stringify({ left: start, width, escapes: escapes.map((e) => `${anchor(e)} ${JSON.stringify(e.esc)}`) }, null, 1);
 }
+
+/**
+ * A sub-agent's title line without its tag: the muted escape, the name, the space, and the escape closing it (Decision 2026-09-14: one
+ * `muted` escape, the text, one space, then the unchanged title). What is left compares against Pi's untagged title with the width ignored,
+ * because the visible line is that many columns shorter and its padding shorter with it.
+ */
+function untagged(b: Buffer, name: string): Buffer {
+	const s = b.toString("latin1");
+	const m = new RegExp(`^((?:\\x1b\\[[0-9;]*m)* ?(?:\\x1b\\[[0-9;]*m)*)\\x1b\\[[0-9;]*m${name} (?:\\x1b\\[[0-9;]*m)?`).exec(s); // the row shell's one padding column may precede the tag
+	if (!m) throw new Error(`line does not start with the tag ${JSON.stringify(name)}: ${show(b)}`);
+	return Buffer.from(m[1]! + s.slice(m[0].length), "latin1");
+}
+const stylingNoWidth = (b: Buffer, t: string) => styling(b, t).replace(/\n "width": \d+,/, "");
 
 class Workspace {
 	readonly dir = mkdtempSync(join(tmpdir(), "rbf-row-gate-"));
@@ -222,6 +250,11 @@ function drive(ws: Workspace, run: Run): Promise<Capture> {
 
 /** Eight output lines, the fourth wider than the 100-column pty, so the collapsed preview and its "earlier lines" hint render. */
 const LONG_LINES = ["GATE_P1", "GATE_P2", "GATE_P3", `GATE_P4_${"w".repeat(110)}`, "GATE_P5", "GATE_P6", "GATE_P7", "GATE_P8"];
+/** Commands whose titles fill the row's 98 content columns exactly (the shell pads one column each side of the 100-column pty): `$ echo <91>` for Pi, `alpha $ echo <85>` for the tagged child row. Pi wraps a title at words, so a longer one moves whole to a second row. */
+const FULL_PI = `echo GATE_FULL_${"p".repeat(76)}`;
+const FULL_CHILD = `echo GATE_FULL_${"c".repeat(70)}`;
+/** Six result lines: one more than the collapsed preview shows, so the hint renders with a count of one. */
+const TOOL_LINES = ["GATE_T1", "GATE_T2", "GATE_T3", "GATE_T4", "GATE_T5", "GATE_T6"];
 
 /** Pi's own rows: a command, a replacing edit, an appending edit, a failing command, a long-output command, then text. */
 function piRun(ws: Workspace, extensions: string[]): Run {
@@ -231,14 +264,21 @@ function piRun(ws: Workspace, extensions: string[]): Run {
 		{ tool: "edit", args: { path: ws.path("gate2.txt"), oldText: "GATE_CTX\n", newText: "GATE_CTX\nGATE_APP\n" } },
 		{ tool: "bash", args: { command: "echo GATE_ERR; exit 3" } },
 		{ tool: "bash", args: { command: `printf '%s\\n' ${LONG_LINES.join(" ")}` } },
+		{ tool: "bash", args: { command: FULL_PI } },
 		{ text: "GATE_DONE" },
 	];
 	return { extensions: [...extensions, PROVIDER], model: "rbf-gate/gate", env: { RBF_ROW_GATE_SCRIPT: JSON.stringify(script) }, steps: [...READY_STEPS, { wait: "GATE_DONE" }] };
 }
 
+/** Pi's own bash row cut by Escape while its command runs: the reference for a Codex row cut the same way (the text differs by design; Pi's bash killed its process, Codex keeps it). */
+function piCutRun(_ws: Workspace, extensions: string[]): Run {
+	const script = [{ tool: "bash", args: { command: "echo GATE_SLEEP; sleep 30" } }, { text: "GATE_DONE" }];
+	return { extensions: [...extensions, PROVIDER], model: "rbf-gate/gate", env: { RBF_ROW_GATE_SCRIPT: JSON.stringify(script) }, steps: [...READY_STEPS, { wait: "Elapsed" }, { key: "escape" }, { wait: "abort" }, { sleep: 0.6 }] };
+}
+
 /** A model calling `codex_command` by hand (Pi's `registerTool` is global, so every model sees it): the row must refuse as an error. */
 function directCallRun(ws: Workspace, extensions: string[]): Run {
-	const script = [{ tool: "codex_command", args: { itemId: "by-hand", command: "echo GATE_DIRECT", cwd: ws.work } }, { text: "GATE_DONE" }];
+	const script = [{ tool: "codex_command", args: { itemId: "by-hand", threadId: "", agentPath: "", command: "echo GATE_DIRECT", cwd: ws.work } }, { text: "GATE_DONE" }];
 	return { extensions: [...extensions, CODEX, PROVIDER], model: "rbf-gate/gate", env: { RBF_ROW_GATE_SCRIPT: JSON.stringify(script) }, steps: [...READY_STEPS, { wait: "GATE_DONE" }] };
 }
 
@@ -261,6 +301,22 @@ function codexRows(ws: Workspace): FakeScenario {
 		],
 	};
 }
+/** v0.21.4: three tool call rows (a text result, a code argument, a failed call), then a sub-agent's two command rows, one of them a full-width title. */
+function toolRows(ws: Workspace): FakeScenario {
+	return {
+		turn: [
+			{ kind: "toolCall", id: "t1", server: "bear_app", tool: "list_tags", arguments: {}, result: { content: [{ type: "text", text: `${TOOL_LINES.join("\n")}\n` }] } },
+			{ kind: "toolCall", id: "t2", server: "node_repl", tool: "js", arguments: { code: "GATE_J1\nGATE_J2\nGATE_J3" } },
+			{ kind: "toolCall", id: "t3", server: "bear_app", tool: "fail", arguments: {}, error: "GATE_TOOL_FAIL" },
+			{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+			{ kind: "childTurn", threadId: "T2", turnId: "T2-turn", events: [{ kind: "command", id: "cc", command: "echo GATE_CMD", cwd: ws.work, output: ["GATE_CMD\n"], exitCode: 0 }, { kind: "command", id: "cf", command: FULL_CHILD, cwd: ws.work, output: ["GATE_FULL\n"], exitCode: 0 }, { kind: "complete" }] },
+			{ kind: "answer", id: "a1", text: "GATE_DONE" },
+			{ kind: "complete" },
+		],
+	};
+}
+/** A Codex command row cut by Escape while the fake holds its item open: the row reads the honest v0.21.4 text and takes the styling Pi gives its own cut row. */
+const CUT: FakeScenario = { turn: [{ kind: "command", id: "c1", command: "echo GATE_SLEEP; sleep 30", output: ["GATE_SLEEP\n"], incomplete: true }, { kind: "hang" }] };
 const DECLINED: FakeScenario = { turn: [{ kind: "command", id: "c1", command: "echo GATE_ASK", output: ["GATE_ASK\n"], approvals: [{ when: "before", command: "echo GATE_ASK", reason: "needs a nod" }] }, { kind: "answer", id: "a1", text: "GATE_DONE" }, { kind: "complete" }] };
 const STOPPED: FakeScenario = { turn: [{ kind: "command", id: "c1", command: "echo GATE_HANG", incomplete: true }, { kind: "complete", status: "failed", errorMessage: "boom" }] };
 const QUESTION: FakeScenario = {
@@ -299,7 +355,10 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 		for (const config of CONFIGS) {
 			const runs: Record<string, (ws: Workspace) => Run> = {
 				pi: (ws) => piRun(ws, config.extensions),
+				"pi-cut": (ws) => piCutRun(ws, config.extensions),
 				codex: (ws) => codexRun(ws, config.extensions, codexRows(ws), [{ wait: "GATE_DONE" }]),
+				tools: (ws) => codexRun(ws, config.extensions, toolRows(ws), [{ wait: "GATE_DONE" }]),
+				cut: (ws) => codexRun(ws, config.extensions, CUT, [{ wait: "Elapsed" }, { key: "escape" }, { wait: "still running in Codex" }, { sleep: 0.6 }]),
 				declined: (ws) => codexRun(ws, config.extensions, DECLINED, [{ wait: "Yes for this session" }, { key: "down" }, { key: "down" }, { key: "enter" }, { wait: "Operation aborted" }]),
 				stopped: (ws) => codexRun(ws, config.extensions, STOPPED, [{ wait: "Codex could not complete" }]),
 				question: (ws) => codexRun(ws, config.extensions, QUESTION, [{ wait: "Choose BLUE" }, { key: "down" }, { key: "enter" }, { wait: "GATE_DONE" }]),
@@ -395,6 +454,54 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 			const q = cap(name, "question-secret");
 			expect(styling(line(q, "? Secret"), "? Secret")).toBe(styling(line(pi(), "$ echo GATE_ERR"), "$ echo GATE_ERR; exit 3"));
 			expect(styling(line(q, "Declined"), "Declined")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
+		});
+
+		// v0.21.4 (Scenario 20)
+		const tools = () => cap(name, "tools");
+		it("a tool call row's title is styled as Pi's bash title, its result lines as bash output, its hint and blank line as Pi's collapsed preview", () => {
+			expect(styling(line(tools(), "bear_app.list_tags"), "bear_app.list_tags")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
+			expect(styling(output(tools(), "GATE_T6"), "GATE_T6")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+			const [t, p] = [hint(tools()), hint(pi())];
+			expect(t.text).toBe("... (1 earlier lines,");
+			expect(styling(t.line, t.text)).toBe(styling(p.line, p.text));
+			expect(blanksAbove(tools(), "earlier lines")).toBe(blanksAbove(pi(), "earlier lines"));
+			expect(blanksAbove(tools(), "GATE_T2")).toBe(0); // the first shown line sits right under the hint
+		});
+		it("a code argument's lines sit directly under a bold title, styled as bash output, with no hint for three lines", () => {
+			expect(styling(line(tools(), "node_repl.js"), "node_repl.js")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
+			for (const marker of ["GATE_J1", "GATE_J2", "GATE_J3"]) expect(styling(line(tools(), marker), marker)).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+			expect(blanksAbove(tools(), "GATE_J1")).toBe(0);
+		});
+		it("a failed tool call row reads as Pi's failed bash row, column for column", () => {
+			expect(styling(line(tools(), "bear_app.fail"), "bear_app.fail")).toBe(styling(line(pi(), "$ echo GATE_ERR"), "$ echo GATE_ERR; exit 3"));
+			expect(styling(line(tools(), "GATE_TOOL_FAIL"), "GATE_TOOL_FAIL")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
+		});
+		it("a sub-agent's command row is Pi's bash row byte for byte below the title; the title, tag stripped, is Pi's title with the width ignored", () => {
+			expect(exact(output(tools(), "GATE_CMD"))).toBe(exact(output(pi(), "GATE_CMD")));
+			expect(blanksAbove(tools(), "GATE_CMD", "$ ")).toBe(blanksAbove(pi(), "GATE_CMD", "$ "));
+			expect(distinct(tools(), "Took ")).toEqual(distinct(pi(), "Took "));
+			const title = line(tools(), "$ echo GATE_CMD");
+			expect(text(title).trim()).toBe("alpha $ echo GATE_CMD");
+			expect(stylingNoWidth(untagged(title, "alpha"), "$ echo GATE_CMD")).toBe(stylingNoWidth(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
+		});
+		it("a tagged title that fills the pty is styled as Pi's full-width title, tag stripped", () => {
+			const [title, piTitle] = [line(tools(), "$ echo GATE_FULL_ccc"), line(pi(), "$ echo GATE_FULL_ppp")]; // the `$ ` keeps the echo's own output line out
+			expect(text(title).trim()).toBe(`alpha $ ${FULL_CHILD}`); // one row, not wrapped
+			expect(text(piTitle).trim()).toBe(`$ ${FULL_PI}`);
+			expect(text(title).length).toBe(text(piTitle).length);
+			expect(stylingNoWidth(untagged(title, "alpha"), `$ ${FULL_CHILD}`)).toBe(stylingNoWidth(piTitle, `$ ${FULL_PI}`));
+		});
+		it("a command row cut by Escape reads as Pi's own cut bash row, column for column, with the honest text", () => {
+			const [c, p] = [cap(name, "cut"), cap(name, "pi-cut")];
+			const piCut = p.lines.find((l) => /abort/i.test(text(l)) && !text(l).includes("$ "));
+			expect(piCut).toBeDefined();
+			expect(styling(line(c, "$ echo GATE_SLEEP"), "$ echo GATE_SLEEP; sleep 30")).toBe(styling(line(p, "$ echo GATE_SLEEP"), "$ echo GATE_SLEEP; sleep 30"));
+			expect(text(piCut!).trim()).toBe("Command aborted"); // Pi's bash keeps the output so far and appends its status after a blank line, as it does an exit code
+			expect(exact(output(c, "GATE_SLEEP"))).toBe(exact(output(p, "GATE_SLEEP")));
+			expect(styling(line(c, "still running in Codex"), "Cancelled; command still running in Codex")).toBe(styling(piCut!, "Command aborted"));
+			expect(blanksAbove(c, "still running in Codex")).toBe(blanksAbove(p, "Command aborted"));
+			expect(blanksAbove(p, "Command aborted")).toBe(2); // the output's trailing newline, then the blank line before the status
+			expect(distinct(c, "Took ")).toEqual(distinct(p, "Took "));
 		});
 	});
 

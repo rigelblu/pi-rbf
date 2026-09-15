@@ -4,6 +4,10 @@ title: Changelog
 
 # 🔵⋯ [Unreleased]
 ## 🟠⋯ Added for End Users
+- 2026-09-14 - feat (codex) | see every tool Codex calls as a Pi row: MCP servers, app connectors, and the code kernel that computer use runs through (the row shows Codex's title for the call and the JavaScript it wrote) draw like Pi's own tool rows, with the result behind Ctrl+O; when Codex wants to use an app on your Mac for the first time, Pi asks you in its own dialog with Codex's words, so computer use works through Pi (before this it was refused without a word); when Codex hands work to a sub-agent, that agent's commands, edits, and tool calls are rows prefixed with its name, its approvals ask you in Pi's dialog with the same prefix, and Escape ends the agent's turn along with yours (a command that was already running finishes on its own, as it always has) (#pi-10)
+
+## 🟠⋯ Fixed for End Users
+- 2026-09-14 - fix (ux) | a Codex row cut by Escape reads `Cancelled; command still running in Codex` instead of `Command aborted` (the command was never killed, in v0.21.1 either), Pi tells you once when such a command finishes, and a Codex MCP server that fails to start is named once in a notice (#pi-10)
 
 ---
 
