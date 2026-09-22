@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, Text } from "@earendil-works/pi-tui";
+import { Key, matchesKey, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -259,11 +259,135 @@ export function renderActiveChip(theme: any, label: string): string {
 	return `\x1b[7m\x1b[1m ${label} \x1b[0m`;
 }
 
+// ─── Word-wrap helpers ───────────────────────────────────────────────────────
+
+const cjkBreakRegex = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u;
+
+function isWhitespaceChar(char: string): boolean {
+	return /\s/.test(char);
+}
+
+const PASTE_MARKER_SINGLE = /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/;
+
+function isPasteMarker(segment: string): boolean {
+	return segment.length >= 10 && PASTE_MARKER_SINGLE.test(segment);
+}
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+export interface TextChunk {
+	text: string;
+	startIndex: number;
+	endIndex: number;
+}
+
+/**
+ * Split a line into word-wrapped chunks.
+ * Wraps at word boundaries when possible, falling back to character-level
+ * wrapping for words longer than the available width.
+ * Ported from @earendil-works/pi-tui/dist/components/editor.js.
+ */
+export function wordWrapLine(
+	line: string,
+	maxWidth: number,
+	preSegmented?: Intl.SegmentData[],
+): TextChunk[] {
+	if (!line || maxWidth <= 0) {
+		return [{ text: "", startIndex: 0, endIndex: 0 }];
+	}
+	const lineWidth = visibleWidth(line);
+	if (lineWidth <= maxWidth) {
+		return [{ text: line, startIndex: 0, endIndex: line.length }];
+	}
+	const chunks: TextChunk[] = [];
+	const segments: Intl.SegmentData[] = preSegmented ?? [...graphemeSegmenter.segment(line)];
+	let currentWidth = 0;
+	let chunkStart = 0;
+	let wrapOppIndex = -1;
+	let wrapOppWidth = 0;
+
+	for (let i = 0; i < segments.length; i++) {
+		const seg = segments[i];
+		const grapheme = seg.segment;
+		const gWidth = visibleWidth(grapheme);
+		const charIndex = seg.index;
+		const isWs = !isPasteMarker(grapheme) && isWhitespaceChar(grapheme);
+
+		if (currentWidth + gWidth > maxWidth) {
+			if (wrapOppIndex >= 0 && currentWidth - wrapOppWidth + gWidth <= maxWidth) {
+				chunks.push({
+					text: line.slice(chunkStart, wrapOppIndex),
+					startIndex: chunkStart,
+					endIndex: wrapOppIndex,
+				});
+				chunkStart = wrapOppIndex;
+				currentWidth -= wrapOppWidth;
+			} else if (chunkStart < charIndex) {
+				chunks.push({
+					text: line.slice(chunkStart, charIndex),
+					startIndex: chunkStart,
+					endIndex: charIndex,
+				});
+				chunkStart = charIndex;
+				currentWidth = 0;
+			}
+			wrapOppIndex = -1;
+		}
+
+		if (gWidth > maxWidth) {
+			const subChunks = wordWrapLine(grapheme, maxWidth);
+			for (let j = 0; j < subChunks.length - 1; j++) {
+				const sc = subChunks[j];
+				chunks.push({
+					text: sc.text,
+					startIndex: charIndex + sc.startIndex,
+					endIndex: charIndex + sc.endIndex,
+				});
+			}
+			const last = subChunks[subChunks.length - 1];
+			chunkStart = charIndex + last.startIndex;
+			currentWidth = visibleWidth(last.text);
+			wrapOppIndex = -1;
+			continue;
+		}
+
+		currentWidth += gWidth;
+
+		const next = segments[i + 1];
+		if (isWs && next && (isPasteMarker(next.segment) || !isWhitespaceChar(next.segment))) {
+			wrapOppIndex = next.index;
+			wrapOppWidth = currentWidth;
+		} else if (!isWs && next && !isWhitespaceChar(next.segment)) {
+			const isCjk = !isPasteMarker(grapheme) && cjkBreakRegex.test(grapheme);
+			const nextIsCjk = !isPasteMarker(next.segment) && cjkBreakRegex.test(next.segment);
+			if (isCjk || nextIsCjk) {
+				wrapOppIndex = next.index;
+				wrapOppWidth = currentWidth;
+			}
+		}
+	}
+
+	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
+	return chunks;
+}
+
+function styleDim(theme: any, text: string): string {
+	if (typeof theme?.fg === "function") {
+		try {
+			return theme.fg("dim", text);
+		} catch {
+			// fallback
+		}
+	}
+	return text;
+}
+
 // ─── Component Rendering ────────────────────────────────────────────────────
 
 export function renderQuestionFormLines(state: QuestionFormState, width: number): string[] {
 	const { chips, selectedChipIndex, focus, notesText, notesCursorPos, theme } = state;
 	const renderWidth = Math.max(20, width);
+	const maxWidth = renderWidth - 3;
 	const lines: string[] = [];
 
 	// Top border (theme border color)
@@ -271,7 +395,7 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	const borderDashCount = Math.max(0, renderWidth - title.length - 1);
 	lines.push(styleBorder(theme, "─" + title + "─".repeat(borderDashCount)));
 
-	// Chips row
+	// Chips row (truncated at right edge)
 	const chipRenders = chips.map((chip, idx) => {
 		const isSelected = idx === selectedChipIndex;
 		if (isSelected) {
@@ -279,34 +403,193 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 		}
 		return theme?.fg ? theme.fg("muted", `[ ${chip.label} ]`) : `[ ${chip.label} ]`;
 	});
-	lines.push(`  ${chipRenders.join("   ")}`);
+	lines.push(truncateToWidth(`  ${chipRenders.join("   ")}`, renderWidth));
 	lines.push("");
 
 	// Notes field
 	const isWriteIn = chips[selectedChipIndex]?.type === "write-in";
-	const notesLabel = isWriteIn ? "  Write in your answer: " : "  Add notes to selection: ";
-	if (focus === "notes") {
-		const beforeCursor = notesText.slice(0, notesCursorPos);
-		const atCursor = notesText.slice(notesCursorPos, notesCursorPos + 1) || " ";
-		const afterCursor = notesText.slice(notesCursorPos + 1);
-		const cursorChar = `\x1b[7m${atCursor}\x1b[0m`;
-		const requiredHint = isWriteIn && !notesText ? (theme?.fg ? theme.fg("dim", " (required)") : " (required)") : "";
-		lines.push(styleBorder(theme, notesLabel) + beforeCursor + cursorChar + afterCursor + requiredHint);
+	const label = isWriteIn ? "Write in your answer: " : "Add notes to selection: ";
+
+	if (!notesText) {
+		if (focus === "notes") {
+			// Empty focused: label + cursor blank + ` (required)` (write-in) or label + cursor blank (notes)
+			const requiredSuffix = isWriteIn ? " (required)" : "";
+			const plainStr = label + " " + requiredSuffix;
+			const cursorIndex = label.length;
+			const chunks = wordWrapLine(plainStr, maxWidth);
+
+			for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+				const chunk = chunks[chunkIndex];
+				const isLastChunk = chunkIndex === chunks.length - 1;
+
+				const labelChars = Math.max(0, Math.min(chunk.text.length, label.length - chunk.startIndex));
+				const labelPart = chunk.text.slice(0, labelChars);
+				const remainder = chunk.text.slice(labelChars);
+
+				const hasCursor = isLastChunk
+					? cursorIndex >= chunk.startIndex
+					: cursorIndex >= chunk.startIndex && cursorIndex < chunk.endIndex;
+
+				if (hasCursor) {
+					const adjustedPos = Math.max(0, Math.min(chunk.text.length, cursorIndex - chunk.startIndex));
+					const remainderCursorPos = Math.max(0, Math.min(remainder.length, adjustedPos - labelChars));
+					const beforeCursor = remainder.slice(0, remainderCursorPos);
+					const afterCursor = remainder.slice(remainderCursorPos);
+					const cursorBlank = "\x1b[7m \x1b[0m";
+					const hintPart = afterCursor.slice(1);
+					const styledHint = hintPart ? styleDim(theme, hintPart) : "";
+					const styledRemainder = beforeCursor + cursorBlank + styledHint;
+					const styledLabel = labelPart ? styleBorder(theme, labelPart) : "";
+					lines.push("  " + styledLabel + styledRemainder);
+				} else {
+					if (chunk.startIndex >= cursorIndex) {
+						lines.push("  " + styleDim(theme, chunk.text));
+					} else {
+						lines.push("  " + styleBorder(theme, chunk.text));
+					}
+				}
+			}
+		} else {
+			// Empty unfocused: label + placeholder in dim, no cursor
+			const placeholder = isWriteIn ? "(required, press Tab or ↓ to type)" : "(optional, press Tab or ↓ to type)";
+			const plainStr = label + placeholder;
+			const chunks = wordWrapLine(plainStr, maxWidth);
+
+			for (const chunk of chunks) {
+				const labelChars = Math.max(0, Math.min(chunk.text.length, label.length - chunk.startIndex));
+				const labelPart = chunk.text.slice(0, labelChars);
+				const placeholderPart = chunk.text.slice(labelChars);
+				const styledLabel = labelPart ? styleBorder(theme, labelPart) : "";
+				const styledPlaceholder = placeholderPart ? styleDim(theme, placeholderPart) : "";
+				lines.push("  " + styledLabel + styledPlaceholder);
+			}
+		}
 	} else {
-		const placeholder = isWriteIn ? "(required, press Tab or ↓ to type)" : "(optional, press Tab or ↓ to type)";
-		const displayNotes = notesText
-			? (theme?.fg ? theme.fg("text", notesText) : notesText)
-			: (theme?.fg ? theme.fg("dim", placeholder) : placeholder);
-		lines.push(styleBorder(theme, notesLabel) + displayNotes);
+		// Non-empty field: wrap per explicit logical line
+		const logicalLines = notesText.split("\n");
+		let cursorLine = -1;
+		let cursorCol = -1;
+
+		if (focus === "notes") {
+			const clampedCursorPos = Math.max(0, Math.min(notesText.length, notesCursorPos));
+			let lineStart = 0;
+			for (let i = 0; i < logicalLines.length; i++) {
+				const lineLen = logicalLines[i].length;
+				const isLastLine = i === logicalLines.length - 1;
+				const lineEnd = lineStart + lineLen;
+				if (isLastLine) {
+					if (clampedCursorPos >= lineStart && clampedCursorPos <= lineEnd) {
+						cursorLine = i;
+						cursorCol = clampedCursorPos - lineStart;
+						break;
+					}
+				} else {
+					if (clampedCursorPos >= lineStart && clampedCursorPos < lineEnd) {
+						cursorLine = i;
+						cursorCol = clampedCursorPos - lineStart;
+						break;
+					}
+					if (clampedCursorPos === lineEnd) {
+						cursorLine = i;
+						cursorCol = lineLen;
+						break;
+					}
+				}
+				lineStart = lineEnd + 1;
+			}
+		}
+
+		for (let i = 0; i < logicalLines.length; i++) {
+			const isCurrentLine = i === cursorLine;
+			const isFirstLine = i === 0;
+			const lineLabel = isFirstLine ? label : "";
+			const rawLine = lineLabel + logicalLines[i];
+			const lineLabelLen = lineLabel.length;
+			const effectiveCursorPos = isCurrentLine ? lineLabelLen + cursorCol : -1;
+
+			if (rawLine === "") {
+				// Empty logical line (e.g. \n\n)
+				if (isCurrentLine) {
+					lines.push("  \x1b[7m \x1b[0m");
+				} else {
+					lines.push("  ");
+				}
+				continue;
+			}
+
+			const chunks = wordWrapLine(rawLine, maxWidth);
+
+			for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+				const chunk = chunks[chunkIndex];
+				const isLastChunk = chunkIndex === chunks.length - 1;
+
+				let hasCursorInChunk = false;
+				let adjustedCursorPos = 0;
+
+				if (isCurrentLine && effectiveCursorPos >= 0) {
+					if (isLastChunk) {
+						hasCursorInChunk = effectiveCursorPos >= chunk.startIndex;
+						adjustedCursorPos = effectiveCursorPos - chunk.startIndex;
+					} else {
+						hasCursorInChunk = effectiveCursorPos >= chunk.startIndex && effectiveCursorPos < chunk.endIndex;
+						if (hasCursorInChunk) {
+							adjustedCursorPos = effectiveCursorPos - chunk.startIndex;
+							if (adjustedCursorPos > chunk.text.length) {
+								adjustedCursorPos = chunk.text.length;
+							}
+						}
+					}
+				}
+
+				const labelChars = Math.max(0, Math.min(chunk.text.length, lineLabelLen - chunk.startIndex));
+				const labelPart = chunk.text.slice(0, labelChars);
+				const answerPart = chunk.text.slice(labelChars);
+
+				let styledAnswer = "";
+				if (hasCursorInChunk) {
+					const answerCursorPos = Math.max(0, adjustedCursorPos - labelChars);
+					const beforeCursor = answerPart.slice(0, answerCursorPos);
+					const afterCursor = answerPart.slice(answerCursorPos);
+					const graphemes = [...graphemeSegmenter.segment(answerPart)];
+					// The cursor moves by code unit, so it can sit inside a grapheme;
+					// wrap the whole containing grapheme, never a tail half.
+					const containing = graphemes.find(
+						(g) => answerCursorPos >= g.index && answerCursorPos < g.index + g.segment.length,
+					);
+					if (containing) {
+						styledAnswer =
+							answerPart.slice(0, containing.index) +
+							`\x1b[7m${containing.segment}\x1b[0m` +
+							answerPart.slice(containing.index + containing.segment.length);
+					} else {
+						styledAnswer = answerPart + "\x1b[7m \x1b[0m";
+					}
+				} else {
+					if (focus === "options" && typeof theme?.fg === "function") {
+						try {
+							styledAnswer = theme.fg("text", answerPart);
+						} catch {
+							styledAnswer = answerPart;
+						}
+					} else {
+						styledAnswer = answerPart;
+					}
+				}
+
+				const styledLabel = labelPart ? styleBorder(theme, labelPart) : "";
+				lines.push("  " + styledLabel + styledAnswer);
+			}
+		}
 	}
 
 	lines.push("");
 
-	// Hint line
+	// Hint line (truncated at right edge)
 	const hint = isWriteIn
 		? "  [Type answer] · [Enter] submit · [Esc] dismiss · [Tab/↑] back to options"
 		: "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
-	lines.push(theme?.fg ? theme.fg("dim", hint) : hint);
+	const styledHint = theme?.fg ? theme.fg("dim", hint) : hint;
+	lines.push(truncateToWidth(styledHint, renderWidth));
 
 	// Bottom border (theme border color)
 	lines.push(styleBorder(theme, "─".repeat(renderWidth)));
