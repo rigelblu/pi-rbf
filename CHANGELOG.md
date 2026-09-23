@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.21.5 (2026-09-23)
+## 🟠⋯ Fixed for End Users
+- 2026-09-23 - fix (ux) | long write-in answers in the question form no longer overflow the terminal pane — or crash it outright at widths under 74 columns: the form now wraps label and answer word-wise inside the border (like Pi's own editor), the cursor stays at its logical position across wraps and resizes, chips and hints clip at the right edge instead of throwing, and the submitted answer arrives byte-exact (#pi-19.3) [@pi]
+
+---
+
 # 🔵⋯ v0.21.4 (2026-09-15)
 v0.21.3 was not cut: it is reserved for `#pi-11.2`, whose human lane is still pending.
 ## 🟠⋯ Added for End Users
