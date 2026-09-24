@@ -347,6 +347,7 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 - Dark Background & Light Text: The active selection chip is highlighted with a prominent dark background and bold bright white text.
 - Additional Notes Input: Embedded `Add notes to selection:` field allows typing extra instructions or modifications to append to the chosen option before submitting.
 - Write-in Option: Dedicated write-in option as the last numbered option (`N+1`). Selecting it auto-focuses the notes field so any custom text can be submitted directly. Long answers wrap word-wise inside the pane (like Pi's own editor), with a constant one-column cursor reservation, an inverse cursor that covers the whole grapheme at the insertion point, and chips/hints that clip at the right edge — the submitted text is always byte-exact.
+- Terminal Paste: Pasting into the write-in or notes field (from chips or field focus) inserts clipboard text at the cursor, preserves internal blank lines, and removes terminal control characters before rendering or submission.
 - Canned Reply: Quick chip `[ C. /convo-is-very-best ]` (or pressing `c` / `C`) immediately selects `/skill:convo-is-very-best` (with optional notes).
 - Accidental ESC Recovery: If dismissed with `Esc`, the options are cached. Typing `/answer-question`, or pressing `Ctrl+Q`, re-opens the selector instantly.
 - Keyboard Navigation:

@@ -6,6 +6,18 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.21.7 (2026-09-26)
+## 🟠⋯ 🔒 Security Fixes for End Users
+- 2026-09-26 - fix | pasted terminal control characters no longer reach the terminal through the question form before submission; normal text, internal blank lines, and the submitted answer remain intact (#pi-19.4) [@pi]
+
+---
+
+# 🔵⋯ v0.21.6 (2026-09-23)
+## 🟠⋯ Fixed for End Users
+- 2026-09-23 - fix | pasting into the question form's write-in or notes field now works: the custom form silently dropped the terminal's bracketed-paste event before, so a paste had no effect at all; pasted text now inserts at the cursor, CRLF and lone CR normalize to newlines, internal blank lines survive to the submitted answer, and pasting while the option chips have focus moves focus into the answer field (#pi-19.4) [@pi]
+
+---
+
 # 🔵⋯ v0.21.5 (2026-09-23)
 ## 🟠⋯ Fixed for End Users
 - 2026-09-23 - fix (ux) | long write-in answers in the question form no longer overflow the terminal pane — or crash it outright at widths under 74 columns: the form now wraps label and answer word-wise inside the border (like Pi's own editor), the cursor stays at its logical position across wraps and resizes, chips and hints clip at the right edge instead of throwing, and the submitted answer arrives byte-exact (#pi-19.3) [@pi]
