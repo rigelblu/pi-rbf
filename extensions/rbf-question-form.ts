@@ -599,6 +599,10 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 
 // ─── Component Factory ──────────────────────────────────────────────────────
 
+function stripTerminalControls(text: string): string {
+	return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+}
+
 export function createQuestionFormComponent(
 	options: NormalizedOption[],
 	tui: TUI,
@@ -616,6 +620,18 @@ export function createQuestionFormComponent(
 	};
 
 	function handleInput(data: string): void {
+		// Bracketed paste: completed wrapped event from Pi TUI's Terminal
+		const PASTE_START = "\x1b[200~";
+		const PASTE_END = "\x1b[201~";
+		if (data.startsWith(PASTE_START) && data.endsWith(PASTE_END)) {
+			const payload = stripTerminalControls(data.slice(PASTE_START.length, -PASTE_END.length).replace(/\r\n|\r/g, "\n"));
+			state.notesText = state.notesText.slice(0, state.notesCursorPos) + payload + state.notesText.slice(state.notesCursorPos);
+			state.notesCursorPos += payload.length;
+			state.focus = "notes";
+			tui.requestRender();
+			return;
+		}
+
 		// Escape handling
 		if (data === "\x1b" || matchesKey(data, Key.escape)) {
 			if (state.focus === "notes" && state.notesText.length > 0) {
@@ -742,7 +758,7 @@ export function createQuestionFormComponent(
 			}
 
 			// Printable character
-			if (data.length === 1 && data >= " ") {
+			if (data.length === 1 && data >= " " && stripTerminalControls(data) === data) {
 				state.notesText = state.notesText.slice(0, state.notesCursorPos) + data + state.notesText.slice(state.notesCursorPos);
 				state.notesCursorPos++;
 				tui.requestRender();
@@ -751,7 +767,7 @@ export function createQuestionFormComponent(
 
 			// Multi-char text (paste)
 			if (data.length > 1 && !data.startsWith("\x1b")) {
-				const clean = data.replace(/\r?\n/g, " ");
+				const clean = stripTerminalControls(data.replace(/\r\n?|\n/g, " "));
 				state.notesText = state.notesText.slice(0, state.notesCursorPos) + clean + state.notesText.slice(state.notesCursorPos);
 				state.notesCursorPos += clean.length;
 				tui.requestRender();

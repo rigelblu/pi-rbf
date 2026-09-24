@@ -1285,3 +1285,494 @@ describe("Scenario 15: Editing and submission preserve the logical answer", () =
 		expect(done.mock.calls[0][0]).not.toContain("\n");
 	});
 });
+
+// ─── Scenario 10: Completed bracketed paste inserts once at the cursor ──────
+
+describe("Scenario 10: Completed bracketed paste inserts once at the cursor", () => {
+	const mockTheme: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+
+	function createComponent() {
+		const options = [
+			{ index: 0, label: "Alpha", fullText: "1. Alpha" },
+			{ index: 1, label: "Beta", fullText: "2. Beta" },
+		];
+		const tui = { requestRender: vi.fn() };
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
+		return { comp, tui, done };
+	}
+
+	function wrapPaste(payload: string): string {
+		return `\x1b[200~${payload}\x1b[201~`;
+	}
+
+	it("paste at start of existing notes", () => {
+		const { comp, done } = createComponent();
+		// Select write-in, type "abcd", move cursor to start
+		comp.handleInput("3");
+		for (const ch of "abcd") comp.handleInput(ch);
+		comp.handleInput("\x1b[H"); // Home
+
+		comp.handleInput(wrapPaste("PASTE"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("PASTEabcd");
+	});
+
+	it("paste at middle of existing notes", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		for (const ch of "abcd") comp.handleInput(ch);
+		// Cursor at 4 (end), move left twice → cursor at 2 (between b and c)
+		comp.handleInput("\x1b[D");
+		comp.handleInput("\x1b[D");
+
+		comp.handleInput(wrapPaste("PASTE"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("abPASTEcd");
+	});
+
+	it("paste at end of existing notes", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		for (const ch of "abcd") comp.handleInput(ch);
+
+		comp.handleInput(wrapPaste("PASTE"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("abcdPASTE");
+	});
+
+	it("cursor lands immediately after the payload", () => {
+		const { comp } = createComponent();
+		comp.handleInput("3");
+		for (const ch of "abcd") comp.handleInput(ch);
+		comp.handleInput("\x1b[H"); // Home
+
+		comp.handleInput(wrapPaste("XY"));
+		// Cursor should be at 2, so typing 'Z' inserts between payload and original
+		comp.handleInput("Z");
+		comp.handleInput("\x1b[F"); // End
+		const lines = comp.render(80);
+		const flat = lines.map((l: string) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+		expect(flat).toContain("XYZabcd");
+	});
+
+	it("cursor advances by the normalized payload length, not the raw one", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		for (const ch of "abcd") comp.handleInput(ch);
+		comp.handleInput("\x1b[D");
+		comp.handleInput("\x1b[D");
+
+		comp.handleInput(wrapPaste("first\r\nsecond"));
+		comp.handleInput("Z");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("abfirst\nsecondZcd");
+	});
+
+	it("markers never appear in state or submission", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("hello"));
+
+		// Check render doesn't contain markers
+		const lines = comp.render(80);
+		const flat = lines.join("\n");
+		expect(flat).not.toContain("200~");
+		expect(flat).not.toContain("201~");
+
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("hello");
+		expect(done.mock.calls[0][0]).not.toContain("200~");
+		expect(done.mock.calls[0][0]).not.toContain("201~");
+	});
+
+	it("CRLF normalizes to LF", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("first\r\nsecond"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("first\nsecond");
+	});
+
+	it("lone CR normalizes to LF", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("first\rsecond"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("first\nsecond");
+	});
+
+	it("internal blank lines are preserved", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("first\n\nthird"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("first\n\nthird");
+	});
+
+	it("paste into empty write-in", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("pasted text"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("pasted text");
+	});
+
+	it("paste while focus is on options moves focus to notes", () => {
+		const { comp, done } = createComponent();
+		// Chip 1 is selected and focus stays on the chips row
+		comp.handleInput(wrapPaste("pasted"));
+
+		// Left and printable input must edit notes, not navigate the chips.
+		comp.handleInput("\x1b[D");
+		comp.handleInput("Z");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("1. Alpha\n\npasteZd");
+	});
+});
+
+// ─── Scenario 11: Pi TUI owns raw split chunks and post-paste input ─────────
+
+describe("Scenario 11: Pi TUI owns raw split chunks and post-paste input", () => {
+	it("StdinBuffer emits one paste payload from split chunks, then normal data", async () => {
+		const { StdinBuffer } = await import("@earendil-works/pi-tui");
+		const buf = new StdinBuffer({ timeout: 50, escapeTimeout: 10 });
+
+		const pastePayloads: string[] = [];
+		const dataPayloads: string[] = [];
+
+		buf.on("paste", (content: string) => pastePayloads.push(content));
+		buf.on("data", (content: string) => dataPayloads.push(content));
+
+		// Simulate raw chunks arriving in three pieces
+		buf.process("\x1b[200~first\r\n");
+		buf.process("second");
+		buf.process("\x1b[201~X");
+
+		// One paste payload with the raw content (no wrappers)
+		expect(pastePayloads).toHaveLength(1);
+		expect(pastePayloads[0]).toBe("first\r\nsecond");
+
+		// Normal data follows
+		expect(dataPayloads).toContain("X");
+
+		buf.destroy();
+	});
+
+	it("form receives the paste through the real ProcessTerminal boundary, then handles X normally", async () => {
+		const { ProcessTerminal } = await import("@earendil-works/pi-tui");
+
+		const mockTheme: any = {
+			fg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		};
+		const options = [
+			{ index: 0, label: "Alpha", fullText: "1. Alpha" },
+			{ index: 1, label: "Beta", fullText: "2. Beta" },
+		];
+		const tui = { requestRender: vi.fn() };
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
+
+		// Select write-in so paste goes into notes
+		comp.handleInput("3");
+
+		// Drive the real boundary: Terminal re-wraps StdinBuffer paste payloads
+		const terminal = new ProcessTerminal() as any;
+		terminal.inputHandler = (data: string) => comp.handleInput(data);
+		terminal.setupStdinBuffer();
+		terminal.stdinBuffer.process("\x1b[200~first\r\n");
+		terminal.stdinBuffer.process("second");
+		terminal.stdinBuffer.process("\x1b[201~X");
+
+		comp.handleInput("\r");
+
+		// "first\r\nsecond" is CRLF in the raw payload, normalized to LF by handleInput;
+		// "X" follows as ordinary typing after the paste
+		expect(done).toHaveBeenCalledWith("first\nsecondX");
+	});
+});
+
+// ─── Scenario 17: Pasted terminal controls remain inert ─────────────────────
+
+describe("Scenario 17: Pasted terminal controls stay out of the answer and terminal", () => {
+	async function createRecordingForm() {
+		const { ProcessTerminal } = await import("@earendil-works/pi-tui");
+		const { TuiMainScreen } = await import("@earendil-works/pi-tui/dist/tui-main-screen.js");
+		const writes: string[] = [];
+		const terminal = {
+			columns: 80,
+			rows: 24,
+			write: (text: string) => writes.push(text),
+			hideCursor() {},
+			showCursor() {},
+		};
+		const tui = new TuiMainScreen(terminal as any);
+		const done = vi.fn();
+		const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const comp = createQuestionFormComponent([{ index: 0, label: "Alpha", fullText: "1. Alpha" }], tui as any, theme, done);
+		tui.addChild(comp);
+		const source = new ProcessTerminal() as any;
+		source.inputHandler = (data: string) => comp.handleInput(data);
+		source.setupStdinBuffer();
+		return { comp, done, source, tui, writes };
+	}
+
+	it.each(["options", "notes"])("blocks an OSC paste before Enter with %s focus", async (focus) => {
+		const { comp, done, source, tui, writes } = await createRecordingForm();
+		try {
+			if (focus === "notes") {
+				comp.handleInput("2");
+				for (const char of "abcd") comp.handleInput(char);
+				comp.handleInput("\x1b[D");
+				comp.handleInput("\x1b[D");
+			}
+			const payload = "a\x1b]52;c;WA==\x07b";
+			source.stdinBuffer.process(`\x1b[200~${payload}\x1b[201~`);
+			tui.renderNow();
+			expect(writes.length).toBeGreaterThan(0);
+			const outputBeforeEnter = writes.join("");
+			expect(outputBeforeEnter).not.toContain(payload);
+			expect(outputBeforeEnter).not.toContain("\x1b]52");
+			expect(outputBeforeEnter).not.toContain("WA==\x07b");
+			expect(done).not.toHaveBeenCalled();
+			if (focus === "notes") comp.handleInput("Z");
+			comp.handleInput("\r");
+			expect(done).toHaveBeenCalledWith(focus === "notes" ? "aba]52;c;WA==bZcd" : "1. Alpha\n\na]52;c;WA==b");
+		} finally {
+			source.stdinBuffer.destroy();
+		}
+	});
+
+	it("filters C0, DEL, and C1 while preserving LF, tab, Unicode, and cursor position", async () => {
+		const { comp, done, source, tui, writes } = await createRecordingForm();
+		try {
+			comp.handleInput("2");
+			for (const char of "abcd") comp.handleInput(char);
+			comp.handleInput("\x1b[D");
+			comp.handleInput("\x1b[D");
+			const payload = "A\x00\x08\x0b\x1b\x1f\x7f\x80\x9b\x9f\tΩ\r\nB";
+			source.stdinBuffer.process(`\x1b[200~${payload}\x1b[201~`);
+			tui.renderNow();
+			expect(writes.length).toBeGreaterThan(0);
+			const outputBeforeEnter = writes.join("");
+			for (const control of ["\x00", "\x08", "\x0b", "\x1f", "\x7f", "\x80", "\x9b", "\x9f"]) {
+				expect(outputBeforeEnter).not.toContain(control);
+			}
+			comp.handleInput("Z");
+			comp.handleInput("\r");
+			expect(done).toHaveBeenCalledWith("abA\tΩ\nBZcd");
+		} finally {
+			source.stdinBuffer.destroy();
+		}
+	});
+
+	it("also filters controls delivered as ordinary input", () => {
+		const done = vi.fn();
+		const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const comp = createQuestionFormComponent(
+			[{ index: 0, label: "Alpha", fullText: "1. Alpha" }],
+			{ requestRender: vi.fn() } as any,
+			theme,
+			done,
+		);
+		comp.handleInput("2");
+		comp.handleInput("\x9b");
+		comp.handleInput("a\x00b\x7f\x80c");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("abc");
+	});
+});
+
+// ─── Scenario 12: Existing trim and controls remain explicit ────────────────
+
+describe("Scenario 12: Existing trim and controls remain explicit", () => {
+	const mockTheme: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+
+	function createComponent() {
+		const options = [
+			{ index: 0, label: "Alpha", fullText: "1. Alpha" },
+			{ index: 1, label: "Beta", fullText: "2. Beta" },
+		];
+		const tui = { requestRender: vi.fn() };
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
+		return { comp, tui, done };
+	}
+
+	function wrapPaste(payload: string): string {
+		return `\x1b[200~${payload}\x1b[201~`;
+	}
+
+	it("leading/trailing whitespace on paste is trimmed by buildSubmissionText", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("  hello world  "));
+		comp.handleInput("\r");
+
+		// buildSubmissionText trims for write-in
+		expect(done).toHaveBeenCalledWith("hello world");
+	});
+
+	it("leading LF on paste is trimmed by buildSubmissionText", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("\nhello"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("hello");
+	});
+
+	it("trailing LF on paste is trimmed by buildSubmissionText", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("hello\n"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("hello");
+	});
+
+	it("internal blank lines survive submission", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("first\n\nthird"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("first\n\nthird");
+	});
+
+	it("Left arrow works after paste", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("abc"));
+		// Cursor at 3, move left
+		comp.handleInput("\x1b[D");
+		// Type 'X' — should insert between b and c
+		comp.handleInput("X");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("abXc");
+	});
+
+	it("Right arrow works after paste", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		for (const ch of "ab") comp.handleInput(ch);
+		comp.handleInput("\x1b[H"); // Home
+		comp.handleInput(wrapPaste("XY"));
+		// Cursor at 2, move right
+		comp.handleInput("\x1b[C");
+		comp.handleInput("Z");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("XYaZb");
+	});
+
+	it("Home after paste moves to start", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("hello"));
+		comp.handleInput("\x1b[H");
+		comp.handleInput("X");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("Xhello");
+	});
+
+	it("End after paste moves to end", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		for (const ch of "ab") comp.handleInput(ch);
+		comp.handleInput("\x1b[H"); // Home
+		comp.handleInput(wrapPaste("XY"));
+		comp.handleInput("\x1b[F"); // End
+		comp.handleInput("Z");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("XYabZ");
+	});
+
+	it("Backspace after paste works", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("abc"));
+		comp.handleInput("\x7f"); // Backspace
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("ab");
+	});
+
+	it("Escape after paste clears notes, second Esc dismisses", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("hello"));
+
+		// First Esc: clears notes and returns to options
+		comp.handleInput("\x1b");
+		expect(done).not.toHaveBeenCalled();
+
+		// Second Esc: dismisses
+		comp.handleInput("\x1b");
+		expect(done).toHaveBeenCalledWith(null);
+	});
+
+	it("Enter on empty write-in after cleared paste still blocks", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("hello"));
+		// Esc clears
+		comp.handleInput("\x1b");
+		// Now in options with empty notes, select write-in again
+		comp.handleInput("3");
+		// Enter should block
+		comp.handleInput("\r");
+		expect(done).not.toHaveBeenCalled();
+	});
+
+	it("ordinary typing after paste works", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("3");
+		comp.handleInput(wrapPaste("ab"));
+		comp.handleInput("c");
+		comp.handleInput("d");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("abcd");
+	});
+
+	it("option selection is unaffected by paste support", () => {
+		const { comp, done } = createComponent();
+		// Select option 2 and submit
+		comp.handleInput("2");
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("2. Beta");
+	});
+
+	it("option notes (non-write-in) with paste works", () => {
+		const { comp, done } = createComponent();
+		// Select option 1
+		comp.handleInput("1");
+		// Tab to notes
+		comp.handleInput("\t");
+		// Paste into notes
+		comp.handleInput(wrapPaste("my note"));
+		comp.handleInput("\r");
+
+		expect(done).toHaveBeenCalledWith("1. Alpha\n\nmy note");
+	});
+});
