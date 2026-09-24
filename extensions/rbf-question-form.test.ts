@@ -171,13 +171,26 @@ describe("buildChips", () => {
 		expect(chips[0]).toEqual({ key: "1", type: "option", label: "1", fullText: "1. A" });
 		expect(chips[1]).toEqual({ key: "2", type: "option", label: "2", fullText: "2. B" });
 		expect(chips[2]).toEqual({ key: "3", type: "option", label: "3", fullText: "3. C" });
-		expect(chips[3]).toEqual({ key: "4", type: "write-in", label: "4. Write-in" });
-		expect(chips[4]).toEqual({
+		expect(chips[3]).toEqual({
 			key: "c",
 			type: "canned",
 			label: "C. /convo-is-very-best",
 			cannedCommand: "/skill:convo-is-very-best",
 		});
+		expect(chips[4]).toEqual({ key: "4", type: "write-in", label: "4. Write-in" });
+	});
+
+	it("creates one-option case correctly", () => {
+		const options = [
+			{ index: 0, label: "A", fullText: "1. A" },
+		];
+		const chips = buildChips(options);
+
+		expect(chips).toHaveLength(3);
+		expect(chips[0].key).toBe("1");
+		expect(chips[1].type).toBe("canned");
+		expect(chips[2].type).toBe("write-in");
+		expect(chips[2].label).toBe("2. Write-in");
 	});
 });
 
@@ -219,6 +232,30 @@ describe("buildSubmissionText", () => {
 // ─── renderQuestionFormLines ────────────────────────────────────────────────
 
 describe("renderQuestionFormLines", () => {
+	it("renders the chip row in numbered, canned, Write-in order", () => {
+		const chips = buildChips([
+			{ index: 0, label: "Alpha", fullText: "1. Alpha" },
+			{ index: 1, label: "Beta", fullText: "2. Beta" },
+		]);
+		const lines = renderQuestionFormLines(
+			{
+				chips,
+				selectedChipIndex: 0,
+				focus: "options",
+				notesText: "",
+				notesCursorPos: 0,
+				theme: mockThemeFallback,
+			},
+			80,
+		);
+		const chipRow = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).find((l) => l.includes("Write-in"))!;
+		const positions = ["[ 2 ]", "[ C. /convo-is-very-best ]", "[ 3. Write-in ]"].map((s) => chipRow.indexOf(s));
+		expect(positions.every((p) => p >= 0)).toBe(true);
+		expect(positions[0]).toBeLessThan(positions[1]);
+		expect(positions[1]).toBeLessThan(positions[2]);
+		expect(chipRow.indexOf("[ 3. Write-in ]")).toBe(chipRow.length - "[ 3. Write-in ]".length);
+	});
+
 	const mockThemeWithAnsi: any = {
 		fg: (_color: string, text: string) => text,
 		bold: (text: string) => text,
@@ -421,6 +458,91 @@ describe("createQuestionFormComponent input handling", () => {
 		comp.handleInput("k");
 		comp.handleInput("\r");
 		expect(done).toHaveBeenCalledWith("Work");
+	});
+
+	it("right-arrow from the last numbered option selects C with chip focus", () => {
+		const { comp, done } = createComponent();
+
+		// Start on option 1 (index 0). Move right to option 2 (index 1).
+		comp.handleInput("\x1b[C");
+		// Move right again -> should go to canned 'C' (index 2).
+		comp.handleInput("\x1b[C");
+
+		// Submit to verify it's the canned chip.
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("/skill:convo-is-very-best");
+
+		// Chip-focus probe: pressing a letter must navigate chips, not type into notes.
+		const { comp: chipFocusComp, done: chipFocusDone } = createComponent();
+		chipFocusComp.handleInput("\x1b[C"); // option 2
+		chipFocusComp.handleInput("\x1b[C"); // canned C
+		chipFocusComp.handleInput("h"); // vim-left: back to option 2 if chip focus; ignored text if notes focus
+		chipFocusComp.handleInput("\r");
+		expect(chipFocusDone).toHaveBeenCalledWith("2. Beta");
+	});
+
+	it("after arrowing onto Write-in, focus is notes, left-arrow moves text cursor, Tab/up returns to chips, left-arrow reaches C", () => {
+		const { comp, done } = createComponent();
+
+		// Move right to 2, then C, then Write-in
+		comp.handleInput("\x1b[C");
+		comp.handleInput("\x1b[C");
+		comp.handleInput("\x1b[C");
+
+		// Now on Write-in, focus is notes. Type 'hi'
+		comp.handleInput("h");
+		comp.handleInput("i");
+
+		// Left arrow should move the text cursor; prove it by typing between the letters
+		comp.handleInput("\x1b[D");
+		comp.handleInput("X");
+
+		// Tab to go back to chips
+		comp.handleInput("\t");
+
+		// Left arrow on chips goes to C
+		comp.handleInput("\x1b[D");
+
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("/skill:convo-is-very-best\n\nhXi");
+	});
+
+	it("up-arrow also returns from the Write-in answer field to the chips", () => {
+		const { comp, done } = createComponent();
+
+		// Arrow onto Write-in (option 1, option 2, C, Write-in)
+		comp.handleInput("\x1b[C");
+		comp.handleInput("\x1b[C");
+		comp.handleInput("\x1b[C");
+
+		// Up-arrow returns to chips; left reaches C
+		comp.handleInput("\x1b[A");
+		comp.handleInput("\x1b[D");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("/skill:convo-is-very-best");
+	});
+
+	it("exact submissions on the existing two-option helper", () => {
+		const { comp, done } = createComponent();
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("1. Alpha");
+
+		const { comp: comp2, done: done2 } = createComponent();
+		comp2.handleInput("c");
+		comp2.handleInput("\r");
+		expect(done2).toHaveBeenCalledWith("/skill:convo-is-very-best");
+
+		const { comp: comp3, done: done3 } = createComponent();
+		comp3.handleInput("3");
+		comp3.handleInput("M");
+		comp3.handleInput("y");
+		comp3.handleInput("\r");
+		expect(done3).toHaveBeenCalledWith("My");
+
+		const { comp: comp4, done: done4 } = createComponent();
+		comp4.handleInput("3");
+		comp4.handleInput("\r");
+		expect(done4).not.toHaveBeenCalled();
 	});
 });
 

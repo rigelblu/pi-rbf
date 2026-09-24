@@ -159,20 +159,20 @@ export function buildChips(options: NormalizedOption[]): QuestionChip[] {
 		fullText: opt.fullText,
 	}));
 
-	// Write-in option
-	const writeInKey = String(options.length + 1);
-	chips.push({
-		key: writeInKey,
-		type: "write-in",
-		label: `${writeInKey}. Write-in`,
-	});
-
 	// Canned reply option
 	chips.push({
 		key: "c",
 		type: "canned",
 		label: "C. /convo-is-very-best",
 		cannedCommand: "/skill:convo-is-very-best",
+	});
+
+	// Write-in option
+	const writeInKey = String(options.length + 1);
+	chips.push({
+		key: writeInKey,
+		type: "write-in",
+		label: `${writeInKey}. Write-in`,
 	});
 
 	return chips;

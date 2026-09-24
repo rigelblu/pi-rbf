@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.21.8 (2026-09-26)
+## 🟠⋯ Fixed for End Users
+- 2026-09-26 - fix (ux) | the question form's Write-in chip is now the last choice, after the canned `/convo-is-very-best` response — before, Write-in sat fourth and the canned response could not be reached with `→` at all, because arrowing onto Write-in jumped focus into its answer field; numeric and `C` shortcuts, focus rules, and submitted text are unchanged (#pi-19.5) [@pi]
+
+---
+
 # 🔵⋯ v0.21.7 (2026-09-26)
 ## 🟠⋯ 🔒 Security Fixes for End Users
 - 2026-09-26 - fix | pasted terminal control characters no longer reach the terminal through the question form before submission; normal text, internal blank lines, and the submitted answer remain intact (#pi-19.4) [@pi]

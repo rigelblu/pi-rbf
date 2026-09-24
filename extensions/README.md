@@ -343,7 +343,8 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 ## 🟠⋯ Capabilities & Behavior
 - Transcript Separation: The agent's full question, recommendation text, user need framing, and context paragraphs stay in the transcript as regular markdown. Only the numbered options appear in the compact interactive form.
 - Input Box Overlap: Uses `ctx.ui.custom()` to temporarily occupy the input box area directly, eliminating double borders and visual separation.
-- Compact Number Selection: Renders compact number chips (`[ 1 ]`, `[ 2 ]`, `[ 3 ]`, `[ 4. Write-in ]`, `[ C. /convo-is-very-best ]`) without repeating the full text that already sits right above in the transcript.
+- Compact Number Selection: Renders compact number chips with the final fallback last — numbered answers, then `[ C. /convo-is-very-best ]`, then `[ N+1. Write-in ]` — without repeating the full text that already sits right above in the transcript.
+- Write-in Last: Write-in is always the rightmost chip and the final `→` traversal stop, after the canned response; selecting it moves focus into its answer field, and `Tab`/`↑` returns to the chips.
 - Dark Background & Light Text: The active selection chip is highlighted with a prominent dark background and bold bright white text.
 - Additional Notes Input: Embedded `Add notes to selection:` field allows typing extra instructions or modifications to append to the chosen option before submitting.
 - Write-in Option: Dedicated write-in option as the last numbered option (`N+1`). Selecting it auto-focuses the notes field so any custom text can be submitted directly. Long answers wrap word-wise inside the pane (like Pi's own editor), with a constant one-column cursor reservation, an inverse cursor that covers the whole grapheme at the insertion point, and chips/hints that clip at the right edge — the submitted text is always byte-exact.
