@@ -168,11 +168,10 @@ export function buildChips(options: NormalizedOption[]): QuestionChip[] {
 	});
 
 	// Write-in option
-	const writeInKey = String(options.length + 1);
 	chips.push({
-		key: writeInKey,
+		key: "w",
 		type: "write-in",
-		label: `${writeInKey}. Write-in`,
+		label: "W. Write-in",
 	});
 
 	return chips;
@@ -585,9 +584,18 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	lines.push("");
 
 	// Hint line (truncated at right edge)
+	let directDigitsHint = "";
+	const optionChipsCount = chips.filter((c) => c.type === "option").length;
+	const maxDigit = Math.min(optionChipsCount, 9);
+	if (maxDigit === 1) {
+		directDigitsHint = "1";
+	} else if (maxDigit > 1) {
+		directDigitsHint = `1-${maxDigit}`;
+	}
+	const keysHint = directDigitsHint ? `${directDigitsHint}, C, W` : "C, W";
 	const hint = isWriteIn
 		? "  [Type answer] · [Enter] submit · [Esc] dismiss · [Tab/↑] back to options"
-		: "  [1-4, C / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss";
+		: `  [${keysHint} / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss`;
 	const styledHint = theme?.fg ? theme.fg("dim", hint) : hint;
 	lines.push(truncateToWidth(styledHint, renderWidth));
 
@@ -659,15 +667,12 @@ export function createQuestionFormComponent(
 		}
 
 		if (state.focus === "options") {
-			// Number keys 1..9
+			// Number keys 1..9 (select matching offered option)
 			if (data.length === 1 && data >= "1" && data <= "9") {
 				const num = parseInt(data, 10);
-				const targetIdx = state.chips.findIndex((c) => c.key === String(num));
+				const targetIdx = state.chips.findIndex((c) => c.type === "option" && c.key === String(num));
 				if (targetIdx !== -1) {
 					state.selectedChipIndex = targetIdx;
-					if (state.chips[targetIdx].type === "write-in") {
-						state.focus = "notes";
-					}
 					tui.requestRender();
 					return;
 				}
@@ -678,6 +683,17 @@ export function createQuestionFormComponent(
 				const targetIdx = state.chips.findIndex((c) => c.type === "canned");
 				if (targetIdx !== -1) {
 					state.selectedChipIndex = targetIdx;
+					tui.requestRender();
+					return;
+				}
+			}
+
+			// W key for Write-in
+			if (data === "w" || data === "W") {
+				const targetIdx = state.chips.findIndex((c) => c.type === "write-in");
+				if (targetIdx !== -1) {
+					state.selectedChipIndex = targetIdx;
+					state.focus = "notes";
 					tui.requestRender();
 					return;
 				}

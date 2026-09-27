@@ -177,7 +177,7 @@ describe("buildChips", () => {
 			label: "C. /convo-is-very-best",
 			cannedCommand: "/skill:convo-is-very-best",
 		});
-		expect(chips[4]).toEqual({ key: "4", type: "write-in", label: "4. Write-in" });
+		expect(chips[4]).toEqual({ key: "w", type: "write-in", label: "W. Write-in" });
 	});
 
 	it("creates one-option case correctly", () => {
@@ -190,7 +190,8 @@ describe("buildChips", () => {
 		expect(chips[0].key).toBe("1");
 		expect(chips[1].type).toBe("canned");
 		expect(chips[2].type).toBe("write-in");
-		expect(chips[2].label).toBe("2. Write-in");
+		expect(chips[2].key).toBe("w");
+		expect(chips[2].label).toBe("W. Write-in");
 	});
 });
 
@@ -198,7 +199,7 @@ describe("buildChips", () => {
 
 describe("buildSubmissionText", () => {
 	const optChip = { key: "1", type: "option" as const, label: "1", fullText: "1. First choice" };
-	const writeInChip = { key: "4", type: "write-in" as const, label: "4. Write-in" };
+	const writeInChip = { key: "w", type: "write-in" as const, label: "W. Write-in" };
 	const cannedChip = {
 		key: "c",
 		type: "canned" as const,
@@ -249,11 +250,11 @@ describe("renderQuestionFormLines", () => {
 			80,
 		);
 		const chipRow = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).find((l) => l.includes("Write-in"))!;
-		const positions = ["[ 2 ]", "[ C. /convo-is-very-best ]", "[ 3. Write-in ]"].map((s) => chipRow.indexOf(s));
+		const positions = ["[ 2 ]", "[ C. /convo-is-very-best ]", "[ W. Write-in ]"].map((s) => chipRow.indexOf(s));
 		expect(positions.every((p) => p >= 0)).toBe(true);
 		expect(positions[0]).toBeLessThan(positions[1]);
 		expect(positions[1]).toBeLessThan(positions[2]);
-		expect(chipRow.indexOf("[ 3. Write-in ]")).toBe(chipRow.length - "[ 3. Write-in ]".length);
+		expect(chipRow.indexOf("[ W. Write-in ]")).toBe(chipRow.length - "[ W. Write-in ]".length);
 	});
 
 	const mockThemeWithAnsi: any = {
@@ -429,24 +430,42 @@ describe("createQuestionFormComponent input handling", () => {
 		expect(done).toHaveBeenCalledWith("/skill:convo-is-very-best");
 	});
 
-	it("selects write-in option and focuses notes", () => {
+	it("selects write-in option and focuses notes with 'w' and 'W'", () => {
 		const { comp, done } = createComponent();
 
-		// 3 is Write-in (2 options + 1)
-		comp.handleInput("3");
+		// 'w' selects Write-in
+		comp.handleInput("w");
 		// Directly type custom text since write-in auto-focuses notes
 		comp.handleInput("M");
 		comp.handleInput("y");
 		comp.handleInput("\r");
 
 		expect(done).toHaveBeenCalledWith("My");
+
+		// 'W' also selects Write-in
+		const { comp: compW, done: doneW } = createComponent();
+		compW.handleInput("W");
+		compW.handleInput("O");
+		compW.handleInput("k");
+		compW.handleInput("\r");
+		expect(doneW).toHaveBeenCalledWith("Ok");
+	});
+
+	it("former N+1 digit is not a write-in alias when option does not exist", () => {
+		const { comp, done } = createComponent();
+
+		// '3' was the former N+1 Write-in key for 2 options, but now has no effect
+		comp.handleInput("3");
+		// Should still be on option 1
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("1. Alpha");
 	});
 
 	it("blocks Enter submission when write-in notes are empty and requires text", () => {
 		const { comp, done } = createComponent();
 
-		// 3 is Write-in
-		comp.handleInput("3");
+		// 'w' is Write-in
+		comp.handleInput("w");
 		// Hit Enter immediately while notes are empty
 		comp.handleInput("\r");
 		expect(done).not.toHaveBeenCalled();
@@ -533,14 +552,14 @@ describe("createQuestionFormComponent input handling", () => {
 		expect(done2).toHaveBeenCalledWith("/skill:convo-is-very-best");
 
 		const { comp: comp3, done: done3 } = createComponent();
-		comp3.handleInput("3");
+		comp3.handleInput("w");
 		comp3.handleInput("M");
 		comp3.handleInput("y");
 		comp3.handleInput("\r");
 		expect(done3).toHaveBeenCalledWith("My");
 
 		const { comp: comp4, done: done4 } = createComponent();
-		comp4.handleInput("3");
+		comp4.handleInput("w");
 		comp4.handleInput("\r");
 		expect(done4).not.toHaveBeenCalled();
 	});
@@ -1356,8 +1375,8 @@ describe("Scenario 15: Editing and submission preserve the logical answer", () =
 		const done = vi.fn();
 		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
 
-		// 1. Select Write-in (key '3' for 2 options)
-		comp.handleInput("3");
+		// 1. Select Write-in (key 'w')
+		comp.handleInput("w");
 
 		// 2. Type text that spans across a wrap boundary at width 40
 		const initialText = "This is a custom answer for the form that spans across boundaries";
@@ -1434,7 +1453,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 	it("paste at start of existing notes", () => {
 		const { comp, done } = createComponent();
 		// Select write-in, type "abcd", move cursor to start
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "abcd") comp.handleInput(ch);
 		comp.handleInput("\x1b[H"); // Home
 
@@ -1446,7 +1465,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("paste at middle of existing notes", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "abcd") comp.handleInput(ch);
 		// Cursor at 4 (end), move left twice → cursor at 2 (between b and c)
 		comp.handleInput("\x1b[D");
@@ -1460,7 +1479,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("paste at end of existing notes", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "abcd") comp.handleInput(ch);
 
 		comp.handleInput(wrapPaste("PASTE"));
@@ -1471,7 +1490,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("cursor lands immediately after the payload", () => {
 		const { comp } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "abcd") comp.handleInput(ch);
 		comp.handleInput("\x1b[H"); // Home
 
@@ -1486,7 +1505,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("cursor advances by the normalized payload length, not the raw one", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "abcd") comp.handleInput(ch);
 		comp.handleInput("\x1b[D");
 		comp.handleInput("\x1b[D");
@@ -1500,7 +1519,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("markers never appear in state or submission", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("hello"));
 
 		// Check render doesn't contain markers
@@ -1517,7 +1536,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("CRLF normalizes to LF", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("first\r\nsecond"));
 		comp.handleInput("\r");
 
@@ -1526,7 +1545,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("lone CR normalizes to LF", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("first\rsecond"));
 		comp.handleInput("\r");
 
@@ -1535,7 +1554,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("internal blank lines are preserved", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("first\n\nthird"));
 		comp.handleInput("\r");
 
@@ -1544,7 +1563,7 @@ describe("Scenario 10: Completed bracketed paste inserts once at the cursor", ()
 
 	it("paste into empty write-in", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("pasted text"));
 		comp.handleInput("\r");
 
@@ -1608,7 +1627,7 @@ describe("Scenario 11: Pi TUI owns raw split chunks and post-paste input", () =>
 		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
 
 		// Select write-in so paste goes into notes
-		comp.handleInput("3");
+		comp.handleInput("w");
 
 		// Drive the real boundary: Terminal re-wraps StdinBuffer paste payloads
 		const terminal = new ProcessTerminal() as any;
@@ -1655,7 +1674,7 @@ describe("Scenario 17: Pasted terminal controls stay out of the answer and termi
 		const { comp, done, source, tui, writes } = await createRecordingForm();
 		try {
 			if (focus === "notes") {
-				comp.handleInput("2");
+				comp.handleInput("w");
 				for (const char of "abcd") comp.handleInput(char);
 				comp.handleInput("\x1b[D");
 				comp.handleInput("\x1b[D");
@@ -1680,7 +1699,7 @@ describe("Scenario 17: Pasted terminal controls stay out of the answer and termi
 	it("filters C0, DEL, and C1 while preserving LF, tab, Unicode, and cursor position", async () => {
 		const { comp, done, source, tui, writes } = await createRecordingForm();
 		try {
-			comp.handleInput("2");
+			comp.handleInput("w");
 			for (const char of "abcd") comp.handleInput(char);
 			comp.handleInput("\x1b[D");
 			comp.handleInput("\x1b[D");
@@ -1709,7 +1728,7 @@ describe("Scenario 17: Pasted terminal controls stay out of the answer and termi
 			theme,
 			done,
 		);
-		comp.handleInput("2");
+		comp.handleInput("w");
 		comp.handleInput("\x9b");
 		comp.handleInput("a\x00b\x7f\x80c");
 		comp.handleInput("\r");
@@ -1742,7 +1761,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("leading/trailing whitespace on paste is trimmed by buildSubmissionText", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("  hello world  "));
 		comp.handleInput("\r");
 
@@ -1752,7 +1771,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("leading LF on paste is trimmed by buildSubmissionText", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("\nhello"));
 		comp.handleInput("\r");
 
@@ -1761,7 +1780,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("trailing LF on paste is trimmed by buildSubmissionText", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("hello\n"));
 		comp.handleInput("\r");
 
@@ -1770,7 +1789,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("internal blank lines survive submission", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("first\n\nthird"));
 		comp.handleInput("\r");
 
@@ -1779,7 +1798,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("Left arrow works after paste", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("abc"));
 		// Cursor at 3, move left
 		comp.handleInput("\x1b[D");
@@ -1792,7 +1811,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("Right arrow works after paste", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "ab") comp.handleInput(ch);
 		comp.handleInput("\x1b[H"); // Home
 		comp.handleInput(wrapPaste("XY"));
@@ -1806,7 +1825,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("Home after paste moves to start", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("hello"));
 		comp.handleInput("\x1b[H");
 		comp.handleInput("X");
@@ -1817,7 +1836,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("End after paste moves to end", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		for (const ch of "ab") comp.handleInput(ch);
 		comp.handleInput("\x1b[H"); // Home
 		comp.handleInput(wrapPaste("XY"));
@@ -1830,7 +1849,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("Backspace after paste works", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("abc"));
 		comp.handleInput("\x7f"); // Backspace
 		comp.handleInput("\r");
@@ -1840,7 +1859,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("Escape after paste clears notes, second Esc dismisses", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("hello"));
 
 		// First Esc: clears notes and returns to options
@@ -1854,12 +1873,12 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("Enter on empty write-in after cleared paste still blocks", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("hello"));
 		// Esc clears
 		comp.handleInput("\x1b");
 		// Now in options with empty notes, select write-in again
-		comp.handleInput("3");
+		comp.handleInput("w");
 		// Enter should block
 		comp.handleInput("\r");
 		expect(done).not.toHaveBeenCalled();
@@ -1867,7 +1886,7 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 
 	it("ordinary typing after paste works", () => {
 		const { comp, done } = createComponent();
-		comp.handleInput("3");
+		comp.handleInput("w");
 		comp.handleInput(wrapPaste("ab"));
 		comp.handleInput("c");
 		comp.handleInput("d");
@@ -1896,5 +1915,235 @@ describe("Scenario 12: Existing trim and controls remain explicit", () => {
 		comp.handleInput("\r");
 
 		expect(done).toHaveBeenCalledWith("1. Alpha\n\nmy note");
+	});
+});
+
+// ─── Scenario 19: Named Write-in shortcut is exact in source ────────────────
+
+describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
+	const mockTheme: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+		getFgAnsi: (color: string) => (color === "borderAccent" ? "\x1b[38;2;86;148;159m" : "\x1b[38;2;40;105;131m"),
+	};
+
+	function createFormHelper(count: number) {
+		const options = Array.from({ length: count }, (_, i) => ({
+			index: i,
+			label: `Choice ${i + 1}`,
+			fullText: `${i + 1}. Choice ${i + 1}`,
+		}));
+		const tui = { requestRender: vi.fn() };
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done);
+		return { options, comp, tui, done };
+	}
+
+	it("buildChips() emits offered digits, C, then W. Write-in for one, three, and nine answers", () => {
+		// 1 option
+		const chips1 = buildChips([{ index: 0, label: "Choice 1", fullText: "1. Choice 1" }]);
+		expect(chips1).toHaveLength(3);
+		expect(chips1.map((c) => c.key)).toEqual(["1", "c", "w"]);
+		expect(chips1.map((c) => c.label)).toEqual(["1", "C. /convo-is-very-best", "W. Write-in"]);
+		expect(chips1[0].type).toBe("option");
+		expect(chips1[1].type).toBe("canned");
+		expect(chips1[2].type).toBe("write-in");
+
+		// 3 options
+		const chips3 = buildChips([
+			{ index: 0, label: "A", fullText: "1. A" },
+			{ index: 1, label: "B", fullText: "2. B" },
+			{ index: 2, label: "C", fullText: "3. C" },
+		]);
+		expect(chips3).toHaveLength(5);
+		expect(chips3.map((c) => c.key)).toEqual(["1", "2", "3", "c", "w"]);
+		expect(chips3.map((c) => c.label)).toEqual(["1", "2", "3", "C. /convo-is-very-best", "W. Write-in"]);
+		expect(chips3[4].type).toBe("write-in");
+
+		// 9 options
+		const chips9 = buildChips(
+			Array.from({ length: 9 }, (_, i) => ({
+				index: i,
+				label: `Option ${i + 1}`,
+				fullText: `${i + 1}. Option ${i + 1}`,
+			})),
+		);
+		expect(chips9).toHaveLength(11);
+		expect(chips9.map((c) => c.key)).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "c", "w"]);
+		expect(chips9.map((c) => c.label)).toEqual([
+			"1",
+			"2",
+			"3",
+			"4",
+			"5",
+			"6",
+			"7",
+			"8",
+			"9",
+			"C. /convo-is-very-best",
+			"W. Write-in",
+		]);
+		expect(chips9[10].type).toBe("write-in");
+	});
+
+	it("derives direct-key hint and respects render width at 40 and 80 columns", () => {
+		for (const count of [1, 3, 9]) {
+			const { comp } = createFormHelper(count);
+
+			for (const width of [40, 80]) {
+				const lines = comp.render(width);
+				for (const line of lines) {
+					expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+				}
+
+				const plainText = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+				if (width === 80) {
+					if (count === 1) {
+						expect(plainText).toContain("[1, C, W / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss");
+					} else if (count === 3) {
+						expect(plainText).toContain("[1-3, C, W / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss");
+					} else if (count === 9) {
+						expect(plainText).toContain("[1-9, C, W / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss");
+					}
+				}
+			}
+		}
+
+		// Also check focused Write-in hint at 40 and 80 columns
+		const { comp: writeInComp } = createFormHelper(3);
+		writeInComp.handleInput("w");
+		for (const width of [40, 80]) {
+			const lines = writeInComp.render(width);
+			for (const line of lines) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+			const plainText = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+			if (width === 80) {
+				expect(plainText).toContain("[Type answer] · [Enter] submit · [Esc] dismiss · [Tab/↑] back to options");
+			}
+		}
+	});
+
+	it("both 'w' and 'W' on chip focus select Write-in and focus the answer field", () => {
+		// Test lowercase 'w'
+		const { comp: comp1, done: done1 } = createFormHelper(3);
+		comp1.handleInput("w");
+		// Verify focus is in answer field by typing without pressing Tab
+		comp1.handleInput("h");
+		comp1.handleInput("e");
+		comp1.handleInput("l");
+		comp1.handleInput("l");
+		comp1.handleInput("o");
+		comp1.handleInput("\r");
+		expect(done1).toHaveBeenCalledWith("hello");
+
+		// Test uppercase 'W'
+		const { comp: comp2, done: done2 } = createFormHelper(3);
+		comp2.handleInput("W");
+		comp2.handleInput("c");
+		comp2.handleInput("u");
+		comp2.handleInput("s");
+		comp2.handleInput("t");
+		comp2.handleInput("o");
+		comp2.handleInput("m");
+		comp2.handleInput("\r");
+		expect(done2).toHaveBeenCalledWith("custom");
+	});
+
+	it("in field focus, 'w' and 'W' type normally instead of re-triggering chip selection", () => {
+		// 1. From Write-in field focus
+		const { comp: comp1, done: done1 } = createFormHelper(3);
+		comp1.handleInput("w"); // Selects Write-in and enters field focus
+		comp1.handleInput("w"); // Types 'w'
+		comp1.handleInput("W"); // Types 'W'
+		comp1.handleInput("o");
+		comp1.handleInput("r");
+		comp1.handleInput("l");
+		comp1.handleInput("d");
+		comp1.handleInput("\r");
+		expect(done1).toHaveBeenCalledWith("wWorld");
+
+		// 2. From notes focus on an offered answer
+		const { comp: comp2, done: done2 } = createFormHelper(3);
+		comp2.handleInput("1"); // Selects option 1
+		comp2.handleInput("\t"); // Tab to notes
+		comp2.handleInput("w"); // Types 'w'
+		comp2.handleInput("W"); // Types 'W'
+		comp2.handleInput("\r");
+		expect(done2).toHaveBeenCalledWith("1. Choice 1\n\nwW");
+	});
+
+	it("former N+1 digit does not select Write-in, but selects offered answer if present", () => {
+		// With 3 offered answers, former N+1 was 4:
+		const { comp: comp3, done: done3 } = createFormHelper(3);
+		comp3.handleInput("4"); // Not a valid direct key for 3 options
+		comp3.handleInput("\r");
+		// Form did not select Write-in; remained on option 1
+		expect(done3).toHaveBeenCalledWith("1. Choice 1");
+
+		// With 1 offered answer, former N+1 was 2:
+		const { comp: comp1, done: done1 } = createFormHelper(1);
+		comp1.handleInput("2"); // Not a valid direct key for 1 option
+		comp1.handleInput("\r");
+		// Form did not select Write-in; remained on option 1
+		expect(done1).toHaveBeenCalledWith("1. Choice 1");
+
+		// With 4 offered answers, 4 names a real offered answer:
+		const { comp: comp4, done: done4 } = createFormHelper(4);
+		comp4.handleInput("4");
+		comp4.handleInput("\r");
+		expect(done4).toHaveBeenCalledWith("4. Choice 4");
+	});
+
+	it("offered digits 1-9 and C/c select their targets across one, three, and nine options", () => {
+		// 1 option: digit 1 and C
+		const { comp: c1, done: d1 } = createFormHelper(1);
+		c1.handleInput("1");
+		c1.handleInput("\r");
+		expect(d1).toHaveBeenCalledWith("1. Choice 1");
+
+		const { comp: c1C, done: d1C } = createFormHelper(1);
+		c1C.handleInput("C");
+		c1C.handleInput("\r");
+		expect(d1C).toHaveBeenCalledWith("/skill:convo-is-very-best");
+
+		// 3 options: digit 2, 3, and c
+		const { comp: c3_2, done: d3_2 } = createFormHelper(3);
+		c3_2.handleInput("2");
+		c3_2.handleInput("\r");
+		expect(d3_2).toHaveBeenCalledWith("2. Choice 2");
+
+		const { comp: c3_c, done: d3_c } = createFormHelper(3);
+		c3_c.handleInput("c");
+		c3_c.handleInput("\r");
+		expect(d3_c).toHaveBeenCalledWith("/skill:convo-is-very-best");
+
+		// 9 options: test all digits 1..9
+		for (let i = 1; i <= 9; i++) {
+			const { comp: c9, done: d9 } = createFormHelper(9);
+			c9.handleInput(String(i));
+			c9.handleInput("\r");
+			expect(d9).toHaveBeenCalledWith(`${i}. Choice ${i}`);
+		}
+	});
+
+	it("empty Write-in blocks Enter submission, non-empty custom text submits exactly", () => {
+		const { comp, done } = createFormHelper(3);
+
+		// Select Write-in via 'w'
+		comp.handleInput("w");
+		// Hit Enter with empty field
+		comp.handleInput("\r");
+		expect(done).not.toHaveBeenCalled();
+
+		// Hit Enter with whitespace-only field
+		comp.handleInput("   ");
+		comp.handleInput("\r");
+		expect(done).not.toHaveBeenCalled();
+
+		// Type real custom answer and submit
+		comp.handleInput("custom answer for pi-19.7");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("custom answer for pi-19.7");
 	});
 });
