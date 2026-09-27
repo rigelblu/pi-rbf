@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { Key, visibleWidth } from "@earendil-works/pi-tui";
 import { wordWrapLine as editorWordWrapLine } from "@earendil-works/pi-tui/dist/components/editor.js";
+import { findWordBackward, findWordForward } from "@earendil-works/pi-tui/dist/word-navigation.js";
 import rbfQuestionForm, {
 	buildChips,
 	buildSubmissionText,
@@ -2012,7 +2014,7 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 			}
 		}
 
-		// Also check focused Write-in hint at 40 and 80 columns
+		// Also check focused Write-in and notes hint at 40 and 80 columns
 		const { comp: writeInComp } = createFormHelper(3);
 		writeInComp.handleInput("w");
 		for (const width of [40, 80]) {
@@ -2022,9 +2024,19 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 			}
 			const plainText = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
 			if (width === 80) {
-				expect(plainText).toContain("[Type answer] · [Enter] submit · [Esc] dismiss · [Tab/↑] back to options");
+				expect(plainText).toContain("[Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close");
+			} else if (width === 40) {
+				expect(plainText).toContain("[Tab/↑ top] choices · [Enter] submi");
 			}
 		}
+
+		// Check optional-notes field focus also displays field-focused hint
+		const { comp: notesComp } = createFormHelper(3);
+		notesComp.handleInput("1"); // Select option 1
+		notesComp.handleInput("\t"); // Tab to notes field
+		const notesLines80 = notesComp.render(80);
+		const notesPlain80 = notesLines80.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+		expect(notesPlain80).toContain("[Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close");
 	});
 
 	it("both 'w' and 'W' on chip focus select Write-in and focus the answer field", () => {
@@ -2150,3 +2162,531 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 		expect(done).toHaveBeenCalledWith("custom answer for pi-19.7");
 	});
 });
+
+// ─── pi-36: Configured editor actions (movement, deletion, kill ring, undo) ───
+
+describe("pi-36: Configured editor actions (char/word/line movement, deletion, kill ring, undo)", () => {
+	it("runtime uses only the public Pi TUI package path so installed extensions can load", () => {
+		const source = readFileSync(new URL("./rbf-question-form.ts", import.meta.url), "utf8");
+		expect(source).not.toMatch(/from ["']@earendil-works\/pi-tui\/dist\//);
+	});
+
+	const mockTheme: any = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+
+	function createHelper(opts?: { keybindings?: any }) {
+		const options = [
+			{ index: 0, label: "Alpha", fullText: "1. Alpha" },
+			{ index: 1, label: "Beta", fullText: "2. Beta" },
+		];
+		const tui = { requestRender: vi.fn() };
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(options, tui as any, mockTheme, done, opts?.keybindings);
+		return { comp, tui, done };
+	}
+
+	const stripAnsi = (str: string) => str.replace(/\x1b\[[0-9;]*m/g, "");
+
+	it("word motions match Pi's plain-text word navigation at every grapheme boundary", () => {
+		const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+		for (const text of ["one two", "a,b.c", "hey... there", "let’s go", "naïve café", "alpha--beta", "a (b) c", "界字 next", "👨‍👩‍👧‍👦 x", "one\t two"]) {
+			const graphemes = [...segmenter.segment(text)].map((part) => part.segment);
+			for (let n = 0; n <= graphemes.length; n++) {
+				const cursor = graphemes.slice(0, n).join("").length;
+				for (const [key, navigate] of [["\x1bb", findWordBackward], ["\x1bf", findWordForward]] as const) {
+					const { comp, done } = createHelper();
+					comp.handleInput("w");
+					comp.handleInput(`\x1b[200~${text}\x1b[201~`);
+					comp.handleInput("\x01"); // Start of this one-line answer.
+					for (let i = 0; i < n; i++) comp.handleInput("\x06");
+					comp.handleInput(key);
+					comp.handleInput("§");
+					comp.handleInput("\r");
+					const next = navigate(text, cursor);
+					expect(done, `${JSON.stringify(text)}, cursor ${cursor}, key ${JSON.stringify(key)}`).toHaveBeenCalledWith(
+						(text.slice(0, next) + "§" + text.slice(next)).trim(),
+					);
+				}
+			}
+		}
+	});
+
+	it("Scenario 1: Move and kill a line in Write-in focus", () => {
+		const { comp, done } = createHelper();
+		// Select Write-in
+		comp.handleInput("w");
+		// Type alpha\nbeta using completed paste
+		comp.handleInput("\x1b[200~alpha\nbeta\x1b[201~");
+
+		// Move cursor to after "be" in "beta": beta starts at index 6, so after "be" is index 8.
+		// Move to line start with Ctrl+A, then right twice with Ctrl+F
+		comp.handleInput("\x01"); // Ctrl+A (cursorLineStart) -> start of "beta" (index 6)
+		comp.handleInput("\x06"); // Ctrl+F -> index 7 ("b")
+		comp.handleInput("\x06"); // Ctrl+F -> index 8 ("be")
+
+		// Ctrl+E reaches end of line
+		comp.handleInput("\x05"); // Ctrl+E -> end of "beta" (index 10)
+		// Move back to after "be" (Left twice)
+		comp.handleInput("\x1b[D");
+		comp.handleInput("\x1b[D");
+
+		// From after "be", Ctrl+U leaves alpha\nta
+		comp.handleInput("\x15"); // Ctrl+U (deleteToLineStart)
+		const linesAfterKill = stripAnsi(comp.render(80).join("\n"));
+		expect(linesAfterKill).toContain("alpha\n");
+		expect(linesAfterKill).toContain("ta");
+		expect(linesAfterKill).not.toContain("beta");
+
+		// Ctrl+Y restores alpha\nbeta
+		comp.handleInput("\x19"); // Ctrl+Y (yank)
+		const linesAfterYank = stripAnsi(comp.render(80).join("\n"));
+		expect(linesAfterYank).toContain("beta");
+
+		// Submit with Enter
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("alpha\nbeta");
+	});
+
+	it("Scenario 1: Move and kill a line in optional-notes focus", () => {
+		const { comp, done } = createHelper();
+		// Select Option 1
+		comp.handleInput("1");
+		// Tab to optional notes
+		comp.handleInput("\t");
+		// Paste alpha\nbeta
+		comp.handleInput("\x1b[200~alpha\nbeta\x1b[201~");
+
+		// Move to line start with Ctrl+A, then right twice
+		comp.handleInput("\x01"); // start of "beta"
+		comp.handleInput("\x06");
+		comp.handleInput("\x06"); // after "be"
+
+		// Ctrl+U leaves alpha\nta
+		comp.handleInput("\x15");
+		const linesAfterKill = stripAnsi(comp.render(80).join("\n"));
+		expect(linesAfterKill).toContain("alpha\n");
+		expect(linesAfterKill).toContain("ta");
+		expect(linesAfterKill).not.toContain("beta");
+
+		// Ctrl+Y restores alpha\nbeta
+		comp.handleInput("\x19");
+		const linesAfterYank = stripAnsi(comp.render(80).join("\n"));
+		expect(linesAfterYank).toContain("beta");
+
+		// Submit with Enter
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("1. Alpha\n\nalpha\nbeta");
+	});
+
+	it("Ctrl+K deletes to line end, second Ctrl+K deletes newline to merge lines", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("\x1b[200~alpha\nbeta\x1b[201~");
+
+		// Move to start of beta
+		comp.handleInput("\x01");
+		// Right twice (after "be")
+		comp.handleInput("\x06");
+		comp.handleInput("\x06");
+
+		// Ctrl+K removes "ta" to end of line
+		comp.handleInput("\x0b");
+
+		// Second Ctrl+K: already at end of line "be", but there is no next line here.
+		// Let's test with 3 lines: alpha\nbeta\ngamma
+		const { comp: c3, done: d3 } = createHelper();
+		c3.handleInput("w");
+		c3.handleInput("\x1b[200~alpha\nbeta\ngamma\x1b[201~");
+		// Cursor is at end of line 3 ("gamma"). Up arrow moves to line 2 ("beta")
+		c3.handleInput("\x1b[A");
+		// Move to start of beta
+		c3.handleInput("\x01");
+		c3.handleInput("\x06");
+		c3.handleInput("\x06"); // after "be"
+		c3.handleInput("\x0b"); // removes "ta", leaves alpha\nbe\ngamma
+		c3.handleInput("\x0b"); // at end of "be", removes "\n", leaves alpha\nbegamma
+		c3.handleInput("\r");
+		expect(d3).toHaveBeenCalledWith("alpha\nbegamma");
+	});
+
+	it("word movement, word deletion, forward delete, and undo on 'one two'", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("\x1b[200~one two\x1b[201~");
+
+		// Cursor at end (index 7). Ctrl+B moves by one
+		comp.handleInput("\x02"); // cursor at 6 (between w and o)
+		comp.handleInput("\x06"); // cursor at 7 (after o)
+
+		// Alt+B moves word backward to start of "two" (index 4)
+		comp.handleInput("\x1bb");
+		// Alt+B again moves word backward to start of "one" (index 0)
+		comp.handleInput("\x1bb");
+		// Alt+F moves word forward to end of "one" (index 3)
+		comp.handleInput("\x1bf");
+		// Alt+F moves word forward to end of "two" (index 7)
+		comp.handleInput("\x1bf");
+
+		// Ctrl+W deletes "two", leaving "one "
+		comp.handleInput("\x17");
+		let plain = stripAnsi(comp.render(80).join("\n"));
+		expect(plain).toContain("one ");
+		expect(plain).not.toContain("one two");
+
+		// Undo (Ctrl+-) restores "one two"
+		comp.handleInput("\x1f");
+		plain = stripAnsi(comp.render(80).join("\n"));
+		expect(plain).toContain("one two");
+
+		// Move to start of "two" (Alt+B)
+		comp.handleInput("\x1bb");
+		// Alt+D deletes word forward "two", leaving "one "
+		comp.handleInput("\x1bd");
+		plain = stripAnsi(comp.render(80).join("\n"));
+		expect(plain).toContain("one ");
+		expect(plain).not.toContain("one two");
+
+		// Undo restores "one two"
+		comp.handleInput("\x1f");
+		plain = stripAnsi(comp.render(80).join("\n"));
+		expect(plain).toContain("one two");
+
+		// Move to start (Ctrl+A), Delete / Ctrl+D deletes 'o', leaving "ne two"
+		comp.handleInput("\x01");
+		comp.handleInput("\x04"); // Ctrl+D
+		plain = stripAnsi(comp.render(80).join("\n"));
+		expect(plain).toContain("ne two");
+		expect(plain).not.toContain("one two");
+
+		// Undo restores 'o'
+		comp.handleInput("\x1f");
+		plain = stripAnsi(comp.render(80).join("\n"));
+		expect(plain).toContain("one two");
+
+		// Submit
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("one two");
+	});
+
+	it("yank-pop (Alt+Y) cycles through kill ring entries", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		// Type first kill
+		comp.handleInput("\x1b[200~first\x1b[201~");
+		comp.handleInput("\x01"); // line start
+		comp.handleInput("\x0b"); // kill "first"
+
+		// Type second kill
+		comp.handleInput("\x1b[200~second\x1b[201~");
+		comp.handleInput("\x01");
+		comp.handleInput("\x0b"); // kill "second"
+
+		// Yank (Ctrl+Y) inserts most recent: "second"
+		comp.handleInput("\x19");
+		// Yank-pop (Alt+Y) replaces "second" with "first"
+		comp.handleInput("\x1by");
+
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("first");
+	});
+
+	it("respects custom keybinding manager injected into component", () => {
+		const { KeybindingsManager, TUI_KEYBINDINGS } = require("@earendil-works/pi-tui");
+		const customKb = new KeybindingsManager(TUI_KEYBINDINGS, {
+			"tui.editor.cursorWordLeft": "ctrl+x",
+		});
+		const { comp, done } = createHelper({ keybindings: customKb });
+		comp.handleInput("w");
+		comp.handleInput("\x1b[200~alpha beta\x1b[201~"); // cursor at 10
+
+		// Press custom key Ctrl+X ("\x18") to trigger cursorWordLeft
+		comp.handleInput("\x18");
+		// Now cursor is at start of beta (index 6). Delete forward (Ctrl+D) deletes 'b'
+		comp.handleInput("\x04");
+
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("alpha eta");
+	});
+
+	it("Scenario 2: multiline visual row navigation with sticky visual column and Up-to-choices exit", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		// Text: "alpha\nb\nlonger"
+		// Line 1: alpha (indices 0..4, len 5). Cursor after alph is index 4 (col 4).
+		// Line 2: b (index 6, len 1). Max col is 1 (index 7).
+		// Line 3: longer (indices 8..13, len 6). Col 4 is index 12 (after "long").
+		comp.handleInput("\x1b[200~alpha\nb\nlonger\x1b[201~");
+
+		// Move to start of text:
+		// Cursor is currently at end of text (index 14).
+		// Up arrow twice moves to line 1
+		comp.handleInput("\x1b[A"); // moves to line 2 (b)
+		comp.handleInput("\x1b[A"); // moves to line 1 (alpha)
+		// Move to start of line with Ctrl+A, then right 4 times to column 4 (after alph)
+		comp.handleInput("\x01");
+		comp.handleInput("\x06");
+		comp.handleInput("\x06");
+		comp.handleInput("\x06");
+		comp.handleInput("\x06");
+
+		// Verify cursor on line 1: render at 80 cols has cursor on 'a' (index 4)
+		let plain = comp.render(80).join("\n");
+		expect(plain).toContain("Write in your answer: alph\x1b[7ma\x1b[0m");
+
+		// Down clamps at column 1 of 'b'
+		comp.handleInput("\x1b[B"); // Down
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("  b\x1b[7m \x1b[0m");
+
+		// Another Down restores column 4 of 'longer'
+		comp.handleInput("\x1b[B"); // Down
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("  long\x1b[7me\x1b[0mr");
+
+		// Up clamps at column 1 of 'b'
+		comp.handleInput("\x1b[A"); // Up
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("  b\x1b[7m \x1b[0m");
+
+		// Another Up restores column 4 of 'alpha'
+		comp.handleInput("\x1b[A"); // Up
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("Write in your answer: alph\x1b[7ma\x1b[0m");
+
+		// Then Up on line 1 returns to choices
+		comp.handleInput("\x1b[A"); // Up
+		// Now focus should be "options" (chip-focused hint is rendered, no cursor in field)
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("select · [Tab/↓] notes · [Enter] submit");
+
+		// Submit with Enter submits the choice with "alpha\nb\nlonger"
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("alpha\nb\nlonger");
+	});
+
+	it("Scenario 2: Tab returns directly to choices from any visual row", () => {
+		const { comp } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("\x1b[200~alpha\nb\nlonger\x1b[201~");
+		// Currently on line 3 ("longer")
+		comp.handleInput("\t");
+		let plain = comp.render(80).join("\n");
+		expect(plain).toContain("select · [Tab/↓] notes · [Enter] submit");
+
+		// Tab back to notes, move Up to line 2 ("b")
+		comp.handleInput("\t");
+		comp.handleInput("\x1b[A");
+		// Tab again returns to choices
+		comp.handleInput("\t");
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("select · [Tab/↓] notes · [Enter] submit");
+	});
+
+	it("Scenario 2: Unbroken long line at width 40 wraps and Up traverses visual rows before leaving", () => {
+		const { comp } = createHelper();
+		comp.handleInput("w");
+		// 100-character unbroken line wraps into 3 visual rows at width 40 (maxWidth 37)
+		const longText = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+		comp.handleInput("\x1b[200~" + longText + "\x1b[201~");
+
+		// Render at 40 cols to establish visual lines
+		comp.render(40);
+
+		// Cursor starts at end (on the last visual segment).
+		// Pressing Up once moves to the previous visual segment (not choices)
+		comp.handleInput("\x1b[A");
+		let plain = comp.render(40).join("\n");
+		expect(plain).toContain("[Tab/↑ top] choices"); // still in field!
+
+		// Pressing Up again moves to the first visual segment
+		comp.handleInput("\x1b[A");
+		plain = comp.render(40).join("\n");
+		expect(plain).toContain("[Tab/↑ top] choices"); // still in field!
+
+		// Pressing Up on the first visual segment returns to choices
+		comp.handleInput("\x1b[A");
+		plain = comp.render(40).join("\n");
+		expect(plain).toContain("select · [Tab/↓]"); // now in choices!
+	});
+
+	it("vertical travel never splits a Unicode grapheme", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("\x1b[200~😀\nx\x1b[201~");
+		comp.render(80);
+		comp.handleInput("\x1b[A"); // The target row has a two-cell emoji, not two editable characters.
+		comp.handleInput("\x7f"); // Column 1 falls inside the emoji: clamp left; don't remove a surrogate.
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("😀\nx");
+	});
+
+	it("vertical travel measures display cells and restores the requested column", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("\x1b[200~界az\nx\nabcd\x1b[201~");
+		comp.render(80);
+		comp.handleInput("\x1b[D");
+		comp.handleInput("\x1b[D"); // Display column 2 on the last row.
+		comp.handleInput("\x1b[A"); // Short x row clamps to column 1.
+		comp.handleInput("\x1b[A"); // Restore display column 2, just after 界.
+		comp.handleInput("!");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("界!az\nx\nabcd");
+	});
+
+	it("Scenario 3: W, a, Ctrl+J, b, Enter submits exactly a\\nb once", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("a");
+		comp.handleInput("\n"); // Ctrl+J
+		comp.handleInput("b");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledTimes(1);
+		expect(done).toHaveBeenCalledWith("a\nb");
+	});
+
+	it("Scenario 3: distinct Shift+Enter adds LF but never submits", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("a");
+		comp.handleInput("\x1b[13;2u"); // Kitty Shift+Enter
+		comp.handleInput("b");
+		comp.handleInput("\x1b[13;2~"); // CSI Shift+Enter
+		comp.handleInput("c");
+		expect(done).not.toHaveBeenCalled();
+
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledTimes(1);
+		expect(done).toHaveBeenCalledWith("a\nb\nc");
+	});
+
+	it("Scenario 3: paste with terminal control sequences strips ESC and BEL before render and submission", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		// a\x1b]52;c;WA==\x07b
+		comp.handleInput("\x1b[200~a\x1b]52;c;WA==\x07b\x1b[201~");
+		const rendered = comp.render(80).join("\n");
+		expect(rendered).not.toContain("\x1b]52;c;WA==");
+		expect(rendered).not.toContain("\x07");
+
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("a]52;c;WA==b");
+	});
+
+	it("Scenario 3: empty Write-in blocks Enter; Esc clears text then dismisses", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		// Empty Write-in: Enter does not call done
+		comp.handleInput("\r");
+		expect(done).not.toHaveBeenCalled();
+
+		// Type "x"
+		comp.handleInput("x");
+		// First Esc clears text and returns to choices
+		comp.handleInput("\x1b");
+		expect(done).not.toHaveBeenCalled();
+		let plain = comp.render(80).join("\n");
+		expect(plain).toContain("select · [Tab/↓] notes · [Enter] submit");
+
+		// Second Esc dismisses form (calls done(null))
+		comp.handleInput("\x1b");
+		expect(done).toHaveBeenCalledWith(null);
+	});
+
+	it("Scenario 3: notes selection with 1, Tab, x, Enter submits exactly '1. Alpha\\n\\nx'", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("1");
+		comp.handleInput("\t");
+		comp.handleInput("x");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("1. Alpha\n\nx");
+	});
+
+	it("Scenario 3: Form Enter, Tab, and Escape win collisions with remapped editor actions", () => {
+		const { KeybindingsManager, TUI_KEYBINDINGS } = require("@earendil-works/pi-tui");
+		// Remap editor actions to enter, tab, and escape
+		const collidingKb = new KeybindingsManager(TUI_KEYBINDINGS, {
+			"tui.editor.deleteCharForward": "enter",
+			"tui.editor.cursorWordForward": "tab",
+			"tui.editor.undo": "escape",
+		});
+		const { comp, done } = createHelper({ keybindings: collidingKb });
+		comp.handleInput("w");
+		comp.handleInput("test");
+
+		// Tab should return to choices, not trigger cursorWordForward
+		comp.handleInput("\t");
+		let plain = comp.render(80).join("\n");
+		expect(plain).toContain("select · [Tab/↓] notes · [Enter] submit");
+
+		// Tab back to notes
+		comp.handleInput("\t");
+
+		// Escape should clear text and return to choices, not trigger undo
+		comp.handleInput("\x1b");
+		plain = comp.render(80).join("\n");
+		expect(plain).toContain("select · [Tab/↓] notes · [Enter] submit");
+
+		// Retype "hello"
+		comp.handleInput("\t");
+		comp.handleInput("hello");
+
+		// Enter should submit, not trigger deleteCharForward
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("hello");
+	});
+
+	it("an empty sanitized paste does not consume the next undo", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("a");
+		comp.handleInput("\x1b[200~\x1b\x07\x1b[201~");
+		comp.handleInput("\x1f"); // Undo must revert the last actual edit, not an empty paste.
+		comp.handleInput("b");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("b");
+	});
+
+	it("a configured input submit chord cannot steal an editor action or submit from options", () => {
+		const { KeybindingsManager, TUI_KEYBINDINGS } = require("@earendil-works/pi-tui");
+		const kb = new KeybindingsManager(TUI_KEYBINDINGS, { "tui.input.submit": "ctrl+u" });
+		const { comp, done } = createHelper({ keybindings: kb });
+		comp.handleInput("\n"); // Ctrl+J has no editing target while choices are focused.
+		expect(done).not.toHaveBeenCalled();
+		comp.handleInput("w");
+		comp.handleInput("alpha");
+		comp.handleInput("\x15"); // Ctrl+U deletes the answer instead of submitting it.
+		expect(done).not.toHaveBeenCalled();
+		comp.handleInput("beta");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("beta");
+	});
+
+	it("unknown escape with CR cannot silently insert a line", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("a");
+		comp.handleInput("\x1b[999~\r");
+		comp.handleInput("b");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("ab");
+	});
+
+	it("Scenario 3: unknown Pi app/history/autocomplete actions and control characters are ignored", () => {
+		const { comp, done } = createHelper();
+		comp.handleInput("w");
+		comp.handleInput("a");
+		// Send unknown control characters or app chords: e.g. Ctrl+P (up/prev history in readline), Ctrl+N (next history)
+		// which are not bound in TUI_KEYBINDINGS for editor
+		comp.handleInput("\x10"); // Ctrl+P
+		comp.handleInput("\x0e"); // Ctrl+N
+		// Send unknown ANSI sequence
+		comp.handleInput("\x1b[999~");
+		comp.handleInput("b");
+		comp.handleInput("\r");
+		expect(done).toHaveBeenCalledWith("ab");
+	});
+});
+

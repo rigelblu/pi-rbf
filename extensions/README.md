@@ -351,20 +351,40 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 - Terminal Paste: Pasting into the write-in or notes field (from chips or field focus) inserts clipboard text at the cursor, preserves internal blank lines, and removes terminal control characters before rendering or submission.
 - Canned Reply: Quick chip `[ C. /convo-is-very-best ]` (or pressing `c` / `C`) immediately selects `/skill:convo-is-very-best` (with optional notes).
 - Accidental ESC Recovery: If dismissed with `Esc`, the options are cached. Typing `/answer-question`, or pressing `Ctrl+Q`, re-opens the selector instantly.
-- Keyboard Navigation:
-  - `1`–`9`: Select a matching offered answer
-  - `c` / `C`: Select the canned reply
-  - `w` / `W`: Select Write-in from chip focus; type the letter normally in the answer field
-  - `←` / `→` or `h` / `l`: Move selection between chips
-  - `Tab` or `↓` / `j`: Move focus down to `Add notes to selection:`
-  - `Shift+Tab` or `↑` / `k`: Move focus back up to options row
-  - `Enter`: Confirm and submit highlighted option + notes
-  - `Esc`: Clear notes or dismiss selector without submitting
+- Keyboard Navigation & Controls:
+  - Chip focus (`options`):
+    - `1`–`9`: Select matching numbered answer
+    - `c` / `C`: Select canned reply
+    - `w` / `W`: Select Write-in and focus answer field
+    - `←` / `→` or `h` / `l`: Move selection between chips
+    - `Tab` or `↓` / `j`: Move focus down to answer/notes field
+    - `Enter`: Confirm and submit selected option (blocks if Write-in is empty)
+    - `Esc`: Dismiss selector without submitting
+  - Field focus (`notes`):
+    - Configured Pi editor key families (respects `~/.pi/agent/keybindings.json` via active keybindings manager):
+      - Character & word navigation: `←` / `→` or `Ctrl+B` / `Ctrl+F` (char left/right), `Alt+B` / `Alt+F` (word left/right), `Home` / `End` or `Ctrl+A` / `Ctrl+E` (logical line start/end)
+      - Deletion: `Backspace` / `Ctrl+H` (char left), `Delete` / `Ctrl+D` (char right), `Ctrl+W` / `Alt+Backspace` (word left), `Alt+D` (word right), `Ctrl+U` (delete to line start), `Ctrl+K` (delete to line end; deletes newline when at line end)
+      - Kill ring & undo: `Ctrl+Y` (yank), `Alt+Y` (yank-pop to cycle kill ring), `Ctrl+-` / `Ctrl+_` (undo)
+    - Visual row multiline navigation:
+      - `↑` (Up): traverses earlier visual (wrapped) rows; pressing `↑` on the first visual row returns to choices.
+      - `↓` (Down): traverses later visual rows; consecutive vertical moves remember the original visual column across shorter rows and restore it on longer rows (non-vertical movements or edits reset the remembered column).
+    - Focus, submission, and priority:
+      - `Tab`: unconditionally returns to choices from any row.
+      - `Enter`: submits the form (Form `Enter`, `Tab`, and `Esc` always take precedence over colliding custom editor bindings).
+      - `Esc`: if field contains text, clears field and returns to choices; pressing `Esc` again dismisses form.
+    - Newline vs. Enter & Terminal Caveat:
+      - `Shift+Enter` and `Ctrl+J` insert a newline (`\n`) without submitting. Bare `Enter` submits.
+      - *Terminal Shift+Enter Caveat:* In terminals without extended keyboard protocols (like Kitty keyboard protocol or CSI u), `Shift+Enter` is reported identically to bare `Enter` (`\r`), triggering submission. Use `Ctrl+J` in these terminals to insert newlines reliably.
+    - Field-focused hint shows `  [Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close` at 80 cols (truncated cleanly at 40 cols while retaining navigation and submit).
 - Dual Tool Registration: Exposes both `question` and `ask_question` tools accepting string options or structured `{ label, description }` objects.
 - Text Detection Heuristic: Automatically activates the selector on `agent_settled` when assistant messages end with numbered options following `Recommendation:`, `User Need Framing:`, preceding `?`, or containing `← recommended` / `(recommended)` tags. Regular tutorial lists are never misidentified.
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi --no-extensions -e ./extensions/rbf-question-form.ts`, ask a question with options, select using numbers or arrows, add optional notes, or run `/answer-question`.
+- Activation recipe: always on; no configuration flag needed.
+  1. Launch local extension in isolated session: `pi --no-extensions -e ./extensions/rbf-question-form.ts`
+  2. Ask a question with options (or invoke `question` tool).
+  3. Press `W` to focus Write-in, or press `1` then `Tab` for optional notes.
+  4. Edit text with editor keys (`Ctrl+A`, `Ctrl+E`, `Ctrl+U`, `Ctrl+K`, `Ctrl+Y`, `Ctrl+-`), insert newlines with `Ctrl+J`, navigate visual rows with `↑`/`↓`, and submit with `Enter`.
 - Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
 
