@@ -5,7 +5,7 @@ The row gate's test hands this script one JSON plan on stdin:
 
   {"argv": ["pi", ...], "cwd": "...", "env": {...}, "cols": 100, "rows": 40, "timeout": 30,
    "out": "raw.bin",
-   "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}]}
+   "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}, {"snapshot": "after-turn"}]}
 
 Rules learned driving Pi 0.85.1 (core memories): a slash command or prompt goes in as one
 bracketed paste, never char by char, or Pi's autocomplete opens and Enter takes a completion;
@@ -51,6 +51,7 @@ def main() -> int:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
     raw = bytearray()
+    snapshots = {}
     failure = None
 
     def pump(until: float) -> None:
@@ -73,9 +74,10 @@ def main() -> int:
         for step in plan["steps"]:
             if "wait" in step:
                 pattern = re.compile(step["wait"].encode())
-                while not pattern.search(strip(bytes(raw))):
+                count = int(step.get("count", 1))
+                while len(list(pattern.finditer(strip(bytes(raw))))) < count:
                     if time.monotonic() > deadline:
-                        failure = f"timed out waiting for {step['wait']!r}"
+                        failure = f"timed out waiting for {step['wait']!r} (count={count})"
                         break
                     pump(time.monotonic() + 0.1)
                 if failure:
@@ -88,6 +90,12 @@ def main() -> int:
                 pump(time.monotonic() + 0.15)
             elif "sleep" in step:
                 pump(time.monotonic() + float(step["sleep"]))
+            elif "snapshot" in step:
+                name = step["snapshot"]
+                if name in snapshots:
+                    failure = f"duplicate snapshot {name!r}"
+                    break
+                snapshots[name] = len(raw)
     finally:
         # Let the last frame land, then take only Pi down; its children follow it (stdin EOF).
         pump(time.monotonic() + 0.4)
@@ -108,6 +116,7 @@ def main() -> int:
     if failure:
         print(failure, file=sys.stderr)
         return 2
+    print(json.dumps(snapshots))
     return 0
 
 

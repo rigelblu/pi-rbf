@@ -105,12 +105,31 @@ export function highlightConfigSections(text: string, theme?: ForegroundTheme): 
  */
 export function cleanReadOutputText(text: string): string {
 	if (!text) return text;
-	// Strip leading newlines so output sits directly below tool call header
-	let cleaned = text.replace(/^\n+/, "");
-	// Strip surrounding markdown code block fences if present in the raw text
-	const fenceMatch = cleaned.match(/^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```\s*$/);
-	if (fenceMatch) {
-		cleaned = fenceMatch[1];
+
+	const ansiPattern = /\x1b\[[0-9;]*[a-zA-Z]/g;
+	const fencePattern = /^```[a-zA-Z0-9_-]*$/;
+	const lineBreak = /\r\n/.test(text) ? "\r\n" : "\n";
+	const lines = text.split(lineBreak);
+	const strippedLines = lines.map((line) => line.replace(ansiPattern, "").trim());
+	const firstContent = strippedLines.findIndex((line) => line.length > 0);
+	let lastContent = -1;
+	for (let i = strippedLines.length - 1; i >= 0; i--) {
+		if (strippedLines[i].length > 0) {
+			lastContent = i;
+			break;
+		}
+	}
+
+	const surroundedByFences =
+		firstContent >= 0 && strippedLines[firstContent].startsWith("```") &&
+		fencePattern.test(strippedLines[firstContent]) &&
+		lastContent > firstContent &&
+		strippedLines[lastContent] === "```";
+	const contentLines = surroundedByFences ? lines.slice(firstContent + 1, lastContent) : lines;
+	// Strip the closing fence's separator; Pi may already convert CRLF to `\r` + LF and style over it.
+	let cleaned = contentLines.join(lineBreak).replace(/^(?:\r?\n)+/, "");
+	if (surroundedByFences) {
+		cleaned = cleaned.replace(/\r(?=(?:\x1b\[[0-9;]*[a-zA-Z])*$)/, "");
 	}
 	return cleaned;
 }

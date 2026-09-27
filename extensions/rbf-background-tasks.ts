@@ -42,6 +42,7 @@ const ORIG_LOADER_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origLoaderUpd
 const ORIG_LOADER_SET_MESSAGE = Symbol.for("rbf.backgroundTasks.origLoaderSetMessage");
 const ORIG_BASH_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origBashUpdateDisplay");
 const ORIG_TOOL_EXECUTION_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origToolExecutionUpdateDisplay");
+export const INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.installedToolExecutionUpdateDisplay");
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -440,7 +441,7 @@ export function patchBashExecutionComponent(): void {
 		const origToolUpdateDisplay = toolProto.updateDisplay;
 		toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY] = origToolUpdateDisplay;
 
-		toolProto.updateDisplay = function () {
+		const installedUpdateDisplay = function (this: any) {
 			if (typeof origToolUpdateDisplay === "function") {
 				try {
 					origToolUpdateDisplay.call(this);
@@ -457,6 +458,8 @@ export function patchBashExecutionComponent(): void {
 			}
 		};
 
+		toolProto.updateDisplay = installedUpdateDisplay;
+		toolProto[INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY] = installedUpdateDisplay;
 		toolProto[TOOL_EXECUTION_PATCHED_KEY] = true;
 	}
 }
@@ -486,11 +489,19 @@ export function unpatchBashExecutionComponent(): void {
 
 	const toolProto = (ToolExecutionComponent as any)?.prototype;
 	if (toolProto && toolProto[TOOL_EXECUTION_PATCHED_KEY]) {
-		if (toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY]) {
-			toolProto.updateDisplay = toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
-			delete toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+		const installed = toolProto[INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY];
+		const canRestore =
+			typeof installed === "function"
+				? toolProto.updateDisplay === installed
+				: true;
+		if (canRestore) {
+			if (toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY]) {
+				toolProto.updateDisplay = toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+				delete toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+			}
+			delete toolProto[TOOL_EXECUTION_PATCHED_KEY];
+			delete toolProto[INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY];
 		}
-		delete toolProto[TOOL_EXECUTION_PATCHED_KEY];
 	}
 }
 
@@ -668,6 +679,8 @@ export interface FooterRegistry {
 	originalRender: (width: number) => string[];
 	originalHandleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 	isHandlingMouse?: boolean;
+	installedRender?: (this: any, width: number) => string[];
+	installedHandleMouse?: (this: any, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 }
 
 export function getOrCreateFooterRegistry(): FooterRegistry | null {
@@ -678,15 +691,8 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 	if (!registry) {
 		const originalRender = FooterComponent.prototype.render;
 		const originalHandleMouse = (FooterComponent.prototype as any).handleMouse;
-		registry = {
-			hooks: new Map(),
-			originalRender,
-			originalHandleMouse,
-			isHandlingMouse: false,
-		};
-		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
 
-		FooterComponent.prototype.render = function (this: any, width: number): string[] {
+		const installedRender = function (this: any, width: number): string[] {
 			let lines = registry.originalRender.call(this, width);
 			for (const hook of registry.hooks.values()) {
 				try {
@@ -698,7 +704,7 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 			return lines;
 		};
 
-		(FooterComponent.prototype as any).handleMouse = function (
+		const installedHandleMouse = function (
 			this: any,
 			event: TuiMouseEvent,
 		): TuiMouseEventResult | undefined {
@@ -728,6 +734,19 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 				registry.isHandlingMouse = false;
 			}
 		};
+
+		registry = {
+			hooks: new Map(),
+			originalRender,
+			originalHandleMouse,
+			isHandlingMouse: false,
+			installedRender,
+			installedHandleMouse,
+		};
+		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
+
+		FooterComponent.prototype.render = installedRender;
+		(FooterComponent.prototype as any).handleMouse = installedHandleMouse;
 	}
 	return registry;
 }
@@ -838,13 +857,23 @@ export function unpatchFooterComponent(): void {
 	if (registry) {
 		registry.hooks.delete("tasks");
 		if (registry.hooks.size === 0) {
-			FooterComponent.prototype.render = registry.originalRender;
-			if (registry.originalHandleMouse) {
-				(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
-			} else {
-				delete (FooterComponent.prototype as any).handleMouse;
+			const currentRender = FooterComponent.prototype.render;
+			const currentHandleMouse = (FooterComponent.prototype as any).handleMouse;
+			const canRestore =
+				typeof registry.installedRender === "function" &&
+				typeof registry.installedHandleMouse === "function" &&
+				currentRender === registry.installedRender &&
+				currentHandleMouse === registry.installedHandleMouse;
+
+			if (canRestore) {
+				FooterComponent.prototype.render = registry.originalRender;
+				if (registry.originalHandleMouse) {
+					(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
+				} else {
+					delete (FooterComponent.prototype as any).handleMouse;
+				}
+				delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 			}
-			delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 		}
 	}
 	delete (FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY];

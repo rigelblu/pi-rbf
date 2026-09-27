@@ -331,24 +331,30 @@ export function formatFooterLineWithRightSide(
 	return truncateToWidth(rightContent, width, "");
 }
 
-let statusLineCache: CachedStatusLine | null = null;
+export const STATUS_LINE_CACHE_KEY = Symbol.for("rbf.statusLine.cache");
 
 export function getCachedStatusLine(): CachedStatusLine | null {
-	return statusLineCache;
+	return (globalThis as any)[STATUS_LINE_CACHE_KEY] ?? null;
 }
 
 export function setCachedStatusLine(cache: CachedStatusLine | null): void {
-	statusLineCache = cache;
+	if (cache === null) {
+		delete (globalThis as any)[STATUS_LINE_CACHE_KEY];
+	} else {
+		(globalThis as any)[STATUS_LINE_CACHE_KEY] = cache;
+	}
 }
 
 export function invalidateStatusLineCache(): void {
-	statusLineCache = null;
+	delete (globalThis as any)[STATUS_LINE_CACHE_KEY];
 }
 
 export function patchFooterComponent(): boolean {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return false;
 	}
+	(FooterComponent.prototype as any)[Symbol.for("rbf.statusLine.invalidateCache")] = invalidateStatusLineCache;
+
 	if ((FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY]) {
 		return true;
 	}
@@ -368,22 +374,23 @@ export function patchFooterComponent(): boolean {
 		const now = Date.now();
 
 		let statusText: string;
+		const cached = getCachedStatusLine();
 		if (
-			statusLineCache &&
-			statusLineCache.cwd === cwd &&
-			statusLineCache.sessionName === sessionName &&
-			now - statusLineCache.timestamp < 2000
+			cached &&
+			cached.cwd === cwd &&
+			cached.sessionName === sessionName &&
+			now - cached.timestamp < 2000
 		) {
-			statusText = statusLineCache.line;
+			statusText = cached.line;
 		} else {
 			const components = resolveStatusLineComponents(cwd, { sessionName });
 			statusText = formatStatusLine(components);
-			statusLineCache = {
+			setCachedStatusLine({
 				cwd,
 				sessionName,
 				line: statusText,
 				timestamp: now,
-			};
+			});
 		}
 
 		const theme = this.session?.theme ?? getActiveTheme();
@@ -407,6 +414,7 @@ export function unpatchFooterComponent(): void {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return;
 	}
+	invalidateStatusLineCache();
 	if ((FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY]) {
 		const originalRender = (FooterComponent.prototype as any)[ORIGINAL_STATUS_LINE_RENDER_KEY];
 		if (originalRender) {
@@ -414,11 +422,13 @@ export function unpatchFooterComponent(): void {
 		}
 		delete (FooterComponent.prototype as any)[ORIGINAL_STATUS_LINE_RENDER_KEY];
 		delete (FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY];
+		delete (FooterComponent.prototype as any)[Symbol.for("rbf.statusLine.invalidateCache")];
 	}
 }
 
 export default function rbfStatusLine(pi: ExtensionAPI): void {
 	patchFooterComponent();
+	invalidateStatusLineCache();
 
 	const invalidate = () => {
 		invalidateStatusLineCache();

@@ -225,12 +225,14 @@ Local Pi extension that brings parity with Claude Code's status line to Line 1 o
   - `@<commit>`: shortest parent change ID from `jj log -r @- -T 'change_id.shortest()'` (or git commit)
   - `• <session_name>`: preserves session name if set via `/name`
 - Preserves native metrics: keeps Pi's Line 2 (cumulative tokens, cache reads/writes, cost, context percentage, model, thinking level) and Line 3 (extension statuses) completely untouched
+- Session lifecycle continuity: after `/resume`, a same-type session switch, or `/reload`, background-tasks and todos release their footer hooks without replacing this extension's wrapper; the rich workspace row and native metrics row stay in place. Fresh extension modules keep the established collapsed tool blending, fenced-read cleanup, edit glance, cache-guardian state, and status-line cache binding; an old cache window disappears on shutdown and reappears only after a new eligible turn
 - Seamless Cache Guardian integration: coordinates with `rbf-cache-guardian` to right-align the passive cache guardian countdown on Line 0 alongside the status line
 - Sub-millisecond TUI rendering: in-memory caching with 2-second TTL ensures zero subprocess latency during typing or streaming responses, invalidating reactively on session, turn, and bash events
 - Zero external dependencies: pure TypeScript extension utilizing standard Node built-ins (`node:child_process`, `node:fs`, `node:path`, `node:os`), `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui`
 
 ## 🟠⋯ Setup & Verification
 - Local verification: launch `pi -e ./extensions/rbf-status-line.ts` and inspect Line 1 of the footer (e.g. `📁 pi-rbf | 📦 pi-rbf |  main | 🌴 .claude @mm`)
+- Resume verification: launch `pi -e ./extensions/rbf-background-tasks.ts -e ./extensions/rbf-todos.ts -e ./extensions/rbf-status-line.ts -e ./extensions/rbf-cache-guardian.ts`, name two sessions with `/name`, then `/resume` the earlier one; the first row keeps `📁 … | 📦 … • <resumed name>` and the native usage/model row remains below it. A `/reload` verification should also show familiar collapsed tool rows and no stale cache countdown before a fresh eligible turn
 - Subdirectory check: `cd extensions` and observe `📁 extensions | 📦 pi-rbf |  main | 🌴 .claude @mm`
 - Global installation: `cp ./extensions/rbf-status-line.ts ~/.pi/agent/extensions/rbf-status-line.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-status-line.ts`

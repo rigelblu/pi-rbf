@@ -37,10 +37,32 @@ describe("rbf-clean-markdown-code string cleaning helpers", () => {
 		expect(cleanReadOutputText(fencedWithLeadingNewlines)).toBe("const x = 42;");
 	});
 
+	it("cleanReadOutputText strips ANSI-styled surrounding fences", () => {
+		const raw =
+			"\n\x1b[38;2;102;102;102m```text\x1b[39m\n\x1b[38;2;102;102;102mFENCED_AFTER_RELOAD\x1b[39m\n\x1b[38;2;102;102;102m```\x1b[39m";
+		const cleaned = cleanReadOutputText(raw);
+		expect(cleaned).toBe("\x1b[38;2;102;102;102mFENCED_AFTER_RELOAD\x1b[39m");
+		expect(cleaned).not.toContain("```");
+	});
+
+	it("cleanReadOutputText strips surrounding CRLF fences without retaining the boundary CR", () => {
+		expect(cleanReadOutputText("```text\r\nA\r\nB\r\n```\r\n")).toBe("A\r\nB");
+
+		// Pi's read renderer splits at LF, leaves each CR at the end of the line, then styles around it.
+		const styled =
+			"\x1b[38;2;102;102;102m```text\r\x1b[39m\n\x1b[38;2;102;102;102mA\r\x1b[39m\n\x1b[38;2;102;102;102mB\r\x1b[39m\n\x1b[38;2;102;102;102m```\r\x1b[39m\n";
+		expect(cleanReadOutputText(styled)).toBe(
+			"\x1b[38;2;102;102;102mA\r\x1b[39m\n\x1b[38;2;102;102;102mB\x1b[39m",
+		);
+	});
+
 	it("cleanReadOutputText leaves normal text unchanged", () => {
 		const normal = 'line 1\nline 2';
 		expect(cleanReadOutputText(normal)).toBe(normal);
 		expect(cleanReadOutputText("")).toBe("");
+
+		const proseAroundFence = 'Before\n```text\ninside\n```\nAfter';
+		expect(cleanReadOutputText(proseAroundFence)).toBe(proseAroundFence);
 	});
 });
 

@@ -217,6 +217,8 @@ export interface FooterRegistry {
 	originalRender: (width: number) => string[];
 	originalHandleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 	isHandlingMouse?: boolean;
+	installedRender?: (this: any, width: number) => string[];
+	installedHandleMouse?: (this: any, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 }
 
 export function getOrCreateFooterRegistry(): FooterRegistry | null {
@@ -227,15 +229,8 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 	if (!registry) {
 		const originalRender = FooterComponent.prototype.render;
 		const originalHandleMouse = (FooterComponent.prototype as any).handleMouse;
-		registry = {
-			hooks: new Map(),
-			originalRender,
-			originalHandleMouse,
-			isHandlingMouse: false,
-		};
-		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
 
-		FooterComponent.prototype.render = function (this: any, width: number): string[] {
+		const installedRender = function (this: any, width: number): string[] {
 			let lines = registry.originalRender.call(this, width);
 			for (const hook of registry.hooks.values()) {
 				try {
@@ -247,7 +242,7 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 			return lines;
 		};
 
-		(FooterComponent.prototype as any).handleMouse = function (
+		const installedHandleMouse = function (
 			this: any,
 			event: TuiMouseEvent,
 		): TuiMouseEventResult | undefined {
@@ -277,6 +272,19 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 				registry.isHandlingMouse = false;
 			}
 		};
+
+		registry = {
+			hooks: new Map(),
+			originalRender,
+			originalHandleMouse,
+			isHandlingMouse: false,
+			installedRender,
+			installedHandleMouse,
+		};
+		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
+
+		FooterComponent.prototype.render = installedRender;
+		(FooterComponent.prototype as any).handleMouse = installedHandleMouse;
 	}
 	return registry;
 }
@@ -390,13 +398,23 @@ export function unpatchFooterComponent(): void {
 	if (registry) {
 		registry.hooks.delete("todos");
 		if (registry.hooks.size === 0) {
-			FooterComponent.prototype.render = registry.originalRender;
-			if (registry.originalHandleMouse) {
-				(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
-			} else {
-				delete (FooterComponent.prototype as any).handleMouse;
+			const currentRender = FooterComponent.prototype.render;
+			const currentHandleMouse = (FooterComponent.prototype as any).handleMouse;
+			const canRestore =
+				typeof registry.installedRender === "function" &&
+				typeof registry.installedHandleMouse === "function" &&
+				currentRender === registry.installedRender &&
+				currentHandleMouse === registry.installedHandleMouse;
+
+			if (canRestore) {
+				FooterComponent.prototype.render = registry.originalRender;
+				if (registry.originalHandleMouse) {
+					(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
+				} else {
+					delete (FooterComponent.prototype as any).handleMouse;
+				}
+				delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 			}
-			delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 		}
 	}
 	delete (FooterComponent.prototype as any)[FOOTER_TODOS_PATCHED_KEY];
