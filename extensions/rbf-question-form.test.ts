@@ -1997,6 +1997,9 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 				}
 
 				const plainText = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+				const hintLine = lines[lines.length - 2].replace(/\x1b\[[0-9;]*m/g, "");
+				const directDigits = count === 1 ? "1" : `1-${count}`;
+				expect(hintLine).toContain(`[${directDigits}, C, W / ←→]`);
 				if (width === 80) {
 					if (count === 1) {
 						expect(plainText).toContain("[1, C, W / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss");

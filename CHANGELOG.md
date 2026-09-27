@@ -3,6 +3,8 @@ title: Changelog
 ---
 
 # 🔵⋯ [Unreleased]
+## 🟠⋯ Fixed for End Users
+- 2026-09-26 - fix (ux) | reach the question form's final Write-in choice with `W` regardless of how many numbered answers were offered; `C` and the offered number keys keep their meanings (#pi-19.7) [@pi]
 
 ---
 

@@ -338,21 +338,23 @@ Local Pi extension that adds familiar Vim modal navigation and editing in Pi's p
 # 🔵⋯ rbf-question-form
 
 ## 🟠⋯ Overview
-Local Pi extension providing an inline, non-modal selector at the prompt line for agent questions with numbered options. Keeps recommendation and framing context in the transcript above as readable markdown, letting users pick an option with single number keys (`1`–`9`), arrow or vim keys (`j`/`k`), or `Enter`.
+Local Pi extension providing an inline, non-modal selector at the prompt line for agent questions with numbered options. Keeps recommendation and framing context in the transcript above as readable markdown, letting users pick an offered answer with its number key (`1`–`9`), the canned reply with `C`, or Write-in with `W`.
 
 ## 🟠⋯ Capabilities & Behavior
 - Transcript Separation: The agent's full question, recommendation text, user need framing, and context paragraphs stay in the transcript as regular markdown. Only the numbered options appear in the compact interactive form.
 - Input Box Overlap: Uses `ctx.ui.custom()` to temporarily occupy the input box area directly, eliminating double borders and visual separation.
-- Compact Number Selection: Renders compact number chips with the final fallback last — numbered answers, then `[ C. /convo-is-very-best ]`, then `[ N+1. Write-in ]` — without repeating the full text that already sits right above in the transcript.
+- Compact Number Selection: Renders compact chips with the final fallback last — numbered answers, then `[ C. /convo-is-very-best ]`, then `[ W. Write-in ]` — without repeating the full text that already sits right above in the transcript.
 - Write-in Last: Write-in is always the rightmost chip and the final `→` traversal stop, after the canned response; selecting it moves focus into its answer field, and `Tab`/`↑` returns to the chips.
 - Dark Background & Light Text: The active selection chip is highlighted with a prominent dark background and bold bright white text.
 - Additional Notes Input: Embedded `Add notes to selection:` field allows typing extra instructions or modifications to append to the chosen option before submitting.
-- Write-in Option: Dedicated write-in option as the last numbered option (`N+1`). Selecting it auto-focuses the notes field so any custom text can be submitted directly. Long answers wrap word-wise inside the pane (like Pi's own editor), with a constant one-column cursor reservation, an inverse cursor that covers the whole grapheme at the insertion point, and chips/hints that clip at the right edge — the submitted text is always byte-exact.
+- Write-in Option: Press `w` or `W` while the chips are focused to select the final `W. Write-in` chip and focus its required answer field. The old generated number does not select Write-in. Once the field has focus, `w` and `W` type normally. Long answers wrap word-wise inside the pane (like Pi's own editor), with a constant one-column cursor reservation, an inverse cursor that covers the whole grapheme at the insertion point, and chips/hints that clip at the right edge — the submitted text is always byte-exact.
 - Terminal Paste: Pasting into the write-in or notes field (from chips or field focus) inserts clipboard text at the cursor, preserves internal blank lines, and removes terminal control characters before rendering or submission.
 - Canned Reply: Quick chip `[ C. /convo-is-very-best ]` (or pressing `c` / `C`) immediately selects `/skill:convo-is-very-best` (with optional notes).
 - Accidental ESC Recovery: If dismissed with `Esc`, the options are cached. Typing `/answer-question`, or pressing `Ctrl+Q`, re-opens the selector instantly.
 - Keyboard Navigation:
-  - `1`–`9` / `c`: Jump directly to option chip
+  - `1`–`9`: Select a matching offered answer
+  - `c` / `C`: Select the canned reply
+  - `w` / `W`: Select Write-in from chip focus; type the letter normally in the answer field
   - `←` / `→` or `h` / `l`: Move selection between chips
   - `Tab` or `↓` / `j`: Move focus down to `Add notes to selection:`
   - `Shift+Tab` or `↑` / `k`: Move focus back up to options row
@@ -362,7 +364,7 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 - Text Detection Heuristic: Automatically activates the selector on `agent_settled` when assistant messages end with numbered options following `Recommendation:`, `User Need Framing:`, preceding `?`, or containing `← recommended` / `(recommended)` tags. Regular tutorial lists are never misidentified.
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi -e ./extensions/rbf-question-form.ts`, ask a question with options, select using numbers or arrows, add optional notes, or run `/answer-question`.
+- Local verification: launch `pi --no-extensions -e ./extensions/rbf-question-form.ts`, ask a question with options, select using numbers or arrows, add optional notes, or run `/answer-question`.
 - Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
 
