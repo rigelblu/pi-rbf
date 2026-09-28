@@ -7,6 +7,9 @@ The row gate's test hands this script one JSON plan on stdin:
    "out": "raw.bin",
    "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}, {"snapshot": "after-turn"}]}
 
+A reloadReady step waits for the test-only probe's activation receipt, then sends its
+idempotent command until the newly loaded handler acknowledges it from the editor.
+
 Rules learned driving Pi 0.85.1 (core memories): a slash command or prompt goes in as one
 bracketed paste, never char by char, or Pi's autocomplete opens and Enter takes a completion;
 TERM must be xterm-256color for the row escapes to match daily use; only the Pi pid is killed.
@@ -79,6 +82,33 @@ def main() -> int:
                     if time.monotonic() > deadline:
                         failure = f"timed out waiting for {step['wait']!r} (count={count})"
                         break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
+            elif "reloadReady" in step:
+                receipt = step["reloadReady"]
+                target = int(receipt["loads"])
+                last_ping = 0.0
+                while True:
+                    try:
+                        with open(receipt["path"], encoding="utf-8") as f:
+                            state = json.load(f)
+                    except (OSError, ValueError):  # writer may be replacing the receipt
+                        state = {}
+                    if state.get("readyLoad") == target and state.get("loads") == target:
+                        # The receipt is written inside the command handler; let Pi
+                        # finish that command's redraw before the next paste/Enter.
+                        pump(time.monotonic() + 0.25)
+                        break
+                    if time.monotonic() > deadline:
+                        failure = f"timed out waiting for reload readiness (loads={target})"
+                        break
+                    if state.get("loads") == target and time.monotonic() - last_ping >= 0.75:
+                        # A swallowed ping during the reload box is harmless: retry until
+                        # the new extension's command handler actually runs in the editor.
+                        command = f"/rbf-reload-ready {target}".encode()
+                        os.write(fd, b"\x1b[200~" + command + b"\x1b[201~\r")
+                        last_ping = time.monotonic()
                     pump(time.monotonic() + 0.1)
                 if failure:
                     break

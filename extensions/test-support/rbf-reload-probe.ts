@@ -7,10 +7,11 @@ interface ProbeState {
 	loads: number;
 	previousRender?: any;
 	identityChanges: number;
+	readyLoad?: number;
 	nativeAfterLoadInstalled?: boolean;
 }
 
-export default function rbfReloadProbe(_pi: ExtensionAPI): void {
+export default function rbfReloadProbe(pi: ExtensionAPI): void {
 	const g = globalThis as any;
 	if (!g[PROBE_KEY]) {
 		g[PROBE_KEY] = {
@@ -43,21 +44,25 @@ export default function rbfReloadProbe(_pi: ExtensionAPI): void {
 	state.previousRender = currentRender;
 
 	const receiptPath = process.env.PI_RELOAD_PROBE_RECEIPT;
-	if (receiptPath) {
+	const loaded = state.loads;
+	const writeReceipt = () => {
+		if (!receiptPath) return;
 		try {
 			writeFileSync(
 				receiptPath,
-				JSON.stringify(
-					{
-						loads: state.loads,
-						identityChanges: state.identityChanges,
-					},
-					null,
-					2,
-				),
+				JSON.stringify({ loads: state.loads, identityChanges: state.identityChanges, readyLoad: state.readyLoad ?? 0 }, null, 2),
 			);
 		} catch {
 			// ignore write errors in test environment
 		}
-	}
+	};
+	writeReceipt();
+	pi.registerCommand("rbf-reload-ready", {
+		description: "Confirm the test-only reload probe is accepting commands",
+		handler: async (args) => {
+			if (Number(args.trim()) !== loaded || state.loads !== loaded) return;
+			state.readyLoad = loaded;
+			writeReceipt();
+		},
+	});
 }

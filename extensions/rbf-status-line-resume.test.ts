@@ -24,12 +24,19 @@ const TOOL_EXTENSIONS = [
 	join(ROOT, "extensions", "rbf-edit-glance.ts"),
 	join(ROOT, "extensions", "rbf-tool-execution-blended.ts"),
 	join(SUPPORT, "rbf-row-gate-provider.ts"),
+	join(SUPPORT, "rbf-reload-probe.ts"),
 ];
 
 const PYTHON = spawnSync("python3", ["--version"]).status === 0;
 const READY = existsSync(PI) && PYTHON;
 
-type Step = { wait: string; count?: number } | { paste: string } | { key: string } | { sleep: number } | { snapshot: string };
+type Step =
+	| { wait: string; count?: number }
+	| { reloadReady: { path: string; loads: number } }
+	| { paste: string }
+	| { key: string }
+	| { sleep: number }
+	| { snapshot: string };
 type Run = {
 	extensions: string[];
 	model?: string;
@@ -269,7 +276,7 @@ function drive(ws: TestWorkspace, run: Run, options?: { timeout?: number }): Pro
 	});
 }
 
-describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verification", () => {
+describe.skipIf(!READY)("pi-34: interactive Pi /resume and /reload pty verification", () => {
 	it("rejects a closing read fence after the body", () => {
 		const mutant = Buffer.from("read /tmp/fenced-resume.txt\nFENCED_AFTER_RESUME\n```\nedit /tmp/edit-target.txt\nAdded 1 line, removed 1 line\n");
 		expect(() => expectToolRows(mutant, "fenced-resume.txt", "FENCED_AFTER_RESUME")).toThrow();
@@ -325,25 +332,20 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 						{ wait: "pi17-smoke" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 1 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 2 } },
 						{ snapshot: "after-reload-1" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 2 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 3 } },
 						{ snapshot: "after-reload-2" },
 					],
 				});
-
-				// Verify driver waited until second reload actually completed
-				const reloads = (capture.raw.toString("utf8").match(/Reloaded/g) ?? []).length;
-				expect(reloads).toBeGreaterThanOrEqual(2);
 
 				// Verify reload probe captured 3 activations with zero render identity changes across reloads
 				expect(existsSync(receiptPath)).toBe(true);
 				const probeData = JSON.parse(readFileSync(receiptPath, "utf8"));
 				expect(probeData.loads).toBe(3);
+				expect(probeData.readyLoad).toBe(3);
 				expect(probeData.identityChanges).toBe(0);
 
 				expectFooter(capture.snapshots["after-reload-1"]!, "pi17-smoke");
@@ -374,13 +376,11 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 						{ wait: "pi17-native-mutant" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 1 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 2 } },
 						{ snapshot: "after-reload-1" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 2 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 3 } },
 						{ snapshot: "after-reload-2" },
 					],
 				});
@@ -397,28 +397,30 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 	);
 
 	it(
-		"sensitivity: driver times out if second reload does not occur",
+		"sensitivity: one reload cannot satisfy second-reload readiness",
 		async () => {
 			const ws = new TestWorkspace();
+			const receiptPath = join(ws.dir, "probe-receipt-missing-second.json");
 			try {
-				// Plan issues only ONE /reload, but specifies wait count: 2 with a short timeout.
-				// Proves that a single reload cannot satisfy the two-reload check.
+				// The old global text count could reach two on a redraw of one reload.
+				// Without a second activation, load 3 cannot acknowledge readiness.
 				await expect(
 					drive(
 						ws,
 						{
-							extensions: EXTENSIONS,
+							extensions: RELOAD_EXTENSIONS,
+							env: { PI_RELOAD_PROBE_RECEIPT: receiptPath },
 							steps: [
 								{ wait: "ctrl\\+o more" },
 								{ paste: "/reload" },
 								{ key: "enter" },
-								{ wait: "Reloaded", count: 1 },
-								{ wait: "Reloaded", count: 2 },
+								{ reloadReady: { path: receiptPath, loads: 2 } },
+								{ reloadReady: { path: receiptPath, loads: 3 } },
 							],
-						},
-						{ timeout: 3 },
+							},
+							{ timeout: 8 },
 					),
-				).rejects.toThrow(/timed out waiting for 'Reloaded' \(count=2\)/);
+				).rejects.toThrow(/timed out waiting for reload readiness \(loads=3\)/);
 			} finally {
 				ws.cleanup();
 			}
@@ -441,8 +443,7 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 						{ wait: "ctrl\\+o more" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 1 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 2 } },
 					],
 				});
 
@@ -466,6 +467,7 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 			const reloadedEdit = join(ws.dir, "edit-reload.txt");
 			const resumedRead = join(ws.dir, "fenced-resume.txt");
 			const reloadedRead = join(ws.dir, "fenced-reload.txt");
+			const receiptPath = join(ws.dir, "probe-receipt-tools.json");
 			seedSession(ws, "pi17-tools-old", ws.dir);
 			writeFileSync(resumedEdit, "BEFORE\n");
 			writeFileSync(reloadedEdit, "AFTER\n");
@@ -478,6 +480,7 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 					model: "rbf-gate/gate",
 					cwd: ws.dir,
 					env: {
+						PI_RELOAD_PROBE_RECEIPT: receiptPath,
 						RBF_ROW_GATE_SCRIPT: JSON.stringify([
 							{ text: "unused before resume" },
 							{ tool: "read", args: { path: resumedRead } },
@@ -513,12 +516,10 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 						{ key: "ctrl-o" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 1 },
-						{ sleep: 0.5 },
+						{ reloadReady: { path: receiptPath, loads: 3 } },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 2 },
-						{ sleep: 0.5 },
+						{ reloadReady: { path: receiptPath, loads: 4 } },
 						{ snapshot: "after-reload-2" },
 						{ paste: "show tools after reload" },
 						{ key: "enter" },
@@ -594,13 +595,11 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 						{ snapshot: "after-resume" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 1 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 3 } },
 						{ snapshot: "after-reload-1" },
 						{ paste: "/reload" },
 						{ key: "enter" },
-						{ wait: "Reloaded", count: 2 },
-						{ sleep: 1.0 },
+						{ reloadReady: { path: receiptPath, loads: 4 } },
 						{ snapshot: "after-reload-2" },
 						{ paste: "hello cache 2" },
 						{ key: "enter" },
@@ -613,11 +612,8 @@ describe.skipIf(!READY)("pi-17.2: interactive Pi /resume and /reload pty verific
 				expect(existsSync(receiptPath)).toBe(true);
 				const probeData = JSON.parse(readFileSync(receiptPath, "utf8"));
 				expect(probeData.loads).toBe(4); // initial boot + /resume + two /reload activations
+				expect(probeData.readyLoad).toBe(4);
 				expect(probeData.identityChanges).toBe(0);
-
-				const rawStr = capture.raw.toString("utf8");
-				const reloads = (rawStr.match(/Reloaded/g) ?? []).length;
-				expect(reloads).toBeGreaterThanOrEqual(2);
 
 				expectFooter(capture.snapshots["before-resume"]!, "pi17-guardian", true);
 				expectFooter(capture.snapshots["after-resume"]!, "pi17-guardian-old");
