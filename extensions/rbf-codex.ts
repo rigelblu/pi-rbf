@@ -1,4 +1,4 @@
-// rbf-codex — use Codex's full agent harness through Pi (#pi-10, v0.21.4).
+// rbf-codex — use Codex's full agent harness through Pi (#pi-10, v0.21.12).
 //
 // Pi spawns `codex app-server` over stdio as a direct child, one per Pi session, and
 // sends each prompt to Codex as one turn. Codex owns context, tools, sandbox, approval
@@ -17,7 +17,7 @@
 import { keyHint, parseArgs, renderDiff, truncateToVisualLines, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AssistantMessage, AssistantMessageEventStream, Context, Model, RefreshModelsContext, SimpleStreamOptions, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
-import { Box, Container, Spacer, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { Box, Container, Editor, Spacer, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
@@ -38,7 +38,7 @@ export const TOOL_QUESTION = "codex_question";
 export const TOOL_TOOL = "codex_tool";
 export const CODEX_FALLBACK_BIN = "/Users/tomhosiawa/.local/bin/codex";
 export const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const CLIENT_VERSION = "0.21.4";
+const CLIENT_VERSION = "0.21.12";
 const SETUP_TIMEOUT_MS = 15_000;
 const INTERRUPT_WAIT_MS = 3_000;
 const STDERR_TAIL_LINES = 64;
@@ -57,15 +57,44 @@ type JsonRpc = { id?: number | string; method?: string; params?: unknown; result
 
 export const COPY = {
 	"codex-missing": "Codex CLI not found. Install Codex, check `codex --version`, and send again.",
+	"codex-version": "Codex CLI 0.157.1 or newer is required. Upgrade Codex and try again.",
 	"codex-logged-out": "Codex is not logged in. Run `codex login`, then send again.",
 	"workspace-mismatch": "This conversation's Codex thread belongs to another directory. Start a new Pi conversation here, or reopen it from that directory.",
 	"unsupported-input": "This Codex model accepts plain text only. Remove the image, or pick an image-capable Codex model.",
 	"codex-stopped": "Codex stopped unexpectedly. Send your message again to continue this conversation.",
 	"turn-failed": "Codex could not complete this request. Send your message again or start a new Pi conversation.",
+	"history-unverified": "Codex history for this branch could not be verified. Your message was not sent. Try /fork and resend, or /new to start cold.",
+	"fork-failed": "Codex could not fork this branch. Your message was not sent. Use /new to start cold.",
 	"no-answer": "Codex finished without an answer. Send your message again.",
 	generic: "Codex is unavailable. See the notice for details.",
 } as const;
 export type CopyKey = keyof typeof COPY;
+
+export const COMPACT_NOTICE = {
+	instructions: "Codex compaction cannot take instructions. Run /compact without text.",
+	busy: "Codex is busy. Try /compact after Codex finishes.",
+	version: "Codex CLI 0.157.1 or newer is required. Upgrade Codex and try again.",
+	noThread: "No Codex context to compact yet. Send a message first.",
+	foreignBranch: "This branch needs its own Codex thread. Send a message here first, then /compact.",
+	unverified: "Cannot verify this branch. Try /fork and send a message, or /new to start cold.",
+	changedDraft: "Command changed while Codex checked this branch. Run /compact again.",
+	movedOrChanged: "Codex conversation moved or changed while checking. Check before retrying /compact.",
+	checkingStatus: "Checking Codex branch…",
+	runningStatus: "Compacting Codex context…",
+	runningStatusNavigated: "Compacting Codex context on the branch where /compact started…",
+	completeStatus: "Codex context compacted.",
+	completeNavigated: "Codex compacted the branch where /compact started; this view may be different.",
+	unknown: "Codex context may have changed; completion could not be confirmed.",
+	unknownNavigated: "Codex context may have changed on the branch where /compact started; completion could not be confirmed.",
+	failed: (reason: string) => `Codex context was not compacted: ${reason}`,
+	failedNavigated: (reason: string) => `Codex context was not compacted on the branch where /compact started: ${reason}`,
+} as const;
+
+export const COMPACT_SAFE_REASONS = {
+	refused: "Codex refused this thread.",
+	failed: "Codex reported a failed compaction turn.",
+	interrupted: "Codex reported an interrupted compaction turn.",
+} as const;
 
 export const NOTICE = {
 	declined: (what: string) => `Codex asked for ${what}; this version cannot answer, so it was declined.`,
@@ -595,10 +624,247 @@ export class AppServerClient {
 	}
 }
 
-export type CodexCommand = { bin: string; args: string[]; fallbackBin?: string };
+export type CodexCommand = { bin: string; args: string[]; fallbackBin?: string; versionArgs?: string[] };
+
+export const COMPACT_SUBMIT_INTERCEPTED_KEY = Symbol.for("rbf.codex.compactSubmitIntercepted");
+export const COMPACT_DISPATCHER_KEY = Symbol.for("rbf.codex.compactDispatcher");
+
+export const MIN_CODEX_VERSION = "0.157.1";
+const NAVIGATION_FEEDBACK_DELAY_MS = 50; // let Pi paint its own navigation status before our branch-qualified notice
+
+export function parseCodexVersion(output: string): [number, number, number] | null {
+	const match = /^(?:codex(?:-cli)?\s+)?v?(\d+)\.(\d+)\.(\d+)$/i.exec(output.trim());
+	if (!match) return null;
+	return [parseInt(match[1], 10), parseInt(match[2], 10), parseInt(match[3], 10)];
+}
+
+export function isSupportedCodexVersion(output: string): boolean {
+	const v = parseCodexVersion(output);
+	if (!v) return false;
+	const [major, minor, patch] = v;
+	if (major > 0) return true;
+	if (major < 0) return false;
+	if (minor > 157) return true;
+	if (minor < 157) return false;
+	return patch >= 1;
+}
+
+export function versionArgsFor(command: CodexCommand): string[] {
+	if (command.versionArgs) return command.versionArgs;
+	if (command.args.length > 0 && /\.[tj]sx?$/.test(command.args[0])) {
+		return [command.args[0], "--version"];
+	}
+	return ["--version"];
+}
+
+export async function checkCodexVersion(command: CodexCommand): Promise<boolean> {
+	const argsToUse = versionArgsFor(command);
+	const runVersion = (bin: string) =>
+		new Promise<string>((resolve, reject) => {
+			const cp = spawn(bin, argsToUse, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+			let out = "";
+			let err = "";
+			const timer = setTimeout(() => {
+				cp.kill();
+				reject(new Error("Timeout checking codex version"));
+			}, 5_000);
+			cp.stdout?.on("data", (d) => { out += String(d); });
+			cp.stderr?.on("data", (d) => { err += String(d); });
+			cp.once("error", (e) => {
+				clearTimeout(timer);
+				reject(e);
+			});
+			cp.once("close", (code) => {
+				clearTimeout(timer);
+				if (code === 0) resolve(out);
+				else reject(new Error(`codex --version exited with code ${code}: ${err}`));
+			});
+		});
+
+	let stdout = "";
+	try {
+		stdout = await runVersion(command.bin);
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT" && command.fallbackBin) {
+			try {
+				stdout = await runVersion(command.fallbackBin);
+			} catch {
+				return false;
+			}
+		} else {
+			return false;
+		}
+	}
+	return isSupportedCodexVersion(stdout);
+}
+
+export function isCompactCommand(text: unknown): boolean {
+	if (typeof text !== "string") return false;
+	const trimmed = text.trim();
+	return trimmed === "/compact" || /^\/compact\s/.test(trimmed);
+}
+
+export function installCompactSubmitInterceptor(EditorClass: typeof Editor = Editor): void {
+	if (!EditorClass || !EditorClass.prototype) return;
+	const proto = EditorClass.prototype as any;
+	if (proto[COMPACT_SUBMIT_INTERCEPTED_KEY]) return;
+
+	const originalSubmitValue = proto.submitValue;
+	if (typeof originalSubmitValue !== "function") return;
+
+	proto.submitValue = function (this: any, ...args: any[]) {
+		const dispatcher = (EditorClass as any)[COMPACT_DISPATCHER_KEY];
+		const text = typeof this.expandPasteMarkers === "function"
+			? this.expandPasteMarkers(this.state.lines.join("\n")).trim()
+			: (this.getText?.() ?? "").trim();
+		if (dispatcher && isCompactCommand(text) && dispatcher.shouldIntercept()) {
+			return dispatcher.dispatch(this, text);
+		}
+		return originalSubmitValue.apply(this, args);
+	};
+
+	proto[COMPACT_SUBMIT_INTERCEPTED_KEY] = true;
+}
+
+export type TurnClassification = "user" | "compaction" | "unverified";
+
+export function classifyCompletedTurn(items: unknown[] | undefined): TurnClassification {
+	if (!Array.isArray(items) || items.length === 0) return "unverified";
+	const hasValidUserMessage = items.some((item) => {
+		if (!item || typeof item !== "object") return false;
+		const it = item as Record<string, unknown>;
+		return typeof it.id === "string" && it.id.length > 0 && it.type === "userMessage" && Array.isArray(it.content);
+	});
+	if (hasValidUserMessage) return "user";
+	const allCompaction = items.every((item) => {
+		if (!item || typeof item !== "object") return false;
+		const it = item as Record<string, unknown>;
+		return it.type === "contextCompaction";
+	});
+	if (allCompaction) return "compaction";
+	return "unverified";
+}
+
+export type HistoryVerificationResult =
+	| { ok: true }
+	| { ok: false; diverged: boolean };
+
+export async function verifyBranchHistory(
+	client: AppServerClient,
+	threadId: string,
+	expectedTurnId: string,
+	signal?: AbortSignal
+): Promise<HistoryVerificationResult> {
+	const startTime = Date.now();
+	let cursor: string | undefined = undefined;
+	let pageCount = 0;
+	const seenCursors = new Set<string>();
+	const seenTurns = new Set<string>();
+	let unseenUser = false;
+
+	while (pageCount < 100 && Date.now() - startTime < 30_000) {
+		if (signal?.aborted) return { ok: false, diverged: false };
+		pageCount++;
+		const limit = pageCount === 1 ? 5 : 20;
+		let res: Rec;
+		try {
+			res = rec(await client.request(
+				"thread/turns/list",
+				{ threadId, sortDirection: "desc", itemsView: "full", limit, ...(cursor ? { cursor } : {}) },
+				Math.min(SETUP_TIMEOUT_MS, Math.max(1, 30_000 - (Date.now() - startTime))),
+				signal
+			));
+		} catch {
+			return { ok: false, diverged: false };
+		}
+
+		if (!Array.isArray(res.data) || (res.nextCursor !== null && res.nextCursor !== undefined && typeof res.nextCursor !== "string")) return { ok: false, diverged: false };
+		const data = res.data as Rec[];
+		if (!data.length && (pageCount === 1 || res.nextCursor)) return { ok: false, diverged: false };
+
+		for (const turn of data) {
+			if (!turn || typeof turn.id !== "string" || !turn.id || seenTurns.has(turn.id)) return { ok: false, diverged: false };
+			seenTurns.add(turn.id);
+			const status = turn.status;
+			const classification = classifyCompletedTurn(turn.items as unknown[] | undefined);
+			if (turn.id === expectedTurnId) {
+				if (status !== "completed" || classification !== "user") return { ok: false, diverged: false };
+				return unseenUser ? { ok: false, diverged: true } : { ok: true };
+			}
+			if (status === "completed") {
+				if (classification === "unverified") return { ok: false, diverged: false };
+				if (classification === "user") unseenUser = true;
+			}
+		}
+
+		const nextCursor = typeof res.nextCursor === "string" ? res.nextCursor : null;
+		if (!nextCursor) return { ok: false, diverged: false };
+		if (seenCursors.has(nextCursor)) {
+			return { ok: false, diverged: false };
+		}
+		seenCursors.add(nextCursor);
+		cursor = nextCursor;
+	}
+
+	return { ok: false, diverged: false };
+}
+
+export async function verifyEmptyBranchHistory(
+	client: AppServerClient,
+	threadId: string,
+	signal?: AbortSignal
+): Promise<boolean> {
+	const startTime = Date.now();
+	let cursor: string | undefined = undefined;
+	let pageCount = 0;
+	const seenCursors = new Set<string>();
+	const seenTurns = new Set<string>();
+
+	while (pageCount < 100 && Date.now() - startTime < 30_000) {
+		if (signal?.aborted) return false;
+		pageCount++;
+		const limit = pageCount === 1 ? 5 : 20;
+		let res: Rec;
+		try {
+			res = rec(await client.request(
+				"thread/turns/list",
+				{ threadId, sortDirection: "desc", itemsView: "full", limit, ...(cursor ? { cursor } : {}) },
+				Math.min(SETUP_TIMEOUT_MS, Math.max(1, 30_000 - (Date.now() - startTime))),
+				signal
+			));
+		} catch {
+			return false;
+		}
+
+		if (!Array.isArray(res.data) || (res.nextCursor !== null && res.nextCursor !== undefined && typeof res.nextCursor !== "string")) return false;
+		const data = res.data as Rec[];
+		if (!data.length && res.nextCursor) return false;
+		for (const turn of data) {
+			if (!turn || typeof turn.id !== "string" || !turn.id || seenTurns.has(turn.id)) return false;
+			seenTurns.add(turn.id);
+			const status = turn.status;
+			const items = turn.items as unknown[] | undefined;
+			if (status !== "completed" || classifyCompletedTurn(items) !== "compaction") return false;
+		}
+
+		const nextCursor = typeof res.nextCursor === "string" ? res.nextCursor : null;
+		if (!nextCursor) {
+			return true;
+		}
+		if (seenCursors.has(nextCursor)) {
+			return false;
+		}
+		seenCursors.add(nextCursor);
+		cursor = nextCursor;
+	}
+	return false;
+}
+
 export type RbfCodexOptions = {
 	/** How to spawn the app-server; tests point this at a fake. */
 	command?: CodexCommand;
+	/** Bounded lifecycle wait; tests shorten this rather than waiting three minutes. */
+	compactTimeoutMs?: number;
 	/** Frozen argv for the `--sandbox` guard; defaults to `process.argv.slice(2)`. */
 	argv?: string[];
 	/** Clock for catalog freshness; tests inject one. */
@@ -646,8 +912,20 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		// `pi --sandbox` (#pi-23) and this provider stay mutually exclusive.
 		if (isSandboxLaunch(options.argv ?? process.argv.slice(2))) return;
 
-		// Everything below lives in this closure; Pi rebinds a new instance on switch, fork, and reload.
-		const state = { ctx: null as ExtensionContext | null, client: null as AppServerClient | null, shuttingDown: false, noticedPolicy: false, activeTurn: null as ActiveTurn | null, approvedForSession: false, noticedElicitation: false };
+		const instanceOwner = Symbol("codexInstance");
+		const state = {
+			ctx: null as ExtensionContext | null,
+			client: null as AppServerClient | null,
+			shuttingDown: false,
+			noticedPolicy: false,
+			activeTurn: null as ActiveTurn | null,
+			approvedForSession: false,
+			noticedElicitation: false,
+			pendingCompact: null as Promise<void> | null,
+			checkingCompact: null as { cancelled: boolean; abort: AbortController } | null,
+			runningCompact: null as { threadId: string; navigatedDuringRun: boolean; finished: boolean } | null,
+			recentCompactTerminal: null as { at: number; outcome: "completed" | "failed" | "unknown"; reason?: string; replayed: boolean } | null,
+		};
 
 		const notify = (text: string, type: "info" | "warning" | "error" = "info") => {
 			if (state.ctx?.mode === "tui") state.ctx.ui.notify(text, type);
@@ -1025,6 +1303,12 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			if (state.client && !state.client.exited) return state.client;
 			const client = await AppServerClient.start(cwd, command);
 			state.client = client;
+			const supported = await checkCodexVersion(command);
+			if (!supported) {
+				state.client = null;
+				await client.close();
+				throw new CodexError("codex-version");
+			}
 			client.onRequest = onServerRequest;
 			const failedServers = new Set<string>();
 			client.subscribe((m) => {
@@ -1112,23 +1396,29 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				try {
 					res = rec(await client.request("thread/fork", { threadId, lastTurnId, cwd, ephemeral: false }, SETUP_TIMEOUT_MS, signal));
 				} catch (e) {
-					throw e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e;
+					throw e instanceof CodexError && e.key === "generic" ? new CodexError("fork-failed", e.detail) : e;
 				}
 				const forked = rec(res.thread).id;
-				if (typeof forked !== "string") throw new CodexError("turn-failed", "thread/fork returned no thread id");
+				if (typeof forked !== "string") throw new CodexError("fork-failed", "thread/fork returned no thread id");
 				pi.appendEntry<ThreadEntry>(ENTRY_TYPE, { threadId: forked, cwd, sessionId });
 				return bindingOf(res);
 			};
 			if (!T) return start();
 			if (T.cwd !== cwd) throw new CodexError("workspace-mismatch", `Codex thread directory: ${T.cwd}`);
 			if (T.sessionId !== sessionId) return U ? fork(T.threadId, U.turnId) : start();
-			// Own thread: resume it; with a turn entry, fork only when Codex completed a turn this branch never saw.
-			const res = rec(await client.request("thread/resume", U ? { threadId: T.threadId } : { threadId: T.threadId, excludeTurns: true }, SETUP_TIMEOUT_MS, signal));
-			if (!U) return bindingOf(res);
-			const turns = (rec(res.thread).turns as Rec[] | undefined) ?? [];
-			const at = turns.findIndex((t) => t.id === U.turnId);
-			const unseenCompleted = at >= 0 && turns.slice(at + 1).some((t) => t.status === "completed");
-			return unseenCompleted ? fork(T.threadId, U.turnId) : bindingOf(res);
+			// Own thread: resume it with excludeTurns: true
+			const res = rec(await client.request("thread/resume", { threadId: T.threadId, excludeTurns: true }, SETUP_TIMEOUT_MS, signal));
+			if (rec(res.thread).id !== T.threadId) throw new CodexError("history-unverified");
+			if (U) {
+				const check = await verifyBranchHistory(client, T.threadId, U.turnId, signal);
+				if (check.ok) return bindingOf(res);
+				if (check.diverged) return fork(T.threadId, U.turnId);
+				throw new CodexError("history-unverified");
+			} else {
+				const emptyOk = await verifyEmptyBranchHistory(client, T.threadId, signal);
+				if (!emptyOk) throw new CodexError("history-unverified");
+				return bindingOf(res);
+			}
 		}
 
 		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, reasoning: ThinkingLevel | undefined): Promise<ActiveTurn> {
@@ -1205,6 +1495,27 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				if (!items.length) {
 					notify(NOTICE.nothingToSend, "warning");
 					return fail(new CodexError("generic"));
+				}
+				state.recentCompactTerminal = null;
+				if (state.pendingCompact) {
+					if (signal?.aborted) return out.finish("aborted");
+					let onAbort: (() => void) | undefined;
+					try {
+						await Promise.race([
+							state.pendingCompact,
+							new Promise<void>((_, reject) => {
+								if (!signal) return;
+								onAbort = () => reject(new AbortedError());
+								signal.addEventListener("abort", onAbort, { once: true });
+								if (signal.aborted) onAbort();
+							}),
+						]);
+					} catch (e) {
+							if (signal?.aborted || e instanceof AbortedError) return out.finish("aborted");
+					} finally {
+						if (onAbort) signal?.removeEventListener("abort", onAbort);
+					}
+					if (signal?.aborted) return out.finish("aborted");
 				}
 				try {
 					const cwd = realpathSync.native(ctx.sessionManager.getCwd());
@@ -1642,6 +1953,262 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		}
 
+		function clearEditor(editor: any): void {
+			if (typeof editor.setText === "function") {
+				editor.cancelAutocomplete?.();
+				editor.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+				editor.pastes?.clear();
+				if (typeof editor.pasteCounter === "number") editor.pasteCounter = 0;
+				editor.exitHistoryBrowsing?.();
+				editor.scrollOffset = 0;
+				editor.undoStack?.clear();
+				editor.lastAction = null;
+				if (editor.onChange) editor.onChange("");
+			}
+		}
+
+		async function executeCompactLifecycle(
+			client: AppServerClient,
+			threadId: string,
+			runningControl: { threadId: string; navigatedDuringRun: boolean; finished: boolean }
+		): Promise<void> {
+			type CompactOutcome =
+				| { outcome: "completed" }
+				| { outcome: "failed"; reason: string }
+				| { outcome: "unknown" };
+
+			return new Promise<void>((resolve) => {
+				let settled = false;
+				let timeoutTimer: NodeJS.Timeout | null = null;
+				let compactTurnId: string | null = null;
+				let compactItemId: string | null = null;
+				let itemCompleted = false;
+
+				const cleanup = () => {
+					if (timeoutTimer) clearTimeout(timeoutTimer);
+					unsubscribe();
+					client.onExit.delete(onExit);
+				};
+
+				const settle = (result: CompactOutcome) => {
+					if (settled) return;
+					settled = true;
+					runningControl.finished = true;
+					if (!runningControl.navigatedDuringRun) state.recentCompactTerminal = { ...result, at: now(), replayed: false };
+					cleanup();
+					const report = () => {
+						if (state.shuttingDown) { resolve(); return; }
+						const navigated = runningControl.navigatedDuringRun;
+						if (result.outcome === "completed") notify(navigated ? COMPACT_NOTICE.completeNavigated : COMPACT_NOTICE.completeStatus, navigated ? "warning" : "info");
+						else if (result.outcome === "failed") notify(navigated ? COMPACT_NOTICE.failedNavigated(result.reason) : COMPACT_NOTICE.failed(result.reason), "error");
+						else notify(navigated ? COMPACT_NOTICE.unknownNavigated : COMPACT_NOTICE.unknown, "warning");
+						resolve();
+					};
+					// session_tree fires before Pi redraws its transcript. Its microtasks finish
+					// before a timer, so branch-qualified terminal feedback survives that redraw.
+					if (runningControl.navigatedDuringRun) setTimeout(report, NAVIGATION_FEEDBACK_DELAY_MS);
+					else report();
+				};
+
+				const unsubscribe = client.subscribe((m) => {
+					if (settled) return;
+					if (m.method === "turn/started") {
+						const params = m.params as Rec;
+						if (params?.threadId === threadId) {
+							const turn = params?.turn as Rec;
+							compactTurnId = String(turn?.id ?? "");
+						}
+					} else if (m.method === "item/started") {
+						const params = m.params as Rec;
+						if (params?.threadId === threadId) {
+							const item = params?.item as Rec;
+							if (item?.type === "contextCompaction" && params.turnId === compactTurnId && typeof item.id === "string" && item.id) {
+								compactItemId = item.id;
+							}
+						}
+					} else if (m.method === "item/completed") {
+						const params = m.params as Rec;
+						if (params?.threadId === threadId) {
+							const item = params?.item as Rec;
+							if (item?.type === "contextCompaction" && params.turnId === compactTurnId && compactItemId !== null && item.id === compactItemId) {
+								if (item.status === "completed" || !item.status) {
+									itemCompleted = true;
+								}
+							}
+						}
+					} else if (m.method === "turn/completed") {
+						const params = m.params as Rec;
+						if (params?.threadId === threadId) {
+							const turn = params?.turn as Rec;
+							const turnId = String(turn?.id ?? "");
+							if (turnId === compactTurnId) {
+								const status = turn?.status;
+								if (status === "completed") {
+									if (itemCompleted) {
+										void settle({ outcome: "completed" });
+									} else {
+										void settle({ outcome: "unknown" });
+									}
+								} else if (status === "failed") {
+									void settle({ outcome: "failed", reason: COMPACT_SAFE_REASONS.failed });
+								} else if (status === "interrupted") {
+									void settle({ outcome: "failed", reason: COMPACT_SAFE_REASONS.interrupted });
+								} else {
+									void settle({ outcome: "unknown" });
+								}
+							}
+						}
+					}
+				});
+
+				const onExit = () => {
+					void settle({ outcome: "unknown" });
+				};
+				client.onExit.add(onExit);
+
+				timeoutTimer = setTimeout(async () => {
+					if (state.client === client) state.client = null;
+					await client.close();
+					void settle({ outcome: "unknown" });
+				}, options.compactTimeoutMs ?? 180_000);
+
+				client.request("thread/compact/start", { threadId }).catch(() => {
+					void settle({ outcome: "failed", reason: COMPACT_SAFE_REASONS.refused });
+				});
+			});
+		}
+
+		function handleManualCompact(editor: any, rawText: string): void {
+			const trimmed = rawText.trim();
+			if (trimmed !== "/compact") {
+				notify(COMPACT_NOTICE.instructions, "warning");
+				return;
+			}
+			const ctx = state.ctx;
+			if (!ctx) return;
+			state.recentCompactTerminal = null;
+
+			const isBusy = (ctx.isIdle && !ctx.isIdle()) || (ctx.hasPendingMessages && ctx.hasPendingMessages()) || state.activeTurn !== null || state.pendingCompact !== null;
+			if (isBusy) {
+				notify(COMPACT_NOTICE.busy, "warning");
+				return;
+			}
+
+			const { thread: T, turn: U } = newestEntries(ctx);
+			const sessionId = ctx.sessionManager.getSessionId();
+
+			if (!T) {
+				notify(COMPACT_NOTICE.noThread, "warning");
+				return;
+			}
+			if (T.sessionId !== sessionId) {
+				notify(COMPACT_NOTICE.foreignBranch, "warning");
+				return;
+			}
+			if (!U || U.status !== "completed") {
+				notify(COMPACT_NOTICE.noThread, "warning");
+				return;
+			}
+
+			const capturedLeafId = ctx.sessionManager.getLeafId?.();
+			const capturedModel = ctx.model;
+			const capturedThread = T;
+			const capturedTurn = U;
+			const capturedCwd = realpathSync.native(ctx.sessionManager.getCwd());
+			const capturedEditorText = typeof editor.getText === "function" ? editor.getText() : rawText;
+
+			notify(COMPACT_NOTICE.checkingStatus, "info");
+
+			let resolveCompact!: () => void;
+			state.pendingCompact = new Promise<void>((resolve) => {
+				resolveCompact = resolve;
+			});
+			const checkingControl = { cancelled: false, abort: new AbortController() };
+			state.checkingCompact = checkingControl;
+
+			void (async () => {
+				try {
+					let client: AppServerClient;
+					try {
+						client = await ensureClient(capturedCwd, checkingControl.abort.signal);
+					} catch (e) {
+						if (!checkingControl.cancelled && !state.shuttingDown) notify(e instanceof CodexError && e.key === "codex-version" ? COMPACT_NOTICE.version : COMPACT_NOTICE.unverified, "warning");
+						return;
+					}
+					if (checkingControl.cancelled || state.shuttingDown) return;
+					let check: HistoryVerificationResult;
+					try {
+						const resume = rec(await client.request("thread/resume", { threadId: capturedThread.threadId, excludeTurns: true }, SETUP_TIMEOUT_MS, checkingControl.abort.signal));
+						if (rec(resume.thread).id !== capturedThread.threadId) throw new Error("Codex returned another thread");
+						check = await verifyBranchHistory(client, capturedThread.threadId, capturedTurn.turnId, checkingControl.abort.signal);
+					} catch {
+						if (!checkingControl.cancelled && !state.shuttingDown) notify(COMPACT_NOTICE.unverified, "warning");
+						return;
+					}
+					if (checkingControl.cancelled || state.shuttingDown) return;
+					if (!check.ok) {
+						notify(COMPACT_NOTICE.unverified, "warning");
+						return;
+					}
+
+					const currentLeafId = ctx.sessionManager.getLeafId?.();
+					const currentModel = ctx.model;
+					const { thread: curT, turn: curU } = newestEntries(ctx);
+					const currentCwd = realpathSync.native(ctx.sessionManager.getCwd());
+					const currentEditorText = typeof editor.getText === "function" ? editor.getText() : "";
+
+					if (
+						currentLeafId !== capturedLeafId ||
+						currentModel?.id !== capturedModel?.id ||
+						currentModel?.provider !== PROVIDER_ID ||
+						curT?.threadId !== capturedThread.threadId ||
+						curU?.turnId !== capturedTurn.turnId ||
+						currentCwd !== capturedCwd
+					) {
+						notify(COMPACT_NOTICE.movedOrChanged, "warning");
+						return;
+					}
+
+					if (currentEditorText !== capturedEditorText) {
+						notify(COMPACT_NOTICE.changedDraft, "warning");
+						return;
+					}
+
+					clearEditor(editor);
+
+					state.checkingCompact = null;
+					const runningControl = { threadId: capturedThread.threadId, navigatedDuringRun: false, finished: false };
+					state.runningCompact = runningControl;
+
+					notify(COMPACT_NOTICE.runningStatus, "info");
+
+					await executeCompactLifecycle(client, capturedThread.threadId, runningControl);
+				} catch {
+					if (!checkingControl.cancelled && !state.shuttingDown) {
+						const running = state.runningCompact;
+						const msg = running ? (running.navigatedDuringRun ? COMPACT_NOTICE.unknownNavigated : COMPACT_NOTICE.unknown) : COMPACT_NOTICE.unverified;
+						notify(msg, "warning");
+					}
+				} finally {
+					state.checkingCompact = null;
+					state.runningCompact = null;
+					state.pendingCompact = null;
+					resolveCompact();
+				}
+			})();
+		}
+
+		installCompactSubmitInterceptor();
+		(Editor as any)[COMPACT_DISPATCHER_KEY] = {
+			owner: instanceOwner,
+			shouldIntercept: () => {
+				return state.ctx?.model?.provider === PROVIDER_ID;
+			},
+			dispatch: (editor: any, text: string) => {
+				handleManualCompact(editor, text);
+			},
+		};
+
 		pi.on("session_start", async (_event, ctx) => {
 			state.ctx = ctx;
 			state.client = null;
@@ -1650,6 +2217,19 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			state.activeTurn = null;
 			state.approvedForSession = false;
 			state.noticedElicitation = false;
+			state.pendingCompact = null;
+			state.checkingCompact = null;
+			state.runningCompact = null;
+			state.recentCompactTerminal = null;
+			(Editor as any)[COMPACT_DISPATCHER_KEY] = {
+				owner: instanceOwner,
+				shouldIntercept: () => {
+					return state.ctx?.model?.provider === PROVIDER_ID;
+				},
+				dispatch: (editor: any, text: string) => {
+					handleManualCompact(editor, text);
+				},
+			};
 			if (!newestOwnEntry(ctx)) return; // a forked copy starts cold, so its last prompt was not ours to interrupt
 			// An unanswered prompt, or a row whose tool never returned (Pi died mid-row): both mean the request was cut.
 			const last = [...ctx.sessionManager.getBranch()].reverse().find((e) => e.type === "message") as { message?: { role: string; stopReason?: string } } | undefined;
@@ -1657,9 +2237,18 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		});
 		const closeChild = async () => {
 			state.shuttingDown = true;
+			state.recentCompactTerminal = null;
+			if (state.checkingCompact) {
+				state.checkingCompact.cancelled = true;
+				state.checkingCompact.abort.abort();
+			}
 			const c = state.client;
 			state.client = null;
 			if (c) await c.close();
+			const curDispatcher = (Editor as any)[COMPACT_DISPATCHER_KEY];
+			if (curDispatcher?.owner === instanceOwner) {
+				delete (Editor as any)[COMPACT_DISPATCHER_KEY];
+			}
 		};
 		pi.on("session_shutdown", closeChild);
 		pi.on("session_before_switch", async () => {
@@ -1670,6 +2259,32 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			if (!isBoundBranch(ctx)) return {};
 			if (event.reason === "manual") notify(NOTICE.compact);
 			return { cancel: true };
+		});
+		pi.on("session_tree", async (_event, _ctx) => {
+			const terminal = state.recentCompactTerminal;
+			if (terminal && !terminal.replayed && now() - terminal.at < 1500) {
+				terminal.replayed = true;
+				setTimeout(() => {
+					if (state.shuttingDown || state.recentCompactTerminal !== terminal) return;
+					if (terminal.outcome === "completed") notify(COMPACT_NOTICE.completeNavigated, "warning");
+					else if (terminal.outcome === "failed") notify(COMPACT_NOTICE.failedNavigated(terminal.reason ?? COMPACT_SAFE_REASONS.failed), "error");
+					else notify(COMPACT_NOTICE.unknownNavigated, "warning");
+				}, NAVIGATION_FEEDBACK_DELAY_MS);
+			}
+			if (state.checkingCompact && !state.checkingCompact.cancelled) {
+				state.checkingCompact.cancelled = true;
+				state.checkingCompact.abort.abort();
+				setTimeout(() => {
+					if (!state.shuttingDown) notify(COMPACT_NOTICE.movedOrChanged, "warning");
+				}, NAVIGATION_FEEDBACK_DELAY_MS);
+			}
+			if (state.runningCompact && !state.runningCompact.finished) {
+				const running = state.runningCompact;
+				running.navigatedDuringRun = true;
+				setTimeout(() => {
+					if (!state.shuttingDown && state.runningCompact === running) notify(COMPACT_NOTICE.runningStatusNavigated, "info");
+				}, NAVIGATION_FEEDBACK_DELAY_MS);
+			}
 		});
 		pi.on("session_before_tree", async (event, ctx) => {
 			if (isBoundBranch(ctx) && event.preparation.userWantsSummary) return { summary: { summary: NOTICE.treeSummary } };

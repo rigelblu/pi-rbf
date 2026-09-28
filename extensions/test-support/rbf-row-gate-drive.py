@@ -16,6 +16,8 @@ TERM must be xterm-256color for the row escapes to match daily use; only the Pi 
 Exit 0 when every wait matched; 2 on a timeout, with the raw bytes still written for a post-mortem.
 """
 import fcntl
+import glob
+import hashlib
 import json
 import os
 import pty
@@ -27,7 +29,7 @@ import sys
 import termios
 import time
 
-KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f"}
+KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f", "ctrl-u": b"\x15"}
 # CSI sequences; OSC sequences ended by BEL or by ST (ESC \), never spanning a later ESC; charset and keypad selects; CR.
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|\r")
 
@@ -120,6 +122,34 @@ def main() -> int:
                 pump(time.monotonic() + 0.15)
             elif "sleep" in step:
                 pump(time.monotonic() + float(step["sleep"]))
+            elif "waitSessionTurns" in step:
+                target = step["waitSessionTurns"]
+                while True:
+                    files = glob.glob(os.path.join(target["dir"], "*.jsonl"))
+                    try:
+                        with open(files[0], "r", encoding="utf-8") as f:
+                            count = sum(1 for line in f if '"customType":"rbf-codex-turn/v1"' in line)
+                    except (IndexError, OSError):
+                        count = 0
+                    if count >= int(target["count"]):
+                        pump(time.monotonic() + 0.3)
+                        break
+                    if time.monotonic() > deadline:
+                        failure = f"timed out waiting for {target['count']} Codex turns, saw {count}"
+                        break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
+            elif "sessionSnapshot" in step:
+                target = step["sessionSnapshot"]
+                name = target["name"]
+                files = glob.glob(os.path.join(target["dir"], "*.jsonl"))
+                if name in snapshots or len(files) != 1:
+                    failure = f"session snapshot {name!r} expected exactly one JSONL, got {len(files)}"
+                    break
+                with open(files[0], "rb") as f:
+                    data = f.read()
+                snapshots[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
             elif "snapshot" in step:
                 name = step["snapshot"]
                 if name in snapshots:

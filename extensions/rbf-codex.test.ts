@@ -5,10 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import { Box } from "@earendil-works/pi-tui";
+import { Box, Editor } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, loneString, mapEffort, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle } from "./rbf-codex.ts";
+import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COMPACT_DISPATCHER_KEY, COMPACT_NOTICE, COMPACT_SAFE_REASONS, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, classifyCompletedTurn, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, isCompactCommand, isSupportedCodexVersion, loneString, mapEffort, parseCodexVersion, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle, verifyBranchHistory, verifyEmptyBranchHistory } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
@@ -50,7 +50,16 @@ function makePi() {
 	};
 }
 
-function makeCtx(opts: { branch?: Entry[]; sessionId?: string; cwd?: string; mode?: "tui" | "print" } = {}) {
+function makeCtx(opts: {
+	branch?: Entry[];
+	sessionId?: string;
+	cwd?: string;
+	mode?: "tui" | "print";
+	model?: Model<any>;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
+	leafId?: string;
+} = {}) {
 	const branch = opts.branch ?? [];
 	const notify = vi.fn();
 	const setWorkingMessage = vi.fn();
@@ -67,17 +76,44 @@ function makeCtx(opts: { branch?: Entry[]; sessionId?: string; cwd?: string; mod
 		return answers.shift();
 	});
 	const mode = opts.mode ?? "tui";
+	let currentModel = opts.model ?? model();
+	let leafId = opts.leafId ?? "leaf-1";
+	let cwd = opts.cwd ?? process.cwd();
+	let idle = true;
+	let pendingMessages = false;
 	const ctx = {
 		mode,
 		hasUI: mode === "tui",
 		ui: { notify, setWorkingMessage, select, input },
+		get model() {
+			return currentModel;
+		},
+		set model(m: Model<any>) {
+			currentModel = m;
+		},
+		isIdle: opts.isIdle ?? (() => idle),
+		hasPendingMessages: opts.hasPendingMessages ?? (() => pendingMessages),
 		sessionManager: {
 			getBranch: () => branch,
 			getSessionId: () => opts.sessionId ?? "session-A",
-			getCwd: () => opts.cwd ?? process.cwd(),
+			getCwd: () => cwd,
+			getLeafId: () => leafId,
 		},
-	} as unknown as ExtensionContext;
-	return { ctx, branch, notify, setWorkingMessage, answers, dialogs, select, input };
+	} as unknown as ExtensionContext & { model: Model<any> };
+	return {
+		ctx,
+		branch,
+		notify,
+		setWorkingMessage,
+		answers,
+		dialogs,
+		select,
+		input,
+		setLeafId: (id: string) => { leafId = id; },
+		setCwd: (path: string) => { cwd = path; },
+		setIsIdle: (val: boolean) => { idle = val; },
+		setHasPendingMessages: (val: boolean) => { pendingMessages = val; },
+	};
 }
 
 function model(id = BOOTSTRAP_MODEL_ID, thinkingLevelMap: Model<any>["thinkingLevelMap"] = BOOTSTRAP_MODEL.thinkingLevelMap): Model<any> {
@@ -140,9 +176,9 @@ describe("rbf-codex", () => {
 	}
 
 	/** Boot an extension instance with `session_start` already fired, ready to stream. */
-	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[] } = {}) {
+	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number } = {}) {
 		const fx = makePi();
-		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [] })(fx.pi);
+		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [], compactTimeoutMs: opts.compactTimeoutMs })(fx.pi);
 		const c = makeCtx(opts);
 		await fx.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, c.ctx);
 		const turn = (text: string | Context["messages"], m: Model<any> = model(), options: { reasoning?: ThinkingLevel; signal?: AbortSignal } = {}) => {
@@ -168,7 +204,12 @@ describe("rbf-codex", () => {
 			const next = await collect(fx.provider.config.streamSimple!(m, { messages: after } as Context, { signal: opts.signal }));
 			return { first, result, next, messages: after };
 		};
-		return { ...fx, ...c, turn, shutdown, exec, round };
+		const editor = new Editor({ requestRender: () => {} } as any, { borderColor: () => "" } as any);
+		const submit = async (text: string) => {
+			editor.setText(text);
+			(editor as any).submitValue();
+		};
+		return { ...fx, ...c, turn, shutdown, exec, round, editor, submit };
 	}
 
 	describe("registration", () => {
@@ -769,8 +810,8 @@ describe("rbf-codex", () => {
 			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
 			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
 			await b.turn("hi");
-			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
-			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1" });
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/turns/list", "turn/start"]);
+			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1", excludeTurns: true });
 			expect(threadEntries(b)).toEqual([]);
 		});
 
@@ -778,7 +819,7 @@ describe("rbf-codex", () => {
 			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "completed" }] });
 			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
 			await b.turn("hi");
-			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/fork", "turn/start"]);
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/turns/list", "thread/fork", "turn/start"]);
 			expect(sent().find((m) => m.method === "thread/fork")!.params).toEqual({ threadId: "thread-fake-1", lastTurnId: "turn-1", cwd: process.cwd(), ephemeral: false });
 			expect(threadEntries(b)).toEqual([{ threadId: "thread-fake-fork-1", cwd: process.cwd(), sessionId: "A" }]);
 			expect(sent().find((m) => m.method === "turn/start")!.params).toMatchObject({ threadId: "thread-fake-fork-1" });
@@ -826,19 +867,27 @@ describe("rbf-codex", () => {
 			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
 		});
 
-		it("(h) a thread/fork error ends the call with turn-failed and sends no turn/start", async () => {
+		it("(h) a thread/fork error ends the call with fork-failed and sends no turn/start", async () => {
 			scenario({ forkError: "no such turn" });
 			const b = await boot({ sessionId: "B", branch: [T("A"), U("turn-1")] });
 			const r = await b.turn("hi");
-			expect(r.final?.errorMessage).toBe(COPY["turn-failed"]);
+			expect(r.final?.errorMessage).toBe(COPY["fork-failed"]);
 			expect(methods()).not.toContain("turn/start");
 		});
 
-		it("(i) own thread with no turn entry after it: resume without turns, never fork, even when Codex lists completed turns", async () => {
+		it("(i) own thread with no turn entry after it: unverified turns refuse with history-unverified", async () => {
 			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "completed" }] });
 			const b = await boot({ sessionId: "A", branch: [T("A")] });
-			await b.turn("hi");
-			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
+			const r = await b.turn("hi");
+			expect(r.final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods()).not.toContain("turn/start");
+		});
+
+		it("(i) own thread with no turn entry after it: genuinely cold thread resumes without fork", async () => {
+			scenario({ resumeTurns: [] });
+			const c = await boot({ sessionId: "A", branch: [T("A")] });
+			await c.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/turns/list", "turn/start"]);
 			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1", excludeTurns: true });
 		});
 	});
@@ -1634,4 +1683,661 @@ describe("rbf-codex", () => {
 			expect(empty.notify).not.toHaveBeenCalled();
 		});
 	});
+
+	describe("manual compaction (pi-10.5)", () => {
+		const T = (sessionId: string, threadId = "thread-fake-1", cwd = process.cwd()) => ({
+			type: "custom",
+			customType: ENTRY_TYPE,
+			data: { threadId, cwd, sessionId },
+		});
+		const U = (turnId: string, status = "completed", threadId = "thread-fake-1") => ({
+			type: "custom",
+			customType: TURN_ENTRY_TYPE,
+			data: { threadId, turnId, status },
+		});
+
+		describe("B1: version floor", () => {
+			it("parses valid semver and rejects invalid/outdated versions", () => {
+				expect(parseCodexVersion("codex-cli 0.157.1")).toEqual([0, 157, 1]);
+				expect(parseCodexVersion("codex 0.158.0")).toEqual([0, 158, 0]);
+				expect(parseCodexVersion("v1.0.0")).toEqual([1, 0, 0]);
+				expect(parseCodexVersion("not a version")).toBeNull();
+				expect(parseCodexVersion("codex-cli 0.154.0, 0.157.1")).toBeNull();
+				expect(parseCodexVersion("unexpected prefix codex-cli 0.157.1")).toBeNull();
+
+				expect(isSupportedCodexVersion("codex-cli 0.157.1")).toBe(true);
+				expect(isSupportedCodexVersion("codex-cli 0.158.0")).toBe(true);
+				expect(isSupportedCodexVersion("codex 1.0.0")).toBe(true);
+				expect(isSupportedCodexVersion("codex-cli 0.157.0")).toBe(false);
+				expect(isSupportedCodexVersion("codex-cli 0.154.0")).toBe(false);
+				expect(isSupportedCodexVersion("invalid")).toBe(false);
+			});
+
+			it("normal prompt rejects Codex CLI < 0.157.1 with codex-version assistant error and closes child", async () => {
+				scenario({ version: "codex-cli 0.154.0" });
+				const b = await boot();
+				const r = await b.turn("hi");
+				expect(r.final?.errorMessage).toBe(COPY["codex-version"]);
+				expect(methods()).not.toContain("initialize");
+				expect(methods()).not.toContain("thread/start");
+				expect(methods()).not.toContain("thread/resume");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("normal prompt rejects unparseable version output", async () => {
+				scenario({ version: "random unparseable text" });
+				const b = await boot();
+				const r = await b.turn("hi");
+				expect(r.final?.errorMessage).toBe(COPY["codex-version"]);
+				expect(methods()).not.toContain("thread/start");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("normal prompt accepts Codex CLI >= 0.157.1", async () => {
+				scenario({ version: "codex-cli 0.157.1" });
+				const b = await boot();
+				const r = await b.turn("hi");
+				expect(r.text).toBe("FAKE_OK");
+			});
+
+			it("manual /compact warns and retains editor text when Codex CLI < 0.157.1", async () => {
+				scenario({ version: "codex-cli 0.154.0", resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.version, "warning"));
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+		});
+
+		describe("B2: classifier and branch history", () => {
+			it("classifies completed turns with userMessage as user, compaction-only as compaction, others as unverified", () => {
+				// Q31 before-turn auto compaction
+				expect(classifyCompletedTurn([
+					{ id: "c1", type: "contextCompaction" },
+					{ id: "u1", type: "userMessage", content: [{ type: "text", text: "hi" }] },
+					{ id: "a1", type: "agentMessage", text: "answer" },
+				])).toBe("user");
+
+				// Q31 mid-turn auto compaction
+				expect(classifyCompletedTurn([
+					{ id: "u1", type: "userMessage", content: [{ type: "text", text: "hi" }] },
+					{ id: "r1", type: "reasoning" },
+					{ id: "a1", type: "agentMessage", text: "thought" },
+					{ id: "c1", type: "commandExecution" },
+					{ id: "cmp1", type: "contextCompaction" },
+					{ id: "r2", type: "reasoning" },
+					{ id: "c2", type: "commandExecution" },
+					{ id: "cmp2", type: "contextCompaction" },
+					{ id: "a2", type: "agentMessage", text: "final" },
+				])).toBe("user");
+
+				// Exclusive contextCompaction
+				expect(classifyCompletedTurn([
+					{ id: "cmp1", type: "contextCompaction" },
+				])).toBe("compaction");
+
+				// Empty, unknown, or malformed
+				expect(classifyCompletedTurn([{ id: "u1", type: "userMessage", content: "not an item array" }])).toBe("unverified");
+				expect(classifyCompletedTurn([])).toBe("unverified");
+				expect(classifyCompletedTurn(undefined)).toBe("unverified");
+				expect(classifyCompletedTurn([{ id: "x1", type: "unknownType" }])).toBe("unverified");
+				expect(classifyCompletedTurn([{ id: "u1", type: "userMessage" }])).toBe("unverified");
+			});
+
+			it("manual /compact refuses a diverged branch (Codex completed a newer user turn)", async () => {
+				scenario({
+					turnsList: [
+						{ id: "turn-2", status: "completed", items: [{ id: "u2", type: "userMessage", content: [{ type: "text", text: "newer" }] }] },
+						{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [{ type: "text", text: "older" }] }] },
+					],
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unverified, "warning"));
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("does not fork on a newer user turn until the recorded U is actually verified", async () => {
+				scenario({ turnsList: [
+					{ id: "turn-2", status: "completed", items: [{ id: "u2", type: "userMessage", content: [] }] },
+					{ id: "turn-1", status: "completed", items: [{ id: "unknown", type: "other" }] },
+				] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("thread/fork");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("refuses an ambiguous turn even when a newer user turn was seen first", async () => {
+				scenario({ turnsList: [
+					{ id: "turn-3", status: "completed", items: [{ id: "u3", type: "userMessage", content: [] }] },
+					{ id: "turn-2", status: "completed", items: [] },
+					{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] },
+				] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("thread/fork");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("rejects malformed history for an own thread without U rather than treating it as empty", async () => {
+				scenario({ turnsListMalformed: true });
+				const b = await boot({ sessionId: "A", branch: [T("A")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("rejects a mismatched thread/resume response before trusting its history", async () => {
+				scenario({ resumeThreadId: "another-thread", resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("thread/turns/list");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("manual /compact succeeds when newer turn is exclusively contextCompaction", async () => {
+				scenario({
+					turnsList: [
+						{ id: "turn-cmp", status: "completed", items: [{ id: "cmp1", type: "contextCompaction" }] },
+						{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [{ type: "text", text: "first" }] }] },
+					],
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				expect(b.editor.getText()).toBe("");
+				expect(methods()).toContain("thread/compact/start");
+			});
+
+			it("paginates full-item history 5 then 20 past six internal compact turns and retains the thread", async () => {
+				const compactions = Array.from({ length: 6 }, (_, i) => ({
+					id: `turn-compact-${i}`,
+					status: "completed",
+					items: [{ id: `compact-${i}`, type: "contextCompaction" }],
+				}));
+				scenario({ turnsList: [...compactions, { id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				const pages = sent().filter((m) => m.method === "thread/turns/list");
+				expect(pages.map((m) => m.params)).toMatchObject([
+					{ threadId: "thread-fake-1", sortDirection: "desc", itemsView: "full", limit: 5 },
+					{ threadId: "thread-fake-1", sortDirection: "desc", itemsView: "full", limit: 20, cursor: "turn-compact-4" },
+				]);
+				const result = await b.turn("after compact");
+				expect(result.text).toBe("FAKE_OK");
+				expect(methods()).not.toContain("thread/fork");
+			});
+
+			it.each(["before", "mid-turn"])("an unseen user turn with %s automatic compaction forks an ordinary prompt", async (order) => {
+				const user = { id: "u2", type: "userMessage", content: [{ type: "text", text: "newer" }] };
+				const compact = { id: "cmp2", type: "contextCompaction" };
+				scenario({ turnsList: [
+					{ id: "turn-2", status: "completed", items: order === "before" ? [compact, user, { id: "extra", type: "unknownType" }] : [user, { id: "r", type: "reasoning" }, compact] },
+					{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] },
+				] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("on my branch");
+				expect(result.text).toBe("FAKE_OK");
+				expect(sent().find((m) => m.method === "thread/fork")?.params).toMatchObject({ threadId: "thread-fake-1", lastTurnId: "turn-1" });
+				expect(sent().find((m) => m.method === "turn/start")?.params).toMatchObject({ threadId: "thread-fake-fork-1" });
+			});
+
+			it("manual /compact refuses both observed orders of a newer completed user turn", async () => {
+				for (const items of [
+					[{ id: "cmp", type: "contextCompaction" }, { id: "u2", type: "userMessage", content: [] }],
+					[{ id: "u2", type: "userMessage", content: [] }, { id: "cmp", type: "contextCompaction" }],
+				]) {
+					scenario({ turnsList: [
+						{ id: "turn-2", status: "completed", items },
+						{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] },
+					] });
+					const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+					await b.submit("/compact");
+					await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unverified, "warning"));
+					expect(methods()).not.toContain("thread/compact/start");
+				}
+			});
+
+			it("manual /compact refuses when branch has no thread entry", async () => {
+				const b = await boot({ branch: [] });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.noThread, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("manual /compact refuses on foreign thread", async () => {
+				const b = await boot({ sessionId: "B", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.foreignBranch, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("manual /compact refuses when own thread has no completed turn entry", async () => {
+				const b = await boot({ sessionId: "A", branch: [T("A")] });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.noThread, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+		});
+
+		it("B2: cyclic cursors fail closed for recorded and empty branches without retrying forever", async () => {
+			for (const verify of [
+				(client: Parameters<typeof verifyBranchHistory>[0]) => verifyBranchHistory(client, "thread-1", "recorded-U"),
+				(client: Parameters<typeof verifyEmptyBranchHistory>[0]) => verifyEmptyBranchHistory(client, "thread-1"),
+			]) {
+				const requests: { cursor?: string; limit: number }[] = [];
+				const client = { request: async (_method: string, params: { cursor?: string; limit: number }) => {
+					requests.push(params);
+					return {
+						data: [{ id: `turn-${requests.length}`, status: "completed", items: [{ id: "cmp", type: "contextCompaction" }] }],
+						nextCursor: "repeated-cursor",
+					};
+				} } as unknown as Parameters<typeof verifyBranchHistory>[0];
+				const result = await verify(client);
+				expect(result === false || (typeof result === "object" && result.ok === false)).toBe(true);
+				expect(requests).toHaveLength(2);
+				expect(requests.map((r) => r.limit)).toEqual([5, 20]);
+			}
+		});
+
+		it("B2: refuses malformed, duplicate, missing-U, and unknown-only full-item pages", async () => {
+			const user = { id: "u1", type: "userMessage", content: [] };
+			for (const data of [
+				[{ id: "turn-1", status: "completed", items: [] }],
+				[{ id: "turn-1", status: "completed", items: [{ id: "x", type: "unknown" }] }],
+				[{ id: "turn-1", status: "failed", items: [user] }],
+				[{ id: "turn-other", status: "completed", items: [user] }],
+				[{ id: "duplicate", status: "completed", items: [{ type: "contextCompaction" }] }, { id: "duplicate", status: "completed", items: [user] }],
+			]) {
+				const client = { request: async () => ({ data, nextCursor: null }) } as unknown as Parameters<typeof verifyBranchHistory>[0];
+				expect(await verifyBranchHistory(client, "thread-1", "turn-1")).toEqual({ ok: false, diverged: false });
+			}
+		});
+
+		it("B2: history timeout refuses before requesting a second page", async () => {
+			const now = vi.spyOn(Date, "now");
+			let tick = 0;
+			now.mockImplementation(() => (tick++ < 3 ? 0 : 30_001));
+			try {
+				const requests: unknown[] = [];
+				const client = { request: async (_method: string, params: unknown) => {
+					requests.push(params);
+					return { data: [{ id: "only-compaction", status: "completed", items: [{ type: "contextCompaction" }] }], nextCursor: "more" };
+				} } as unknown as Parameters<typeof verifyBranchHistory>[0];
+				expect(await verifyBranchHistory(client, "thread-1", "recorded-U")).toEqual({ ok: false, diverged: false });
+				expect(requests).toHaveLength(1);
+			} finally {
+				now.mockRestore();
+			}
+		});
+
+		it("B2: a newly forked thread with no recorded U accepts only empty or compaction-only full history", async () => {
+			for (const [data, accepted] of [
+				[[], true],
+				[[{ id: "compact", status: "completed", items: [{ id: "c", type: "contextCompaction" }] }], true],
+				[[{ id: "inherited", status: "completed", items: [{ id: "u", type: "userMessage", content: [] }] }], false],
+				[[{ id: "ambiguous", status: "completed", items: [{ id: "x", type: "futureItem" }] }], false],
+				[[{ id: "unfinished", status: "inProgress", items: [{ id: "c", type: "contextCompaction" }] }], false],
+			] as const) {
+				const client = { request: async () => ({ data, nextCursor: null }) } as unknown as Parameters<typeof verifyEmptyBranchHistory>[0];
+				expect(await verifyEmptyBranchHistory(client, "forked-thread")).toBe(accepted);
+			}
+		});
+
+		it("B2: the 100-page history budget fails closed before reaching an unverified old turn", async () => {
+			let requests = 0;
+			const client = { request: async () => {
+				requests++;
+				return {
+					data: [{ id: `turn-${requests}`, status: "completed", items: [{ id: `cmp-${requests}`, type: "contextCompaction" }] }],
+					nextCursor: `cursor-${requests}`,
+				};
+			} } as unknown as Parameters<typeof verifyBranchHistory>[0];
+			expect(await verifyBranchHistory(client, "thread-1", "recorded-U")).toEqual({ ok: false, diverged: false });
+			expect(requests).toBe(100);
+		});
+
+		describe("B3: lifecycle match", () => {
+			it("synchronous {} acknowledgement is not completion; waits for matching contextCompaction item and turn/completed", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "completed", includeItem: true, itemStatus: "completed" },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				expect(b.editor.getText()).toBe("");
+			});
+
+			it("safe failure: synchronous rejection reports refused safe reason", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactStartError: "thread not eligible for compaction",
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.refused), "error")
+				);
+			});
+
+			it("safe failure: failed turn reports failed safe reason without raw error interpolation", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "failed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.failed), "error")
+				);
+			});
+
+			it("safe failure: interrupted turn reports interrupted safe reason", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "interrupted", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.interrupted), "error")
+				);
+			});
+
+			it("does not accept a contextCompaction item belonging to another turn", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "completed", includeItem: true, itemTurnId: "other-turn" },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknown, "warning"));
+				expect(b.notify).not.toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info");
+			});
+
+			it("unknown outcome: completed turn arrives without matching compaction item", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "completed", includeItem: false },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknown, "warning")
+				);
+			});
+		});
+
+		describe("B4: waiting prompt", () => {
+			it("normal prompt awaits in-flight compaction before bindThread and turn/start", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "completed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				// Normal prompt enters while compaction is running
+				const turnPromise = b.turn("followup message");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				const res = await turnPromise;
+				expect(res.text).toBe("FAKE_OK");
+				// Verify compact/start was called before the turn's turn/start
+				const m = methods();
+				const compactIdx = m.indexOf("thread/compact/start");
+				const turnIdx = m.indexOf("turn/start");
+				expect(compactIdx).toBeGreaterThanOrEqual(0);
+				expect(turnIdx).toBeGreaterThan(compactIdx);
+			});
+
+			it("a waiting prompt continues after synchronous compaction refusal without a second compact request", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], compactStartError: "not eligible" });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				const result = await b.turn("after refusal");
+				expect(result.text).toBe("FAKE_OK");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.refused), "error");
+				expect(methods().filter((m) => m === "thread/compact/start")).toHaveLength(1);
+				expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			});
+
+			it("timeout closes the compacting child before releasing the same waiting prompt onto a fresh child", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], compactHang: true });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")], compactTimeoutMs: 80 });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(methods()).toContain("thread/compact/start"));
+				const result = await b.turn("after unknown outcome");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknown, "warning");
+				expect(result.text).toBe("FAKE_OK");
+				expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+				expect(methods().filter((m) => m === "thread/compact/start")).toHaveLength(1);
+				expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			});
+
+			it("Escape on waiting prompt aborts only the prompt without cancelling compaction", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 80,
+					compactTurn: { status: "completed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				const ac = new AbortController();
+				const turnPromise = b.turn("will be aborted", model(), { signal: ac.signal });
+				await new Promise((r) => setTimeout(r, 20));
+				ac.abort();
+				const turnRes = await turnPromise;
+				expect(turnRes.final?.stopReason).toBe("aborted");
+				// Compaction still completes successfully
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+			});
+		});
+
+		describe("B5: editor intercept and state", () => {
+			it("intercepts /compact on codex-harness without calling original submitValue", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const originalSubmit = vi.fn();
+				b.editor.onSubmit = originalSubmit;
+				await b.submit("/compact");
+				expect(originalSubmit).not.toHaveBeenCalled();
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+			});
+
+			it("passes /compact through to original submitValue for non-Codex models", async () => {
+				const nonCodex = { ...model("claude-3"), provider: "anthropic" };
+				const b = await boot({ model: nonCodex });
+				const originalSubmit = vi.fn();
+				b.editor.onSubmit = originalSubmit;
+				await b.submit("/compact");
+				expect(originalSubmit).toHaveBeenCalledWith("/compact");
+			});
+
+			it("passes non-compact input through to original submitValue", async () => {
+				const b = await boot();
+				const originalSubmit = vi.fn();
+				b.editor.onSubmit = originalSubmit;
+				await b.submit("Hello world");
+				expect(originalSubmit).toHaveBeenCalledWith("Hello world");
+			});
+
+			it("/compact with instructions warns and keeps editor text untouched", async () => {
+				const b = await boot();
+				await b.submit("/compact keep the system instructions");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.instructions, "warning");
+				expect(b.editor.getText()).toBe("/compact keep the system instructions");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("busy check warns and retains editor text when isIdle is false", async () => {
+				const b = await boot({ isIdle: () => false });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.busy, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+			});
+
+			it("draft modified during checking aborts dispatch and warns changedDraft", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				b.editor.setText("/compact");
+				// Start submit, and immediately modify editor text before async check finishes
+				const p = (b.editor as any).submitValue();
+				b.editor.setText("/compact wait I changed my mind");
+				await p;
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.changedDraft, "warning"));
+				expect(b.editor.getText()).toBe("/compact wait I changed my mind");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it.each(["leaf", "model", "cwd", "turn"])('last-moment %s change during the branch check refuses before dispatch', async (changed) => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], turnsListDelayMs: 80 });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(methods()).toContain("thread/turns/list"));
+				if (changed === "leaf") b.setLeafId("other-leaf");
+				if (changed === "model") b.ctx.model = model("another-codex-model");
+				if (changed === "cwd") b.setCwd(homedir());
+				if (changed === "turn") b.branch.push(U("turn-2"));
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.movedOrChanged, "warning"));
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("reload and shutdown safety: prototype dispatcher rebinding and cleanup", async () => {
+				const b1 = await boot();
+				const disp1 = (Editor as any)[COMPACT_DISPATCHER_KEY];
+				expect(disp1).toBeDefined();
+
+				const b2 = await boot();
+				const disp2 = (Editor as any)[COMPACT_DISPATCHER_KEY];
+				expect(disp2).toBeDefined();
+				expect(disp2).not.toBe(disp1);
+
+				// Shutting down b1 does NOT remove b2's dispatcher
+				await b1.shutdown();
+				expect((Editor as any)[COMPACT_DISPATCHER_KEY]).toBe(disp2);
+
+				// Shutting down b2 removes its own dispatcher
+				await b2.shutdown();
+				expect((Editor as any)[COMPACT_DISPATCHER_KEY]).toBeUndefined();
+			});
+		});
+
+		describe("B6: navigation guard", () => {
+			it("session_tree during checking cancels check and defers movedOrChanged warning", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				b.editor.setText("/compact");
+				(b.editor as any).submitValue();
+				// Trigger session_tree while checking is in flight
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.movedOrChanged, "warning"));
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("session_tree during running latches navigation, does not cancel, and reports completeNavigated", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "completed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+
+				// Fire session_tree while compact is running
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatusNavigated, "info"));
+
+				// Upon completion, emits completeNavigated warning instead of completeStatus info
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeNavigated, "warning"));
+				expect(methods()).toContain("thread/compact/start");
+			});
+
+			it("terminal success immediately before session_tree is re-announced after redraw with its branch named", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeNavigated, "warning"));
+			});
+
+			it("a later prompt clears the terminal replay so unrelated navigation gets no stale compact notice", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				await b.turn("followup");
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await new Promise((r) => setTimeout(r, 80));
+				expect(b.notify).not.toHaveBeenCalledWith(COMPACT_NOTICE.completeNavigated, "warning");
+			});
+
+			it.each([
+				{ status: "failed" as const, expected: COMPACT_NOTICE.failedNavigated(COMPACT_SAFE_REASONS.failed), type: "error" as const },
+				{ status: "completed" as const, expected: COMPACT_NOTICE.unknownNavigated, type: "warning" as const },
+			])("terminal $status immediately before navigation replays its branch-qualified outcome", async ({ status, expected, type }) => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], compactTurn: { status, includeItem: status === "failed" } });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(status === "failed" ? COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.failed) : COMPACT_NOTICE.unknown, type));
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(expected, type));
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await new Promise((r) => setTimeout(r, 80));
+				expect(b.notify.mock.calls.filter(([text]) => text === expected)).toHaveLength(1);
+			});
+
+			it("session_tree during running with failed compaction reports failedNavigated", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "failed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(
+						COMPACT_NOTICE.failedNavigated(COMPACT_SAFE_REASONS.failed),
+						"error"
+					)
+				);
+			});
+
+			it("session_tree during running with unknown outcome reports unknownNavigated", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "completed", includeItem: false },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknownNavigated, "warning")
+				);
+			});
+		});
+	});
 });
+

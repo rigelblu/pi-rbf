@@ -46,6 +46,10 @@ export type FakeScenario = {
 	ignoreInterrupt?: boolean;
 	/** Turns listed on `thread/resume` (with turns). */
 	resumeTurns?: { id: string; status: string }[];
+	/** Only list the scripted turns once turn/start has actually created them. */
+	dynamicResumeTurns?: boolean;
+	/** Simulate a mismatched response to a named thread/resume request. */
+	resumeThreadId?: string;
 	/** Reject `thread/fork` with this message. */
 	forkError?: string;
 	/** Reject `turn/steer` with this message. */
@@ -57,9 +61,35 @@ export type FakeScenario = {
 	approvalPolicy?: string;
 	sandboxType?: string;
 	models?: { id: string; displayName: string; efforts: string[]; hidden?: boolean; input?: string[] }[];
+	version?: string;
+	versionHang?: boolean;
+	versionExitCode?: number;
+	turnsList?: { id: string; status: string; items?: unknown[] }[];
+	turnsListError?: string;
+	/** Simulate a malformed but successful turns/list response. */
+	turnsListMalformed?: boolean;
+	/** Hold a branch-history reply while real Pi navigates away. */
+	turnsListDelayMs?: number;
+	compactStartError?: string;
+	compactHang?: boolean;
+	compactDelayMs?: number;
+	compactTurn?: { status?: "completed" | "failed" | "interrupted"; includeItem?: boolean; itemStatus?: "completed" | "failed"; itemTurnId?: string };
 };
 
 const scenario: FakeScenario = process.env.RBF_FAKE_SCENARIO ? (JSON.parse(process.env.RBF_FAKE_SCENARIO) as FakeScenario) : {};
+
+if (process.argv.includes("--version")) {
+	if (scenario.versionHang) {
+		setInterval(() => {}, 10_000);
+	} else if (scenario.versionExitCode) {
+		process.exit(scenario.versionExitCode);
+	} else {
+		const v = process.env.RBF_FAKE_VERSION ?? scenario.version ?? "codex-cli 0.157.1";
+		process.stdout.write(`${v}\n`);
+		process.exit(0);
+	}
+}
+
 const log = process.env.RBF_FAKE_LOG;
 const THREAD_ID = "thread-fake-1";
 let turnCounter = 0;
@@ -312,12 +342,90 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			send({ id: m.id, result: threadResponse() });
 			break;
 		case "thread/resume":
-			send({ id: m.id, result: threadResponse(String(m.params?.threadId ?? THREAD_ID), m.params?.excludeTurns ? undefined : (scenario.resumeTurns ?? [])) });
+			send({ id: m.id, result: threadResponse(scenario.resumeThreadId ?? String(m.params?.threadId ?? THREAD_ID), m.params?.excludeTurns ? undefined : (scenario.resumeTurns ?? [])) });
 			break;
 		case "thread/fork":
 			if (scenario.forkError) send({ id: m.id, error: { code: -32000, message: scenario.forkError } });
 			else send({ id: m.id, result: threadResponse(`thread-fake-fork-${++forkCounter}`) });
 			break;
+		case "thread/turns/list": {
+			if (scenario.turnsListMalformed) {
+				send({ id: m.id, result: { nextCursor: null } });
+				break;
+			}
+			if (scenario.turnsListError) {
+				send({ id: m.id, error: { code: -32000, message: scenario.turnsListError } });
+				break;
+			}
+			const p = (m.params ?? {}) as Record<string, unknown>;
+			const limit = typeof p.limit === "number" ? p.limit : 20;
+			const cursor = typeof p.cursor === "string" ? p.cursor : undefined;
+
+			let allTurns: { id: string; status: string; items?: unknown[] }[] = [];
+			if (scenario.turnsList) {
+				allTurns = scenario.turnsList;
+			} else if (scenario.resumeTurns) {
+				const visible = scenario.dynamicResumeTurns
+					? scenario.resumeTurns.filter((t) => Number(t.id.match(/^turn-fake-(\d+)$/)?.[1]) <= turnCounter)
+					: scenario.resumeTurns;
+				const turns = p.sortDirection === "asc" ? visible : visible.slice().reverse();
+				allTurns = turns.map((t) => ({
+					id: t.id,
+					status: t.status,
+					items: [
+						{
+							id: `msg-${t.id}`,
+							type: "userMessage",
+							content: [{ type: "text", text: "hi" }],
+						},
+					],
+				}));
+			}
+
+			let startIndex = 0;
+			if (cursor) {
+				const found = allTurns.findIndex((t) => t.id === cursor);
+				if (found >= 0) startIndex = found + 1;
+			}
+			const page = allTurns.slice(startIndex, startIndex + limit);
+			const hasMore = startIndex + limit < allTurns.length;
+			const nextCursor = hasMore && page.length > 0 ? page[page.length - 1].id : null;
+
+			const respond = () => send({
+				id: m.id,
+				result: {
+					data: page,
+					nextCursor,
+				},
+			});
+			if (scenario.turnsListDelayMs) setTimeout(respond, scenario.turnsListDelayMs);
+			else respond();
+			break;
+		}
+		case "thread/compact/start": {
+			const threadId = String((m.params as Record<string, unknown> | undefined)?.threadId ?? THREAD_ID);
+			if (scenario.compactStartError) {
+				send({ id: m.id, error: { code: -32000, message: scenario.compactStartError } });
+				break;
+			}
+			send({ id: m.id, result: {} });
+			if (scenario.compactHang) break;
+			const turnId = `turn-compact-${++turnCounter}`;
+			const cTurn = scenario.compactTurn ?? { status: "completed", includeItem: true, itemStatus: "completed" };
+			setTimeout(async () => {
+				notify("turn/started", { threadId, turn: { id: turnId, status: "inProgress", items: [] } });
+				await tick();
+				if (cTurn.includeItem !== false) {
+					const itemId = `compact-item-${turnCounter}`;
+					notify("item/started", { threadId, turnId: cTurn.itemTurnId ?? turnId, item: { id: itemId, type: "contextCompaction", status: "inProgress" } });
+					await tick();
+					notify("item/completed", { threadId, turnId: cTurn.itemTurnId ?? turnId, item: { id: itemId, type: "contextCompaction", status: cTurn.itemStatus ?? "completed" } });
+					await tick();
+				}
+				notify("turn/completed", { threadId, turn: { id: turnId, status: cTurn.status ?? "completed", items: [] } });
+			}, scenario.compactDelayMs ?? 10);
+			break;
+		}
 		case "turn/start": {
 			const model = m.params?.model;
 			if (scenario.retiredModel && model === scenario.retiredModel) {
