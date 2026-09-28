@@ -11,7 +11,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 - [`rbf-standout-commands`](extensions/rbf-standout-commands.ts) (v0.13.0) — See skills and slash commands standout in prompt as I type with vivid theme link blue highlighting and strict registry validation.
 - [`rbf-click-cursor`](extensions/rbf-click-cursor.ts) (v0.12.0) — Place the prompt cursor where I click in fullscreen TUI mode with immediate screen repaint and selection prevention.
 - [`rbf-image-short-text`](extensions/rbf-image-short-text.ts) (v0.11.1) — See short text (i.e. `[Image #1]`, `[Image #2]`) for pasted images instead of verbose temp file paths, delivering images natively as multimodal attachments.
-- [`rbf-status-line`](extensions/rbf-status-line.ts) (v0.10.0) — See on my status line what I see in Claude Code (workspace, repository, worktree, agent divergence, branch, commit).
+- [`rbf-status-line`](extensions/rbf-status-line.ts) (introduced v0.10.0; session continuity v0.21.11) — See on my status line what I see in Claude Code (workspace, repository, worktree, agent divergence, branch, commit); footer, collapsed tool rows, clean read output, and cache cues survive session resume and reload.
 - [`rbf-cache-guardian`](extensions/rbf-cache-guardian.ts) (v0.9.0) — See when prompt cache reuse is no longer guaranteed with countdown, 10% critical alerts, and Claude Code styled /clear CTA.
 - [`rbf-skill-loaded-blended`](extensions/rbf-skill-loaded-blended.ts) (v0.8.0) — Routine loaded skills blend transparently into terminal background matching Claude Code.
 - [`rbf-clear`](extensions/rbf-clear.ts) (v0.7.0) — Use `/clear` to start a new chat session cleanly, matching native `/new`.

@@ -3,6 +3,10 @@ title: Changelog
 ---
 
 # 🔵⋯ [Unreleased]
+
+---
+
+# 🔵⋯ v0.21.11 (2026-09-27)
 ## 🟠⋯ Fixed for End Users
 - 2026-09-27 - fix (ux) | keep the footer, tool-row presentation, read cleanup, and fresh cache cues working after `/resume` or `/reload`; expired cache state stays out of the new module (#pi-34) [@pi]
 
