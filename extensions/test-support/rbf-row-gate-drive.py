@@ -80,8 +80,9 @@ def main() -> int:
             if "wait" in step:
                 pattern = re.compile(step["wait"].encode())
                 count = int(step.get("count", 1))
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
                 while len(list(pattern.finditer(strip(bytes(raw))))) < count:
-                    if time.monotonic() > deadline:
+                    if time.monotonic() > wait_deadline:
                         failure = f"timed out waiting for {step['wait']!r} (count={count})"
                         break
                     pump(time.monotonic() + 0.1)
@@ -91,6 +92,7 @@ def main() -> int:
                 receipt = step["reloadReady"]
                 target = int(receipt["loads"])
                 last_ping = 0.0
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
                 while True:
                     try:
                         with open(receipt["path"], encoding="utf-8") as f:
@@ -102,13 +104,13 @@ def main() -> int:
                         # finish that command's redraw before the next paste/Enter.
                         pump(time.monotonic() + 0.25)
                         break
-                    if time.monotonic() > deadline:
+                    if time.monotonic() > wait_deadline:
                         failure = f"timed out waiting for reload readiness (loads={target})"
                         break
                     if state.get("loads") == target and time.monotonic() - last_ping >= 0.75:
                         # A swallowed ping during the reload box is harmless: retry until
                         # the new extension's command handler actually runs in the editor.
-                        command = f"/rbf-reload-ready {target}".encode()
+                        command = f"{receipt.get('command', '/rbf-reload-ready')} {target}".encode()
                         os.write(fd, b"\x1b[200~" + command + b"\x1b[201~\r")
                         last_ping = time.monotonic()
                     pump(time.monotonic() + 0.1)
@@ -124,6 +126,7 @@ def main() -> int:
                 pump(time.monotonic() + float(step["sleep"]))
             elif "waitSessionTurns" in step:
                 target = step["waitSessionTurns"]
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
                 while True:
                     files = glob.glob(os.path.join(target["dir"], "*.jsonl"))
                     try:
@@ -134,8 +137,28 @@ def main() -> int:
                     if count >= int(target["count"]):
                         pump(time.monotonic() + 0.3)
                         break
-                    if time.monotonic() > deadline:
+                    if time.monotonic() > wait_deadline:
                         failure = f"timed out waiting for {target['count']} Codex turns, saw {count}"
+                        break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
+            elif "waitJsonl" in step:
+                target = step["waitJsonl"]
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
+                while True:
+                    try:
+                        with open(target["path"], encoding="utf-8") as f:
+                            matches = [json.loads(line) for line in f if line.strip()]
+                        matches = [item for item in matches if item.get(target["field"]) == target["value"]]
+                        count = len({json.dumps(item.get(target["unique"]), sort_keys=True) for item in matches}) if "unique" in target else len(matches)
+                    except (OSError, ValueError):
+                        count = 0
+                    if count >= int(target["count"]):
+                        pump(time.monotonic() + 0.3)
+                        break
+                    if time.monotonic() > wait_deadline:
+                        failure = f"timed out waiting for JSONL receipt count={target['count']}, saw {count}"
                         break
                     pump(time.monotonic() + 0.1)
                 if failure:

@@ -809,6 +809,7 @@ export async function verifyBranchHistory(
 	return { ok: false, diverged: false };
 }
 
+/** No completed Pi user turn: native history may contain interruptions or compaction, not completed user work. */
 export async function verifyEmptyBranchHistory(
 	client: AppServerClient,
 	threadId: string,
@@ -836,15 +837,15 @@ export async function verifyEmptyBranchHistory(
 			return false;
 		}
 
-		if (!Array.isArray(res.data) || (res.nextCursor !== null && res.nextCursor !== undefined && typeof res.nextCursor !== "string")) return false;
+		if (signal?.aborted || Date.now() - startTime >= 30_000) return false;
+		if (!Array.isArray(res.data) || res.nextCursor === "" || (res.nextCursor !== null && res.nextCursor !== undefined && typeof res.nextCursor !== "string")) return false;
 		const data = res.data as Rec[];
 		if (!data.length && res.nextCursor) return false;
 		for (const turn of data) {
 			if (!turn || typeof turn.id !== "string" || !turn.id || seenTurns.has(turn.id)) return false;
 			seenTurns.add(turn.id);
-			const status = turn.status;
-			const items = turn.items as unknown[] | undefined;
-			if (status !== "completed" || classifyCompletedTurn(items) !== "compaction") return false;
+			if (!Array.isArray(turn.items)) return false;
+			if (turn.status !== "interrupted" && (turn.status !== "completed" || classifyCompletedTurn(turn.items) !== "compaction")) return false;
 		}
 
 		const nextCursor = typeof res.nextCursor === "string" ? res.nextCursor : null;
@@ -1453,15 +1454,15 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		/** One user prompt is one Codex turn across N `streamSimple` calls and tool executions. */
 		function streamSimple(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 			const out = new AssistantMessageWriter(model);
+			const ctx = state.ctx;
 			const fail = (e: unknown) => {
-				if (e instanceof AbortedError) return out.finish("aborted");
+				if (options?.signal?.aborted || e instanceof AbortedError) return out.finish("aborted");
 				const err = e instanceof CodexError ? e : new CodexError("generic", String(e));
 				if (err.detail) notify(`Codex: ${err.detail}`, "warning");
 				out.finish("error", err.key);
 			};
 
 			void (async () => {
-				const ctx = state.ctx;
 				if (!ctx) return fail(new CodexError("generic", "session_start has not run"));
 				const signal = options?.signal;
 
@@ -1517,6 +1518,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					}
 					if (signal?.aborted) return out.finish("aborted");
 				}
+				return beginUserTurn(items);
+			})();
+
+			/** Every fresh turn, including a refused steer, verifies the selected branch. */
+			async function beginUserTurn(items: UserInputItem[]): Promise<void> {
+				if (!ctx) return fail(new CodexError("generic", "session_start has not run"));
+				const signal = options?.signal;
+				if (signal?.aborted) return out.finish("aborted");
 				try {
 					const cwd = realpathSync.native(ctx.sessionManager.getCwd());
 					const client = await ensureClient(cwd, signal);
@@ -1535,7 +1544,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				} catch (e) {
 					return fail(e);
 				}
-			})();
+			}
 
 			/** The turn's `end` event, drained by this call: record it, then finish the stream or start the refused steer's turn. */
 			function finishTurn(turn: ActiveTurn, ev: { status: string; error?: string }, mode: { silent?: boolean }, answer: { streamed: boolean; fallback: string }): void {
@@ -1555,9 +1564,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					// The steer was refused because the turn ended: it becomes its own turn now, in this same Pi message.
 					const unsent = turn.unsent;
 					turn.unsent = undefined;
-					void startTurn(turn.client, turn.threadId, unsent, model, options?.reasoning)
-						.then((next) => drain(next, {}))
-						.catch(fail);
+					void beginUserTurn(unsent);
 					return;
 				}
 				if (ev.status === "completed") {

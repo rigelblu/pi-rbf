@@ -1,7 +1,7 @@
 // Scripted `codex app-server` stand-in for rbf-codex tests: JSON-RPC lines over stdio.
 // The scenario comes from RBF_FAKE_SCENARIO (JSON); every inbound message is appended
 // to RBF_FAKE_LOG so a test can assert exactly what Pi sent.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 export type FakeApproval = { when: "before" | "after"; command?: string | null; reason?: string; kind?: string; approvalId?: string };
@@ -42,8 +42,12 @@ export type FakeScenario = {
 	turn?: FakeTurnEvent[];
 	/** Events for the second and later turns, when they differ. */
 	laterTurns?: FakeTurnEvent[];
+	/** Per-persisted-turn scripts for real-Pi first/later interruption probes. */
+	turnScripts?: FakeTurnEvent[][];
 	/** Swallow `turn/interrupt` so no completion ever arrives. */
 	ignoreInterrupt?: boolean;
+	/** Answer `turn/interrupt` at once but end the turn this many ms later, so a steer can land inside the interrupt window. */
+	interruptDelayMs?: number;
 	/** Turns listed on `thread/resume` (with turns). */
 	resumeTurns?: { id: string; status: string }[];
 	/** Only list the scripted turns once turn/start has actually created them. */
@@ -64,6 +68,10 @@ export type FakeScenario = {
 	version?: string;
 	versionHang?: boolean;
 	versionExitCode?: number;
+	/** Retain actual input, items and terminal statuses; optionally persist across fake processes. */
+	retainHistory?: boolean;
+	/** Raw pages for malformed/pagination controls, newest first. */
+	turnsListPages?: unknown[];
 	turnsList?: { id: string; status: string; items?: unknown[] }[];
 	turnsListError?: string;
 	/** Simulate a malformed but successful turns/list response. */
@@ -92,7 +100,12 @@ if (process.argv.includes("--version")) {
 
 const log = process.env.RBF_FAKE_LOG;
 const THREAD_ID = "thread-fake-1";
-let turnCounter = 0;
+type HistoryTurn = { id: string; status: string; items: Record<string, unknown>[] };
+const historyPath = process.env.RBF_FAKE_HISTORY;
+const history: HistoryTurn[] = scenario.retainHistory && historyPath && existsSync(historyPath)
+	? JSON.parse(readFileSync(historyPath, "utf8")) as HistoryTurn[] : [];
+let turnCounter = history.length;
+const saveHistory = () => { if (scenario.retainHistory && historyPath) writeFileSync(historyPath, JSON.stringify(history)); };
 let forkCounter = 0;
 let requestCounter = 9000;
 let childCounter = 0;
@@ -106,6 +119,17 @@ function send(m: Record<string, unknown>): void {
 	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...m })}\n`);
 }
 function notify(method: string, params: unknown): void {
+	if (scenario.retainHistory) {
+		const p = params as { turnId?: string; turn?: { id: string; status: string }; item?: Record<string, unknown> };
+		const turn = history.find((t) => t.id === (p.turn?.id ?? p.turnId));
+		if (turn && method === "turn/completed") turn.status = p.turn!.status;
+		if (turn && p.item && (method === "item/started" || method === "item/completed")) {
+			const i = turn.items.findIndex((item) => item.id === p.item!.id);
+			if (i < 0) turn.items.push(p.item);
+			else turn.items[i] = p.item;
+		}
+		saveHistory();
+	}
 	send({ method, params });
 }
 /** Send a server request and wait for Pi's reply (result or error). */
@@ -349,6 +373,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			else send({ id: m.id, result: threadResponse(`thread-fake-fork-${++forkCounter}`) });
 			break;
 		case "thread/turns/list": {
+			if (scenario.turnsListPages) {
+				const index = Number(m.params?.cursor ?? 0);
+				send({ id: m.id, result: scenario.turnsListPages[index] });
+				break;
+			}
 			if (scenario.turnsListMalformed) {
 				send({ id: m.id, result: { nextCursor: null } });
 				break;
@@ -364,6 +393,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			let allTurns: { id: string; status: string; items?: unknown[] }[] = [];
 			if (scenario.turnsList) {
 				allTurns = scenario.turnsList;
+			} else if (scenario.retainHistory) {
+				allTurns = p.sortDirection === "asc" ? history.slice() : history.slice().reverse();
 			} else if (scenario.resumeTurns) {
 				const visible = scenario.dynamicResumeTurns
 					? scenario.resumeTurns.filter((t) => Number(t.id.match(/^turn-fake-(\d+)$/)?.[1]) <= turnCounter)
@@ -434,7 +465,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			}
 			turnCounter += 1;
 			const turnId = `turn-fake-${turnCounter}`;
-			const events = (turnCounter > 1 && scenario.laterTurns) || scenario.turn || [{ kind: "answer", id: "msg-1", text: "FAKE_OK", phase: "final_answer" }, { kind: "complete" }];
+			if (scenario.retainHistory) {
+				history.push({ id: turnId, status: "inProgress", items: [{ id: `input-${turnCounter}`, type: "userMessage", content: m.params?.input ?? [] }] });
+				saveHistory();
+			}
+			const events = scenario.turnScripts?.[turnCounter - 1] || (turnCounter > 1 && scenario.laterTurns) || scenario.turn || [{ kind: "answer", id: "msg-1", text: "FAKE_OK", phase: "final_answer" }, { kind: "complete" }];
 			const begin = () => {
 				send({ id: m.id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
 				void runTurn({ threadId: String(m.params?.threadId ?? THREAD_ID), turnId, interrupted: false }, events as FakeTurnEvent[]);
@@ -444,19 +479,24 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		}
 		case "turn/steer":
-			if (scenario.steerError) send({ id: m.id, error: { code: -32000, message: scenario.steerError } });
+			if (scenario.retainHistory && !turns.has(String(m.params?.expectedTurnId))) send({ id: m.id, error: { code: -32000, message: "turn is no longer active" } });
+			else if (scenario.steerError) send({ id: m.id, error: { code: -32000, message: scenario.steerError } });
 			else send({ id: m.id, result: { turnId: m.params?.expectedTurnId } });
 			break;
 		case "turn/interrupt": {
 			if (m.id !== undefined) send({ id: m.id, result: {} }); // a request in the real schema; Codex answers it
 			if (scenario.ignoreInterrupt) break; // the "no completion within 3 s" path
 			// Only the named turn ends, as on real Codex (probe 2026-09-14: the parent's interrupt never reaches a child's turn); a running command is not killed.
-			const ctl = turns.get(String(m.params?.turnId));
-			if (ctl) ctl.interrupted = true;
-			turns.delete(String(m.params?.turnId));
-			const threadId = ctl?.threadId ?? String(m.params?.threadId ?? THREAD_ID);
-			notify("turn/completed", { threadId, turn: { id: m.params?.turnId, status: "interrupted", items: [] } });
-			void lateEvents(threadId, String(m.params?.turnId));
+			const end = () => {
+				const ctl = turns.get(String(m.params?.turnId));
+				if (ctl) ctl.interrupted = true;
+				turns.delete(String(m.params?.turnId));
+				const threadId = ctl?.threadId ?? String(m.params?.threadId ?? THREAD_ID);
+				notify("turn/completed", { threadId, turn: { id: m.params?.turnId, status: "interrupted", items: [] } });
+				void lateEvents(threadId, String(m.params?.turnId));
+			};
+			if (scenario.interruptDelayMs) setTimeout(end, scenario.interruptDelayMs);
+			else end();
 			break;
 		}
 		default:

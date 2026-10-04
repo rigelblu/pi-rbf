@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,9 +6,10 @@ import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfi
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { Box, Editor } from "@earendil-works/pi-tui";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeInterruptionFixture } from "./test-support/rbf-codex-interruption-fixture.ts";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COMPACT_DISPATCHER_KEY, COMPACT_NOTICE, COMPACT_SAFE_REASONS, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, classifyCompletedTurn, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, isCompactCommand, isSupportedCodexVersion, loneString, mapEffort, parseCodexVersion, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle, verifyBranchHistory, verifyEmptyBranchHistory } from "./rbf-codex.ts";
+import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COMPACT_DISPATCHER_KEY, COMPACT_NOTICE, COMPACT_SAFE_REASONS, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, AppServerClient, classifyCompletedTurn, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, isCompactCommand, isSupportedCodexVersion, loneString, mapEffort, parseCodexVersion, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle, verifyBranchHistory, verifyEmptyBranchHistory } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
@@ -176,10 +177,14 @@ describe("rbf-codex", () => {
 	}
 
 	/** Boot an extension instance with `session_start` already fired, ready to stream. */
-	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number } = {}) {
+	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number; persistAppends?: boolean } = {}) {
 		const fx = makePi();
 		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [], compactTimeoutMs: opts.compactTimeoutMs })(fx.pi);
 		const c = makeCtx(opts);
+		if (opts.persistAppends) vi.mocked(fx.pi.appendEntry).mockImplementation((customType, data) => {
+			fx.entries.push({ customType, data });
+			c.branch.push({ type: "custom", customType, data });
+		});
 		await fx.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, c.ctx);
 		const turn = (text: string | Context["messages"], m: Model<any> = model(), options: { reasoning?: ThinkingLevel; signal?: AbortSignal } = {}) => {
 			const messages = typeof text === "string" ? [userMessage(text)] : text;
@@ -906,8 +911,8 @@ describe("rbf-codex", () => {
 		});
 
 		it("a refused steer becomes exactly one turn/start after the turn ends, carrying the steer text and images", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "turn already ended" });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "turn already ended" });
+			const b = await boot({ persistAppends: true });
 			const m = model("gpt-fake-2");
 			m.input = ["text", "image"];
 			const first = await b.turn("go", m);
@@ -924,8 +929,8 @@ describe("rbf-codex", () => {
 		});
 
 		it("a refused steer survives a row that opens before the turn ends, and is sent exactly once", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "command", id: "c2", command: "two" }, { kind: "answer", id: "m1", text: "both" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "refused" });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "command", id: "c2", command: "two" }, { kind: "answer", id: "m1", text: "both" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "refused" });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const result1 = await b.exec(first.toolCall!);
 			const second = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result1), userMessage("later")]); // steer refused; this call ends on row c2
@@ -952,6 +957,316 @@ describe("rbf-codex", () => {
 		});
 	});
 
+	describe("interruption recovery", () => {
+		const nativeUser = (text = "STOPPED") => ({ id: "user-1", type: "userMessage", content: [{ type: "text", text, text_elements: [] }] });
+		const interrupted = (id = "interrupted-1", items: unknown[] = [nativeUser()]) => ({ id, status: "interrupted", items });
+		const compact = (id = "compact-1") => ({ id, status: "completed", items: [{ id: `item-${id}`, type: "contextCompaction" }] });
+		const own = (status?: string): Entry[] => [
+			{ type: "custom", customType: ENTRY_TYPE, data: { threadId: "fixture-thread", cwd: process.cwd(), sessionId: "session-A" } },
+			...(status ? [{ type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "fixture-thread", turnId: "interrupted-1", status } }] : []),
+		];
+		function assertDispatch(b: Awaited<ReturnType<typeof boot>>, accepted: boolean) {
+			const starts = sent().filter((m) => m.method === "turn/start");
+			expect(starts).toHaveLength(accepted ? 1 : 0);
+			if (accepted) expect(starts[0].params).toMatchObject({ threadId: "fixture-thread", input: [{ type: "text", text: "NEW_ONLY", text_elements: [] }] });
+			expect(methods()).not.toContain("thread/start");
+			expect(methods()).not.toContain("thread/fork");
+			expect(b.entries.filter((e) => e.customType === ENTRY_TYPE)).toHaveLength(0);
+		}
+
+		it.each([undefined, "interrupted"])("first interruption with local entry %s continues exactly once on own T", async (status) => {
+			scenario({ turnsList: [interrupted()] });
+			const b = await boot({ branch: own(status) });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+		});
+
+		async function undrainedCommand(extra: FakeScenario = {}) {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "hang" }], laterTurns: [{ kind: "answer", id: "new", text: "FAKE_OK" }, { kind: "complete" }], ...extra });
+			const b = await boot({ persistAppends: true });
+			const first = await b.turn("STOPPED");
+			const ac = new AbortController();
+			const execution = b.exec(first.toolCall!, { signal: ac.signal });
+			ac.abort();
+			await expect(execution).rejects.toThrow(ROW_STATUS.aborted);
+			await vi.waitFor(() => expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).not.toBe("inProgress"));
+			// Model the actual host: it never calls the provider with this aborted
+			// signal. Native completion is buffered, but no Pi turn entry exists yet.
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toHaveLength(0);
+			return { b, messages: [userMessage("STOPPED"), first.final!, userMessage("NEW_ONLY")] };
+		}
+
+		it.each([
+			{ name: "interrupted", safe: true, native: {} },
+			{ name: "failed", safe: false, native: { turnsList: [{ ...interrupted("turn-fake-1"), status: "failed" }] } },
+			{ name: "active", safe: false, native: { turnsList: [{ ...interrupted("turn-fake-1"), status: "inProgress" }] } },
+			{ name: "unknown", safe: false, native: { turnsList: [{ ...interrupted("turn-fake-1"), status: "future" }] } },
+			{ name: "missing items", safe: false, native: { turnsList: [{ id: "turn-fake-1", status: "interrupted" }] } },
+			{ name: "unreadable", safe: false, native: { turnsListError: "unreadable" } },
+			{ name: "metadata mismatch", safe: false, native: { resumeThreadId: "wrong" } },
+			{ name: "older completed user", safe: false, native: { turnsList: [...Array.from({ length: 6 }, (_, i) => interrupted(`cut-${i}`)), { id: "older", status: "completed", items: [nativeUser("OLDER")] }] } },
+		])("direct undrained command checks $name history before any new dispatch", async ({ safe, native }) => {
+			const { b, messages } = await undrainedCommand(native);
+			const result = await b.turn(messages);
+			if (safe) expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			const calls = sent();
+			expect(calls.filter((m) => m.method === "turn/steer")).toHaveLength(1);
+			const steer = calls.findIndex((m) => m.method === "turn/steer");
+			const resume = calls.findIndex((m, i) => i > steer && m.method === "thread/resume");
+			expect(steer).toBeGreaterThan(0); expect(resume).toBeGreaterThan(steer);
+			const starts = calls.filter((m) => m.method === "turn/start");
+			expect(starts).toHaveLength(safe ? 2 : 1);
+			if (safe) {
+				const scan = calls.findIndex((m, i) => i > resume && m.method === "thread/turns/list");
+				expect(scan).toBeGreaterThan(resume);
+				expect(calls.indexOf(starts[1])).toBeGreaterThan(scan);
+				expect(starts[1].params).toMatchObject({ threadId: "thread-fake-1", input: [{ type: "text", text: "NEW_ONLY", text_elements: [] }] });
+			}
+			expect(calls.filter((m) => m.method === "thread/start")).toHaveLength(1);
+			expect(calls.filter((m) => m.method === "thread/fork")).toHaveLength(0);
+			expect(b.entries.filter((e) => e.customType === ENTRY_TYPE)).toHaveLength(1);
+		});
+
+		it("direct undrained command with an actual failed native end refuses without U", async () => {
+			const { b, messages } = await undrainedCommand({ ignoreInterrupt: true, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "sleep", ms: 200 }, { kind: "complete", status: "failed", errorMessage: "synthetic native failure" }] });
+			expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).toBe("failed");
+			expect((await b.turn(messages)).final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect(methods()).toContain("thread/turns/list");
+		});
+
+		// Known limit, accepted for the pi-10.6 release (2026-10-05): the stale completed end is recorded on the sibling, so its prompt is sent. Drop `.fails` when fixed.
+		it.fails("direct undrained command with an actual completed native end refuses a same-thread sibling that never showed it (Q33)", async () => {
+			const { b } = await undrainedCommand({ ignoreInterrupt: true, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "sleep", ms: 200 }, { kind: "complete", status: "completed" }] });
+			expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).toBe("completed");
+			// Move to a sibling on the same thread: it keeps the binding and shows neither the stopped prompt nor its row.
+			b.branch.splice(0, b.branch.length, ...b.branch.filter((e) => e.customType === ENTRY_TYPE));
+			const result = await b.turn([userMessage("NEW_ONLY")]);
+			expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		// Known limit, accepted for the pi-10.6 release (2026-10-05): the prompt is steered into the turn being stopped and ends aborted. Drop `.fails` when fixed.
+		it.fails("a prompt sent inside the interrupt window still gets its own answer", async () => {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, interruptDelayMs: 300, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "hang" }], laterTurns: [{ kind: "answer", id: "new", text: "FAKE_OK" }, { kind: "complete" }] });
+			const b = await boot({ persistAppends: true });
+			const first = await b.turn("STOPPED");
+			const ac = new AbortController();
+			const execution = b.exec(first.toolCall!, { signal: ac.signal });
+			ac.abort();
+			await expect(execution).rejects.toThrow(ROW_STATUS.aborted);
+			// Guard: no wait here, so the native turn must still be running when the next prompt arrives.
+			expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).toBe("inProgress");
+			const result = await b.turn([userMessage("STOPPED"), first.final!, userMessage("NEW_ONLY")]);
+			expect(result.text).toBe("FAKE_OK");
+			const starts = sent().filter((m) => m.method === "turn/start");
+			expect(starts).toHaveLength(2);
+			expect(starts[1].params).toMatchObject({ input: [{ type: "text", text: "NEW_ONLY", text_elements: [] }] });
+		});
+
+		it("direct undrained command cancelled during its scan sends no new turn", async () => {
+			const { b, messages } = await undrainedCommand({ turnsListDelayMs: 200 });
+			const ac = new AbortController();
+			const pending = b.turn(messages, model(), { signal: ac.signal });
+			await vi.waitFor(() => expect(methods()).toContain("thread/turns/list"));
+			ac.abort();
+			expect((await pending).final?.stopReason).toBe("aborted");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		it.each(["branch", "cwd"])("direct undrained command rechecks current %s ownership", async (changed) => {
+			const { b, messages } = await undrainedCommand({ turnsList: [{ id: "older", status: "completed", items: [nativeUser("OLDER")] }] });
+			if (changed === "branch") b.branch.splice(0, b.branch.length, ...own());
+			else b.setCwd(dir);
+			const result = await b.turn(messages);
+			expect(result.final?.errorMessage).toBe(COPY[changed === "branch" ? "history-unverified" : "workspace-mismatch"]);
+			if (changed === "branch") expect(sent().filter((m) => m.method === "thread/resume").at(-1)?.params?.threadId).toBe("fixture-thread");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+		});
+
+		it.each(["00000003", "00000008"])("sibling interrupted context on persisted leaf %s sends only new input", async (leaf) => {
+			const file = join(dir, "fixture.jsonl");
+			writeInterruptionFixture(file, process.cwd());
+			const sm = SessionManager.open(file);
+			sm.branch(leaf);
+			scenario({ turnsList: [interrupted()] });
+			const b = await boot({ sessionId: "fixture-session" });
+			(b.ctx as unknown as { sessionManager: SessionManager }).sessionManager = sm;
+			vi.mocked(b.pi.appendEntry).mockImplementation((customType, data) => { b.entries.push({ customType, data }); sm.appendCustomEntry(customType, data); });
+			const newId = sm.appendMessage(userMessage("NEW_ONLY"));
+			expect(sm.getEntry(newId)?.parentId).toBe(leaf);
+			const input = sm.buildSessionContext().messages as Context["messages"];
+			expect((await b.turn(input)).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+			const reopened = SessionManager.open(file);
+			expect(reopened.getBranch().some((e) => e.id === "00000007")).toBe(leaf === "00000008");
+			expect(reopened.getEntries()).toHaveLength(10);
+		});
+
+		it.each([false, true])("sibling completed context refuses (older page=%s)", async (older) => {
+			const user = { id: "sibling-completed-1", status: "completed", items: [nativeUser("SIBLING_ONLY")] };
+			scenario({ turnsList: [...(older ? Array.from({ length: 6 }, (_, i) => interrupted(`cut-${i}`)) : []), user] });
+			const b = await boot({ branch: own() });
+			expect((await b.turn("NEW_ONLY")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, false);
+			if (older) expect(sent().filter((m) => m.method === "thread/turns/list")).toHaveLength(2);
+		});
+
+		it("repeated interruptions and mixed partial items with compaction-only completed turns scan every page", async () => {
+			scenario({ turnsList: [...Array.from({ length: 6 }, (_, i) => interrupted(`cut-${i}`, [nativeUser(), { type: "contextCompaction" }, { type: "futureItem" }])), compact()] });
+			const b = await boot({ branch: own("interrupted") });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+			expect(sent().filter((m) => m.method === "thread/turns/list").map((m) => m.params?.limit)).toEqual([5, 20]);
+		});
+
+		it.each([
+			{ name: "failed", data: [{ ...interrupted(), status: "failed" }] },
+			{ name: "active despite Pi abort", data: [{ ...interrupted(), status: "inProgress" }] },
+			{ name: "unknown status", data: [{ ...interrupted(), status: "futureStatus" }] },
+			{ name: "missing status", data: [{ id: "cut", items: [] }] },
+			{ name: "missing items", data: [{ id: "cut", status: "interrupted" }] },
+			{ name: "null items", data: [{ ...interrupted(), items: null }] },
+			{ name: "object items", data: [{ ...interrupted(), items: {} }] },
+			{ name: "empty completed origin", data: [{ ...interrupted(), status: "completed", items: [] }] },
+			{ name: "unknown completed origin", data: [{ ...interrupted(), status: "completed", items: [{ type: "futureItem" }] }] },
+			{ name: "user after compaction", data: [{ ...compact(), items: [{ type: "contextCompaction" }, nativeUser()] }] },
+			{ name: "duplicate turn", data: [interrupted(), interrupted()] },
+			{ name: "empty id", data: [interrupted("")] },
+			{ name: "null turn", data: [null] },
+			{ name: "nonarray page", data: {} },
+		])("unsafe $name refuses without dispatch", async ({ data }) => {
+			scenario({ turnsListPages: [{ data, nextCursor: null }] });
+			const b = await boot({ branch: own("interrupted") });
+			expect((await b.turn("NEW_ONLY")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, false);
+		});
+
+		it.each([undefined, null, "", 1, {}, false])("end cursor %j preserves optional/null and rejects all other sentinels", async (nextCursor) => {
+			scenario({ turnsListPages: [{ data: [compact()], ...(nextCursor === undefined ? {} : { nextCursor }) }] });
+			const b = await boot({ branch: own() });
+			const accepted = nextCursor === undefined || nextCursor === null;
+			const result = await b.turn("NEW_ONLY");
+			if (accepted) expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, accepted);
+		});
+
+		it.each([undefined, null, "", "1"])("empty page cursor %j is empty history only at genuine end", async (nextCursor) => {
+			scenario({ turnsListPages: [{ data: [], ...(nextCursor === undefined ? {} : { nextCursor }) }] });
+			const b = await boot({ branch: own() });
+			const accepted = nextCursor === undefined || nextCursor === null;
+			const result = await b.turn("NEW_ONLY");
+			if (accepted) expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, accepted);
+		});
+
+		it.each(["mismatch", "request-error", "malformed", "loop"])("%s history refuses zero dispatch", async (control) => {
+			scenario(control === "mismatch" ? { resumeThreadId: "wrong" }
+				: control === "request-error" ? { turnsListError: "synthetic failure" }
+				: control === "malformed" ? { turnsListMalformed: true }
+				: { turnsListPages: [{ data: [interrupted("cut-1")], nextCursor: "1" }, { data: [interrupted("cut-2")], nextCursor: "1" }] });
+			const b = await boot({ branch: own() });
+			expect((await b.turn("NEW_ONLY")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, false);
+		});
+
+		it("abort during the native no-U scan sends zero turns", async () => {
+			scenario({ turnsList: [interrupted()], turnsListDelayMs: 200 });
+			const b = await boot({ branch: own() });
+			const ac = new AbortController();
+			const result = b.turn("NEW_ONLY", model(), { signal: ac.signal });
+			await vi.waitFor(() => expect(methods()).toContain("thread/turns/list"));
+			ac.abort();
+			expect((await result).final?.stopReason).toBe("aborted");
+			assertDispatch(b, false);
+		});
+
+		it.each(["abort", "deadline"])("a final response arriving after %s cannot admit no-U history", async (boundary) => {
+			const ac = new AbortController();
+			let now = 0;
+			const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+			const request = vi.fn(async () => {
+				if (boundary === "abort") ac.abort();
+				else now = 30_000;
+				return { data: [interrupted()], nextCursor: null };
+			});
+			try {
+				expect(await verifyEmptyBranchHistory({ request } as unknown as AppServerClient, "fixture-thread", ac.signal)).toBe(false);
+				expect(request).toHaveBeenCalledTimes(1);
+			} finally { clock.mockRestore(); }
+		});
+
+		it("no-U page and elapsed budgets still fail closed", async () => {
+			let requests = 0;
+			const client = { request: async () => ({ data: [interrupted(`cut-${++requests}`)], nextCursor: `cursor-${requests}` }) } as unknown as AppServerClient;
+			expect(await verifyEmptyBranchHistory(client, "fixture-thread")).toBe(false);
+			expect(requests).toBe(100);
+			const now = vi.spyOn(Date, "now");
+			let ticks = 0;
+			now.mockImplementation(() => ticks++ < 3 ? 0 : 30_001);
+			try {
+				requests = 0;
+				expect(await verifyEmptyBranchHistory(client, "fixture-thread")).toBe(false);
+				expect(requests).toBe(1);
+			} finally { now.mockRestore(); }
+		});
+
+		it("a completed U still skips later interruptions and forks only at U for unseen completed user input", async () => {
+			const branch = [...own(), { type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "fixture-thread", turnId: "checkpoint", status: "completed" } }, { type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "fixture-thread", turnId: "cut", status: "interrupted" } }];
+			scenario({ turnsList: [interrupted("cut"), { id: "checkpoint", status: "completed", items: [nativeUser("OLD")] }] });
+			const b = await boot({ branch });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+			await b.shutdown();
+			scenario({ turnsList: [{ id: "unseen", status: "completed", items: [nativeUser("UNSEEN")] }, interrupted("cut"), { id: "checkpoint", status: "completed", items: [nativeUser("OLD")] }] });
+			const c = await boot({ branch });
+			expect((await c.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			expect(sent().find((m) => m.method === "thread/fork")?.params).toMatchObject({ threadId: "fixture-thread", lastTurnId: "checkpoint" });
+		});
+
+		it("interrupted is not a foreign fork anchor and manual compact without U still refuses", async () => {
+			const b = await boot({ sessionId: "foreign", branch: own("interrupted") });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			expect(methods()).toContain("thread/start");
+			expect(methods()).not.toContain("thread/fork");
+			const c = await boot({ branch: own("interrupted") });
+			await c.submit("/compact");
+			expect(c.notify).toHaveBeenCalledWith(COMPACT_NOTICE.noThread, "warning");
+			expect(methods()).not.toContain("thread/compact/start");
+		});
+
+		it("warmed history verification scans 138 full items on every fresh request within p95 two seconds", async () => {
+			const n = Number(process.env.RBF_INTERRUPTION_BENCH_SAMPLES ?? 10);
+			expect(Number.isInteger(n) && n >= 10).toBe(true);
+			scenario({ turnsList: [interrupted("cut", Array.from({ length: 138 }, (_, i) => ({ id: `item-${i}`, type: i === 0 ? "userMessage" : "futureItem", ...(i === 0 ? { content: [] } : {}) })))] });
+			const client = await AppServerClient.start(process.cwd(), fakeCommand);
+			try {
+				await client.request("initialize", { clientInfo: { name: "pi-10.6-bench", version: "test" }, capabilities: { experimentalApi: true } });
+				client.notify("initialized", {});
+				const samples: number[] = [];
+				for (let i = 0; i <= n; i++) {
+					const start = performance.now();
+					const res = await client.request("thread/resume", { threadId: "fixture-thread", excludeTurns: true });
+					expect(res).toMatchObject({ thread: { id: "fixture-thread" } });
+					expect(await verifyEmptyBranchHistory(client, "fixture-thread")).toBe(true);
+					if (i > 0) samples.push(performance.now() - start);
+				}
+				const p95 = samples.sort((a, b) => a - b)[Math.ceil(0.95 * n) - 1];
+				expect(p95).toBeLessThanOrEqual(2000);
+				expect(methods().filter((m) => m === "thread/resume")).toHaveLength(n + 1);
+				expect(methods().filter((m) => m === "thread/turns/list")).toHaveLength(n + 1);
+				expect(methods()).not.toContain("turn/start");
+				console.log(`synthetic samples=${n} items=138 p95_ms=${p95.toFixed(2)} fresh_requests=true turn_starts=0`);
+			} finally { await client.close(); }
+		}, (Number(process.env.RBF_INTERRUPTION_BENCH_SAMPLES ?? 10) + 1) * 30_000 + 30_000);
+	});
+
 	describe("images (Scenario 11)", () => {
 		it("an image on an image-capable model travels as a data URL after the text; text-only models and the bootstrap row refuse it", async () => {
 			const b = await boot();
@@ -968,8 +1283,8 @@ describe("rbf-codex", () => {
 
 	describe("abort during a row (Scenario 12)", () => {
 		it("aborting the tool's signal sends one turn/interrupt, rejects execute with the cut-row text, and Pi's re-call with the aborted signal finishes the turn silently", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], laterTurns: [{ kind: "answer", id: "ok", text: "FAKE_OK" }, { kind: "complete" }] });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const ac = new AbortController();
 			const p = b.exec(first.toolCall!, { signal: ac.signal });
@@ -983,14 +1298,17 @@ describe("rbf-codex", () => {
 			expect(recall.events.map((e) => e.type)).toEqual(["error"]);
 			expect(sent().length).toBe(before);
 			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
-			delete process.env.RBF_FAKE_SCENARIO;
-			await b.turn("next");
+			expect((await b.turn("next")).text).toBe("FAKE_OK");
 			expect(methods().filter((m) => m === "turn/start")).toHaveLength(2);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods()).toContain("thread/turns/list");
+			expect(sent().filter((m) => m.method === "turn/start").at(-1)?.params).toMatchObject({ threadId: "thread-fake-1", input: [{ type: "text", text: "next", text_elements: [] }] });
 		});
 
-		it("with the interrupt ignored, the child is closed after 3 s and the next prompt spawns a new one", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], ignoreInterrupt: true });
-			const b = await boot();
+		it.each(["interrupted", "inProgress"])("with the interrupt ignored, the 3 s fallback checks native %s before dispatch", async (nativeStatus) => {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], ignoreInterrupt: true });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const ac = new AbortController();
 			const p = b.exec(first.toolCall!, { signal: ac.signal });
@@ -999,22 +1317,33 @@ describe("rbf-codex", () => {
 			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
 			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
 			expect(recall.final?.stopReason).toBe("aborted");
-			delete process.env.RBF_FAKE_SCENARIO;
 			await vi.waitFor(() => expect(sent().filter((m) => m.method === "initialize")).toHaveLength(1));
-			expect((await b.turn("again")).text).toBe("FAKE_OK");
+			const history = JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"));
+			expect(history[0].status).toBe("inProgress");
+			// Explicit native outcome, not the local fallback's interrupted entry.
+			history[0].status = nativeStatus;
+			writeFileSync(process.env.RBF_FAKE_HISTORY!, JSON.stringify(history));
+			scenario({ retainHistory: true });
+			const result = await b.turn("again");
+			if (nativeStatus === "interrupted") expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
 			expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(nativeStatus === "interrupted" ? 2 : 1);
 		}, 15_000);
 
 		it("child death during a row ends the row as Codex stopped and the next call as codex-stopped; under the shutdown flag both end aborted", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
-			const b = await boot();
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const result = await b.exec(first.toolCall!);
 			expect(result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
 			const next = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result)]);
 			expect(next.final?.errorMessage).toBe(COPY["codex-stopped"]);
-			delete process.env.RBF_FAKE_SCENARIO;
-			expect((await b.turn("again")).text).toBe("FAKE_OK"); // activeTurn was nulled; a fresh child and turn
+			scenario({ retainHistory: true });
+			expect((await b.turn("again")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1); // child death is not native terminal proof
 
 			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
 			const s = await boot();
@@ -1528,8 +1857,8 @@ describe("rbf-codex", () => {
 
 	describe("cancellation and child loss", () => {
 		it("Escape sends turn/interrupt and ends aborted when Codex reports interrupted", async () => {
-			scenario({ turn: [{ kind: "hang" }] });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "hang" }], laterTurns: [{ kind: "answer", id: "ok", text: "FAKE_OK" }, { kind: "complete" }] });
+			const b = await boot({ persistAppends: true });
 			const ac = new AbortController();
 			const p = b.turn("hi", model(), { signal: ac.signal });
 			await vi.waitFor(() => expect(methods()).toContain("turn/start"));
@@ -1540,11 +1869,15 @@ describe("rbf-codex", () => {
 			expect(typeof interrupt.id).toBe("number"); // a request, not a notification: real Codex ignores the latter
 			expect(interrupt.params).toEqual({ threadId: "thread-fake-1", turnId: "turn-fake-1" });
 			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect((await b.turn("next")).text).toBe("FAKE_OK");
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "thread/turns/list")).toHaveLength(1);
 		});
 
-		it("without a completion within 3 s the child is closed and the next prompt respawns", async () => {
-			scenario({ turn: [{ kind: "hang" }], ignoreInterrupt: true });
-			const b = await boot();
+		it("without a completion within 3 s the child respawns but refuses native active history", async () => {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "hang" }], ignoreInterrupt: true });
+			const b = await boot({ persistAppends: true });
 			const ac = new AbortController();
 			const p = b.turn("hi", model(), { signal: ac.signal });
 			await vi.waitFor(() => expect(methods()).toContain("turn/start"));
@@ -1552,10 +1885,12 @@ describe("rbf-codex", () => {
 			const r = await p;
 			expect(r.final?.stopReason).toBe("aborted");
 			await vi.waitFor(() => expect(sent().filter((m) => m.method === "initialize")).toHaveLength(1));
-			delete process.env.RBF_FAKE_SCENARIO;
+			scenario({ retainHistory: true });
 			await new Promise((r) => setTimeout(r, 100));
-			expect((await b.turn("again")).text).toBe("FAKE_OK");
+			expect((await b.turn("again")).final?.errorMessage).toBe(COPY["history-unverified"]);
 			expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
 		}, 15_000);
 
 		it("child death mid-turn ends with codex-stopped, but with the shutdown flag set it ends aborted", async () => {
