@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.23.0 (2026-10-04)
+## 🟠⋯ Added for End Users
+- 2026-10-04 - feat (ux) | select question-form answers with the mouse: click numbered choices, C or W without submitting; hover highlights temporarily and clears when the pointer leaves. Choices wrap in narrow panes, Write-in focuses immediately, notes survive switching, and Enter still submits (#pi-40.1)
+
+---
+
 # 🔵⋯ v0.22.0 (2026-10-04)
 ## 🟠⋯ Added for End Users
 - 2026-10-04 - feat (ux) | read file references within the pane width while keeping filenames visible: long paths shorten in the middle and refit on resize; file links, `/copy`, and `/tree` keep the original targets and text. Commands, file contents, and approval text stay literal (#pi-39.1)

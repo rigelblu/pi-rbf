@@ -339,6 +339,8 @@ Local Pi extension that adds familiar Vim modal navigation and editing in Pi's p
 
 # 🔵⋯ rbf-question-form
 
+Mouse selection and temporary hover feedback are available locally in v0.23.0.
+
 Hover highlights the chip under the pointer without selecting it; moving away clears it. The selected answer retains its distinct filled highlight.
 
 ## 🟠⋯ Overview
