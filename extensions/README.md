@@ -574,3 +574,21 @@ Local Pi extension that registers Codex as the model provider `codex-harness`, s
 - Local verification: `pi -p --no-extensions -e ./extensions/rbf-codex.ts --model codex-harness/codex "Reply exactly PI_CODEX_OK and nothing else." < /dev/null` prints `PI_CODEX_OK` (the `< /dev/null` matters from any script or agent shell: Pi reads a non-tty stdin to EOF before loading extensions); `bun run test -- extensions/rbf-codex.test.ts` runs the focused suite against a fake app-server; `bun run test -- extensions/rbf-codex-row-gate.test.ts` is the row gate: it boots a real Pi under a pty, bare and with the daily row extensions, replays each raw stream into the final screen, and asserts the rows of every Codex row kind (command, long output collapsed, edit, added file, failed command, declined, stopped, question answered, skipped, and secret, a `codex_command` called by hand, tool call rows with a text result, a code argument, and a failed call, a sub-agent's tagged command rows, and a command row cut by Escape against Pi's own bash row cut by Escape) against Pi's own bash and edit rows drawn in the same process, blank rows between lines included; needs `python3`, and fails its first test when a prerequisite is missing unless `RBF_ROW_GATE_OPTIONAL=1` (`RBF_ROW_GATE_KEEP=1` keeps the raw captures for a post-mortem). With a `CODEX_HOME` that configures an MCP server, `pi -p … --model codex-harness/gpt-5.6-sol "Call the bear_app MCP tool list_tags exactly once and the node_repl js tool exactly once with the code 21*2, then reply exactly TAGS=<count> JS=<value>." < /dev/null` answers with both values and the session log holds two `codex_tool` calls
 - Global installation: `cp ./extensions/rbf-codex.ts ~/.pi/agent/extensions/rbf-codex.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-codex.ts`. Codex threads, credentials, and settings are untouched; `codex resume` still opens any thread. The provider's entry in Pi's model store stays behind and is inert
+
+
+# 🔵⋯ rbf-path-labels candidate
+
+Unreleased pi-39.1 candidate. Shortens eligible assistant file references, native footer directory segments, `/session` File values and file-autocomplete descriptions by display cells. It keeps the filename first, omits whole interior directories with `…`, and restores more location when the pane widens. Spaced/CJK reference labels that native wrapping can split receive their own line. The existing pi-rbf basename footer remains unchanged.
+
+Run the candidate from its engineering worktree:
+```sh
+cd /Volumes/tom-ssd/src/worktrees/pi-rbf/pi-39.1
+pi --no-extensions -e ./extensions/rbf-path-labels.ts
+```
+This activates it for that process. Omit the `-e` argument on the next launch to roll back. Daily activation and release are separate gates. Component compatibility is verified against checkout Pi 0.85.1 and daily Pi 1.0.2; private layout changes fall back to native output with a bounded warning.
+
+Eligible references are local-file link labels, one path in inline code, or a strong-prefix bare path in explicit reference prose. Ambiguous instructions, commands, flags, wildcards, multiple operands, fenced/indented code, HTML literals, thinking, tools and user text retain native rendering. Unsupported syntax delegates. Terminal hyperlinks retain the original destination; without hyperlinks, the label is plain text. Same filenames can share shortened labels; nearby prose and original destinations distinguish them.
+
+Terminal selection copies what is visible, including `…`. `/copy` retrieves the original last assistant response. For an older response, clear selection, open `/tree`, select the message and use the footer's copy action (default Ctrl+X), then Escape without Enter. It copies original text without navigating. Completion inserts its original full value. No new clipboard or per-path action is added.
+
+Run `bun run test -- extensions/rbf-path-labels.test.ts` and `bun run typecheck` from a checkout with its pinned dependencies installed. The canonical pi-39 brief's verification receipts contain the isolated offline terminal probe and its captured source hashes. Human font/scan comfort, same-name ambiguity and recovery friction remain pending.

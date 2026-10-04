@@ -4,6 +4,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-path-labels`](extensions/rbf-path-labels.ts) (pi-39.1 candidate, unreleased) — Fit assistant file references and native full-path labels within their pane; keep original targets, source text and completion values. [Activation and recovery](extensions/README.md#-rbf-path-labels-candidate).
 - [`rbf-rename`](extensions/rbf-rename.ts) (v0.17.0) — Use `/rename` to name or rename the current Pi session while preserving native `/name`.
 - [`rbf-rewind`](extensions/rbf-rewind.ts) (v0.16.0) — Use `/rewind` as a first-class alias for `/tree` to navigate session branches and checkpoints.
 - [`rbf-question-form`](extensions/rbf-question-form.ts) (introduced v0.15.0; answer editing v0.21.10) — Select answers to agent questions in an inline quick-pick form. Press `W` for Write-in; use familiar Pi editor keys in Write-in or notes, `Ctrl+J` for a new line, Up through wrapped rows, Tab for choices, and Enter to submit. Pasted text has terminal controls removed before display and submission.
