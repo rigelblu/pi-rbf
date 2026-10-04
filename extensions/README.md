@@ -339,6 +339,8 @@ Local Pi extension that adds familiar Vim modal navigation and editing in Pi's p
 
 # 🔵⋯ rbf-question-form
 
+Hover highlights the chip under the pointer without selecting it; moving away clears it. The selected answer retains its distinct filled highlight.
+
 ## 🟠⋯ Overview
 Local Pi extension providing an inline, non-modal selector at the prompt line for agent questions with numbered options. Keeps recommendation and framing context in the transcript above as readable markdown, letting users pick an offered answer with its number key (`1`–`9`), the canned reply with `C`, or Write-in with `W`.
 
@@ -377,17 +379,21 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
     - Newline vs. Enter & Terminal Caveat:
       - `Shift+Enter` and `Ctrl+J` insert a newline (`\n`) without submitting. Bare `Enter` submits.
       - *Terminal Shift+Enter Caveat:* In terminals without extended keyboard protocols (like Kitty keyboard protocol or CSI u), `Shift+Enter` is reported identically to bare `Enter` (`\r`), triggering submission. Use `Ctrl+J` in these terminals to insert newlines reliably.
-    - Field-focused hint shows `  [Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close` at 80 cols (truncated cleanly at 40 cols while retaining navigation and submit).
+    - Field-focused hints wrap at word boundaries and show separate `[Shift+Enter] / [Ctrl+J]` keys; Enter and Escape actions remain complete in narrow panes.
+- Mouse selection (fullscreen): click anywhere inside a numbered, C or W chip, including its brackets/padding. Clicks select without sending; Enter submits. Numbered/C clicks focus choices; W focuses the retained answer field. Notes, cursor, undo and kill/yank history survive switching. Dragging, modified/right/middle clicks, gaps and stale targets do not activate.
+- Narrow panes: complete chips wrap in numbered → C → W order from 20 columns, with stable selected footprints. C compacts to `C` only when its full label cannot fit a row; W likewise. Allow enough pane height for the wrapped form. Below 20 columns output fits and keyboard operation remains available; mouse reachability is not promised.
+- Terminal modes: `--tui-mode fullscreen` enables native mouse routing and the Click hint. `--tui-mode regular` keeps keyboard operation and terminal selection without a Click hint. Normal prompt clicking remains owned by `rbf-click-cursor` after form dismissal.
 - Dual Tool Registration: Exposes both `question` and `ask_question` tools accepting string options or structured `{ label, description }` objects.
 - Text Detection Heuristic: Automatically activates the selector on `agent_settled` when assistant messages end with numbered options following `Recommendation:`, `User Need Framing:`, preceding `?`, or containing `← recommended` / `(recommended)` tags. Regular tutorial lists are never misidentified.
 
 ## 🟠⋯ Setup & Verification
 - Activation recipe: always on; no configuration flag needed.
-  1. Launch local extension in isolated session: `pi --no-extensions -e ./extensions/rbf-question-form.ts`
+  1. Launch local extension in isolated session: `pi --no-extensions --tui-mode fullscreen -e ./extensions/rbf-question-form.ts`
   2. Ask a question with options (or invoke `question` tool).
   3. Press `W` to focus Write-in, or press `1` then `Tab` for optional notes.
   4. Edit text with editor keys (`Ctrl+A`, `Ctrl+E`, `Ctrl+U`, `Ctrl+K`, `Ctrl+Y`, `Ctrl+-`), insert newlines with `Ctrl+J`, navigate visual rows with `↑`/`↓`, and submit with `Enter`.
-- Global installation: `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
+- Candidate checks: `npm test -- extensions/rbf-question-form.test.ts --testTimeout 30000` and `npm run typecheck`. Tests include cell/payload/gesture cases and the native fullscreen dispatcher/custom-UI restoration. Real terminal/font/theme comfort still requires the documented human checks before delivery.
+- Global installation (after separately authorized verification/delivery): `cp ./extensions/rbf-question-form.ts ~/.pi/agent/extensions/rbf-question-form.ts`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-question-form.ts`
 
 ---

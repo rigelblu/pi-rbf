@@ -5,11 +5,12 @@ import {
 	KeybindingsManager,
 	matchesKey,
 	Text,
+	StdinBuffer,
 	truncateToWidth,
 	TUI_KEYBINDINGS,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import type { TUI } from "@earendil-works/pi-tui";
+import type { TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ─── Option types & chips ───────────────────────────────────────────────────
@@ -439,10 +440,52 @@ function styleDim(theme: any, text: string): string {
 
 // ─── Component Rendering ────────────────────────────────────────────────────
 
-export function renderQuestionFormLines(state: QuestionFormState, width: number): string[] {
+interface ChipTarget {
+	chipIndex: number;
+	x: number;
+	y: number;
+	width: number;
+}
+
+function layoutChips(state: QuestionFormState, width: number, hoveredChipIndex?: number): { rows: string[]; targets: ChipTarget[] } {
+	const rows: string[] = [];
+	const targets: ChipTarget[] = [];
+	let row = "  ";
+	let x = 2;
+	for (const [chipIndex, chip] of state.chips.entries()) {
+		const label = visibleWidth(chip.label) + 4 > width - 2 && chip.type !== "option"
+			? chip.key.toUpperCase() : chip.label;
+		const chipWidth = visibleWidth(label) + 4;
+		if (x > 2 && x + 3 + chipWidth > width) {
+			rows.push(row);
+			row = "  ";
+			x = 2;
+		}
+		if (x > 2) { row += "   "; x += 3; }
+		const rendered = chipIndex === state.selectedChipIndex
+			? " " + renderActiveChip(state.theme, label) + " "
+			: chipIndex === hoveredChipIndex
+				? `\x1b[7m[ ${label} ]\x1b[0m`
+				: state.theme?.fg ? state.theme.fg("muted", `[ ${label} ]`) : `[ ${label} ]`;
+		row += rendered;
+		if (x + chipWidth <= width) targets.push({ chipIndex, x, y: rows.length + 1, width: chipWidth });
+		x += chipWidth;
+	}
+	rows.push(row);
+	return { rows, targets };
+}
+
+export function renderQuestionFormLines(state: QuestionFormState, width: number, mouseEnabled = false): string[] {
+	return renderQuestionForm(state, width, mouseEnabled, layoutChips(state, Math.max(1, width)));
+}
+
+function renderQuestionForm(
+	state: QuestionFormState, width: number, mouseEnabled: boolean,
+	layout: ReturnType<typeof layoutChips>,
+): string[] {
 	const { chips, selectedChipIndex, focus, notesText, notesCursorPos, theme } = state;
-	const renderWidth = Math.max(20, width);
-	const maxWidth = renderWidth - 3;
+	const renderWidth = Math.max(1, width);
+	const maxWidth = Math.max(1, renderWidth - 3);
 	const lines: string[] = [];
 
 	// Top border (theme border color)
@@ -450,15 +493,7 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	const borderDashCount = Math.max(0, renderWidth - title.length - 1);
 	lines.push(styleBorder(theme, "─" + title + "─".repeat(borderDashCount)));
 
-	// Chips row (truncated at right edge)
-	const chipRenders = chips.map((chip, idx) => {
-		const isSelected = idx === selectedChipIndex;
-		if (isSelected) {
-			return renderActiveChip(theme, chip.label);
-		}
-		return theme?.fg ? theme.fg("muted", `[ ${chip.label} ]`) : `[ ${chip.label} ]`;
-	});
-	lines.push(truncateToWidth(`  ${chipRenders.join("   ")}`, renderWidth));
+	lines.push(...layout.rows);
 	lines.push("");
 
 	// Notes field
@@ -498,7 +533,7 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 					lines.push("  " + styledLabel + styledRemainder);
 				} else {
 					if (chunk.startIndex >= cursorIndex) {
-						lines.push("  " + styleDim(theme, chunk.text));
+						lines.push("  " + styleDim(theme, chunk.text.trimEnd()));
 					} else {
 						lines.push("  " + styleBorder(theme, chunk.text));
 					}
@@ -639,7 +674,7 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 
 	lines.push("");
 
-	// Hint line (truncated at right edge)
+	// Hints wrap without splitting key tokens at supported widths.
 	let directDigitsHint = "";
 	const optionChipsCount = chips.filter((c) => c.type === "option").length;
 	const maxDigit = Math.min(optionChipsCount, 9);
@@ -650,15 +685,22 @@ export function renderQuestionFormLines(state: QuestionFormState, width: number)
 	}
 	const keysHint = directDigitsHint ? `${directDigitsHint}, C, W` : "C, W";
 	const hint = focus === "notes"
-		? "  [Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close"
-		: `  [${keysHint} / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss`;
-	const styledHint = theme?.fg ? theme.fg("dim", hint) : hint;
-	lines.push(truncateToWidth(styledHint, renderWidth));
+		? "[Tab/↑ top] choices · [Enter] submit · [Shift+Enter] / [Ctrl+J] line · [Esc] close"
+		: `[${mouseEnabled ? "Click / " : ""}${keysHint} / ←→] select · [Tab/↓] notes · [Enter] submit · [Esc] dismiss`;
+	let hintRow = "";
+	for (const word of hint.split(" ")) {
+		const next = hintRow ? `${hintRow} ${word}` : word;
+		if (hintRow && visibleWidth(next) > Math.max(1, renderWidth - 2)) {
+			lines.push("  " + styleDim(theme, hintRow));
+			hintRow = word;
+		} else hintRow = next;
+	}
+	if (hintRow) lines.push("  " + styleDim(theme, hintRow));
 
 	// Bottom border (theme border color)
 	lines.push(styleBorder(theme, "─".repeat(renderWidth)));
 
-	return lines;
+	return lines.map((line) => truncateToWidth(line, renderWidth));
 }
 
 // ─── Component Factory ──────────────────────────────────────────────────────
@@ -783,12 +825,41 @@ export function buildVisualLines(notesText: string, width: number, isWriteIn: bo
 	return visualLines;
 }
 
+// Observe complete native pointer coordinates only to clear feedback outside the
+// component. Pi still owns dispatch; never consume, transform or select here.
+function observeTerminalPointer(onPosition: (position?: { x: number; y: number }) => void): () => void {
+	const configuredTimeout = Number(process.env.PI_TUI_ESC_TIMEOUT);
+	const escapeTimeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+		? configuredTimeout : process.env.SSH_CONNECTION || process.env.SSH_TTY ? 100 : 10;
+	const buffer = new StdinBuffer({ escapeTimeout });
+	let lastPosition: { x: number; y: number } | undefined;
+	let sawPosition = false;
+	buffer.on("data", (sequence) => {
+		if (sequence === "\x1b[O") { lastPosition = undefined; sawPosition = true; return; }
+		const mouse = /^\x1b\[<\d+;(\d+);(\d+)[Mm]$/.exec(sequence);
+		if (mouse) {
+			lastPosition = { x: Number(mouse[1]) - 1, y: Number(mouse[2]) - 1 };
+			sawPosition = true;
+		}
+	});
+	const onData = (data: string | Buffer) => {
+		sawPosition = false;
+		buffer.process(data);
+		// Pi has dispatched this whole chunk already. Replay only its final pointer
+		// position, so an earlier outside move cannot clear a later inside hover.
+		if (sawPosition) onPosition(lastPosition);
+	};
+	process.stdin.on("data", onData);
+	return () => { process.stdin.removeListener("data", onData); buffer.destroy(); };
+}
+
 export function createQuestionFormComponent(
 	options: NormalizedOption[],
 	tui: TUI,
 	theme: Theme,
 	done: (result: string | null) => void,
 	keybindings?: KeybindingsManager | any,
+	observePointerPosition?: (onPosition: (position?: { x: number; y: number }) => void) => () => void,
 ) {
 	const chips = buildChips(options);
 	const state: QuestionFormState = {
@@ -811,6 +882,75 @@ export function createQuestionFormComponent(
 	let lastYankLength = 0;
 	let preferredVisualCol: number | null = null;
 	let lastWidth = 80;
+	let closed = false;
+	let geometry: { width: number; height: number; targets: ChipTarget[] } | undefined;
+	let generation = 0;
+	let pending: { chipIndex: number; generation: number; cancelled: boolean } | undefined;
+	const mouseEnabled = tui.mode === "fullscreen";
+	let hoveredChipIndex: number | undefined;
+	let mouseOrigin: { x: number; y: number } | undefined;
+	const removeHoverListener = mouseEnabled ? observePointerPosition?.((position) => {
+		if (closed || hoveredChipIndex === undefined) return;
+		const hovered = geometry?.targets.find((target) => target.chipIndex === hoveredChipIndex);
+		if (!position || !mouseOrigin || !hovered
+			|| position.y - mouseOrigin.y !== hovered.y
+			|| position.x - mouseOrigin.x < hovered.x
+			|| position.x - mouseOrigin.x >= hovered.x + hovered.width) setHover(undefined);
+	}) : undefined;
+
+	function setHover(chipIndex: number | undefined): boolean {
+		if (hoveredChipIndex === chipIndex) return false;
+		hoveredChipIndex = chipIndex;
+		tui.requestRender();
+		return true;
+	}
+
+	function dispose(): void {
+		closed = true;
+		hoveredChipIndex = undefined;
+		removeHoverListener?.();
+		geometry = undefined;
+		pending = undefined;
+	}
+
+	function complete(result: string | null): void {
+		if (closed) return;
+		dispose();
+		done(result);
+	}
+
+	function handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (closed || !mouseEnabled) return;
+		const unmodified = !event.shift && !event.alt && !event.ctrl;
+		const boundsMatch = geometry && event.width === geometry.width && event.height === geometry.height;
+		if (boundsMatch) mouseOrigin = { x: event.screenX - event.x, y: event.screenY - event.y };
+		const target = boundsMatch && event.x >= 0 && event.y >= 0 && event.x < event.width && event.y < event.height
+			? geometry?.targets.find((t) => event.y === t.y && event.x >= t.x && event.x < t.x + t.width)
+			: undefined;
+		if (event.type === "move") {
+			const hoverTarget = unmodified && event.button === "none" ? target?.chipIndex : undefined;
+			setHover(hoverTarget);
+			return;
+		}
+		setHover(undefined);
+		if (event.type === "press") {
+			pending = undefined;
+			if (!unmodified || event.button !== "left" || !target) return;
+			pending = { chipIndex: target.chipIndex, generation, cancelled: false };
+			return { handled: true, capture: true, render: false };
+		}
+		if (!pending || !["drag", "release", "click"].includes(event.type)) return;
+		if (!unmodified || !boundsMatch || pending.generation !== generation || target?.chipIndex !== pending.chipIndex
+			|| (event.button !== "left" && event.button !== "none") || event.type === "drag") pending.cancelled = true;
+		if (event.type !== "click") return { handled: true, render: false };
+		const gesture = pending;
+		pending = undefined;
+		if (gesture.cancelled) return { handled: true, render: false };
+		state.selectedChipIndex = gesture.chipIndex;
+		state.focus = state.chips[gesture.chipIndex].type === "write-in" ? "notes" : "options";
+		tui.requestRender();
+		return { handled: true, focus: true, render: true };
+	}
 
 	function pushUndo(): void {
 		undoStack.push({
@@ -925,6 +1065,8 @@ export function createQuestionFormComponent(
 	}
 
 	function handleInput(data: string): void {
+		if (closed) return;
+		setHover(undefined);
 		// Bracketed paste: completed wrapped event from Pi TUI's Terminal
 		const PASTE_START = "\x1b[200~";
 		const PASTE_END = "\x1b[201~";
@@ -954,7 +1096,7 @@ export function createQuestionFormComponent(
 				tui.requestRender();
 				return;
 			}
-			done(null);
+			complete(null);
 			return;
 		}
 
@@ -997,7 +1139,7 @@ export function createQuestionFormComponent(
 				return;
 			}
 			const result = buildSubmissionText(selectedChip, state.notesText);
-			done(result);
+			complete(result);
 			return;
 		}
 
@@ -1365,10 +1507,27 @@ export function createQuestionFormComponent(
 	return {
 		render(width: number): string[] {
 			lastWidth = width;
-			return renderQuestionFormLines(state, width);
+			if (closed) return [];
+			if (geometry && geometry.width !== width) hoveredChipIndex = undefined;
+			const layout = layoutChips(state, Math.max(1, width), hoveredChipIndex);
+			const lines = renderQuestionForm(state, width, mouseEnabled, layout);
+			const next = { width, height: lines.length, targets: layout.targets };
+			if (JSON.stringify(next) !== JSON.stringify(geometry)) {
+				generation++;
+				if (pending) pending.cancelled = true;
+			}
+			geometry = next;
+			return lines;
 		},
 		handleInput,
-		invalidate() {},
+		handleMouse,
+		invalidate() {
+			hoveredChipIndex = undefined;
+			geometry = undefined;
+			generation++;
+			if (pending) pending.cancelled = true;
+		},
+		dispose,
 	};
 }
 
@@ -1395,7 +1554,7 @@ export default function rbfQuestionForm(pi: ExtensionAPI): void {
 			const customFn = (ctx.ui as any).custom;
 			if (typeof customFn === "function") {
 				const result = await (ctx.ui as any).custom((tui: TUI, theme: Theme, kb: any, done: (res: string | null) => void) => {
-					return createQuestionFormComponent(options, tui, theme, done, kb);
+					return createQuestionFormComponent(options, tui, theme, done, kb, observeTerminalPointer);
 				});
 
 				if (result) {

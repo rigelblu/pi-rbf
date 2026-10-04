@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { Key, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, visibleWidth, Container, Text, TuiAltScreen, VStack } from "@earendil-works/pi-tui";
 import { wordWrapLine as editorWordWrapLine } from "@earendil-works/pi-tui/dist/components/editor.js";
 import { findWordBackward, findWordForward } from "@earendil-works/pi-tui/dist/word-navigation.js";
 import rbfQuestionForm, {
@@ -1999,7 +1999,7 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 				}
 
 				const plainText = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
-				const hintLine = lines[lines.length - 2].replace(/\x1b\[[0-9;]*m/g, "");
+				const hintLine = plainText;
 				const directDigits = count === 1 ? "1" : `1-${count}`;
 				expect(hintLine).toContain(`[${directDigits}, C, W / ←→]`);
 				if (width === 80) {
@@ -2024,9 +2024,9 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 			}
 			const plainText = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
 			if (width === 80) {
-				expect(plainText).toContain("[Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close");
+				expect(plainText.replace(/\s+/g, " ")).toContain("[Tab/↑ top] choices · [Enter] submit · [Shift+Enter] / [Ctrl+J] line · [Esc] close");
 			} else if (width === 40) {
-				expect(plainText).toContain("[Tab/↑ top] choices · [Enter] submi");
+				expect(plainText).toContain("[Tab/↑ top] choices · [Enter] submit");
 			}
 		}
 
@@ -2036,7 +2036,7 @@ describe("Scenario 19: Named Write-in shortcut is exact in source", () => {
 		notesComp.handleInput("\t"); // Tab to notes field
 		const notesLines80 = notesComp.render(80);
 		const notesPlain80 = notesLines80.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
-		expect(notesPlain80).toContain("[Tab/↑ top] choices · [Enter] submit · [Shift+Enter/Ctrl+J] line · [Esc] close");
+		expect(notesPlain80.replace(/\s+/g, " ")).toContain("[Tab/↑ top] choices · [Enter] submit · [Shift+Enter] / [Ctrl+J] line · [Esc] close");
 	});
 
 	it("both 'w' and 'W' on chip focus select Write-in and focus the answer field", () => {
@@ -2690,3 +2690,289 @@ describe("pi-36: Configured editor actions (char/word/line movement, deletion, k
 	});
 });
 
+
+describe("pi-40: mouse question-form selection", () => {
+	const theme: any = { fg: (_: string, text: string) => text, bold: (text: string) => text };
+	const plain = (lines: string[]) => lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+	function form(count = 3, mode = "fullscreen") {
+		const done = vi.fn();
+		const tui: any = { mode, requestRender: vi.fn() };
+		const options = Array.from({ length: count }, (_, i) => normalizeToolOption(["Alpha", "Beta", "Gamma"][i] ?? `Option ${i + 1}`, i));
+		const comp = createQuestionFormComponent(options, tui, theme, done);
+		return { comp, done, tui };
+	}
+	type Form = ReturnType<typeof form>;
+	function position(f: Form, key: string, width = 80) {
+		const lines = plain(f.comp.render(width));
+		const label = key === "c" ? (width < 27 ? "C" : "C. /convo-is-very-best") : key === "w" ? "W. Write-in" : key;
+		for (const [y, line] of lines.entries()) {
+			const x = line.indexOf(`[ ${label} ]`);
+			if (x >= 0) return { x, y, width, height: lines.length, cells: visibleWidth(label) + 4 };
+		}
+		// Initially selected 1 has the exact five-cell footprint in the approved frame.
+		if (key === "1" && lines[1].startsWith("    1  ")) return { x: 2, y: 1, width, height: lines.length, cells: 5 };
+		throw new Error(`No visible chip ${key}: ${lines.join("\n")}`);
+	}
+	function event(p: { x: number; y: number; width: number; height: number }, type: string, extras: any = {}) {
+		return { ...p, type, button: "left", screenX: p.x, screenY: p.y, shift: false, alt: false, ctrl: false, ...extras } as any;
+	}
+	function click(f: Form, key: string, width = 80, offset = 0, button = "none") {
+		const p = position(f, key, width);
+		p.x += offset;
+		expect(f.comp.handleMouse(event(p, "press"))).toMatchObject({ handled: true, capture: true });
+		f.comp.handleMouse(event(p, "release", { button }));
+		expect(f.comp.handleMouse(event(p, "click", { button }))).toMatchObject({ handled: true, focus: true });
+	}
+	for (const count of [1, 3, 9]) for (const width of [20, 40, 80, 120]) {
+		it(`every cell of each complete chip selects once: ${count} options, ${width} columns`, () => {
+			for (const key of [...Array.from({ length: count }, (_, i) => String(i + 1)), "c", "w"]) {
+				const sample = form(count);
+				const target = position(sample, key, width);
+				expect(plain(sample.comp.render(width)).every((line) => visibleWidth(line) <= width)).toBe(true);
+				for (let cell = 0; cell < target.cells; cell++) {
+					const f = form(count);
+					click(f, key, width, cell);
+					expect(f.done).not.toHaveBeenCalled();
+					if (key === "w") f.comp.handleInput("written");
+					f.comp.handleInput("\r");
+					const expected = key === "c" ? "/skill:convo-is-very-best" : key === "w" ? "written"
+						: `${key}. ${["Alpha", "Beta", "Gamma"][Number(key) - 1] ?? `Option ${key}`}`;
+					expect(f.done.mock.calls).toEqual([[expected]]);
+				}
+			}
+		});
+	}
+	it("retains exact multiline payloads from notes focus for numbered, C and W", () => {
+		for (const [key, expected] of [["2", "2. Beta\n\nkeep this\n雪🙂"], ["c", "/skill:convo-is-very-best\n\nkeep this\n雪🙂"], ["w", "keep this\n雪🙂"]]) {
+			const f = form();
+			f.comp.handleInput("\t");
+			f.comp.handleInput("\x1b[200~keep this\n雪🙂\x1b[201~");
+			click(f, key);
+			expect(f.done).not.toHaveBeenCalled();
+			f.comp.handleInput("\r");
+			expect(f.done.mock.calls).toEqual([[expected]]);
+		}
+	});
+	it("preserves cursor, undo and kill/yank state across mouse focus changes", () => {
+		const f = form();
+		f.comp.handleInput("\t");
+		f.comp.handleInput("abc");
+		f.comp.handleInput("\x02"); // cursor between b/c
+		click(f, "c");
+		click(f, "w");
+		f.comp.handleInput("!");
+		expect(plain(f.comp.render(80)).join("\n")).toContain("ab!c");
+		f.comp.handleInput("\x1f");
+		f.comp.handleInput("\x0b"); // kill c, preserving the cursor
+		click(f, "2");
+		click(f, "w");
+		f.comp.handleInput("\x19");
+		f.comp.handleInput("\r");
+		expect(f.done.mock.calls).toEqual([["abc"]]);
+	});
+	it("already-selected W focuses its retained field and whitespace W cannot submit", () => {
+		const f = form();
+		click(f, "w");
+		f.comp.handleInput("   ");
+		f.comp.handleInput("\r");
+		expect(f.done).not.toHaveBeenCalled();
+		f.comp.handleInput("\t");
+		const lines = plain(f.comp.render(80));
+		const y = lines.findIndex((line) => line.includes("W. Write-in"));
+		const x = lines[y].indexOf("W. Write-in") - 2;
+		const p = { x, y, width: 80, height: lines.length };
+		for (const type of ["press", "release", "click"]) f.comp.handleMouse(event(p, type));
+		f.comp.handleInput("x");
+		f.comp.handleInput("\r");
+		expect(f.done.mock.calls).toEqual([["x"]]);
+	});
+	it("accepts left and none release/click after press, preserving eligibility through unchanged repaint", () => {
+		for (const button of ["left", "none"]) {
+			const f = form(); const p = position(f, "2");
+			f.comp.handleMouse(event(p, "press"));
+			f.comp.render(80);
+			f.comp.handleMouse(event(p, "release", { button }));
+			f.comp.handleMouse(event(p, "click", { button }));
+			f.comp.handleMouse(event(p, "click", { button }));
+			expect(f.tui.requestRender).toHaveBeenCalledTimes(1);
+			f.comp.handleInput("\r");
+			expect(f.done.mock.calls).toEqual([["2. Beta"]]);
+		}
+	});
+	it("ignores standalone clicks, other buttons/modifiers, gaps, field, stale and clipped bounds", () => {
+		for (const extras of [{ button: "right" }, { button: "middle" }, { shift: true }, { ctrl: true }, { alt: true }, { width: 40 }, { height: 2 }, { x: 0 }, { y: 0 }, { y: 4 }, { x: 7 }]) {
+			const f = form(); const p = position(f, "2");
+			for (const type of ["press", "release", "click"]) expect(f.comp.handleMouse(event(p, type, extras))).toBeUndefined();
+			f.comp.handleInput("\r"); expect(f.done.mock.calls).toEqual([["1. Alpha"]]);
+		}
+		const f = form(); const p = position(f, "2");
+		for (const button of ["left", "none"]) for (const type of ["release", "click", "move", "wheel"]) expect(f.comp.handleMouse(event(p, type, { button }))).toBeUndefined();
+	});
+	it("cancels drag even after returning, resize even after returning and invalidation", () => {
+		for (const cancel of ["drag", "resize", "invalidate", "modifier", "different-target"]) {
+			const f = form(); const p = position(f, "2");
+			f.comp.handleMouse(event(p, "press"));
+			if (cancel === "drag") f.comp.handleMouse(event(p, "drag", { x: p.x + 1 }));
+			if (cancel === "resize") { f.comp.render(40); f.comp.render(80); }
+			if (cancel === "invalidate") { f.comp.invalidate(); f.comp.render(80); }
+			f.comp.handleMouse(event(p, "release", cancel === "modifier" ? { shift: true } : cancel === "different-target" ? { x: 2 } : {}));
+			expect(f.comp.handleMouse(event(p, "click"))).toMatchObject({ handled: true });
+			f.comp.handleInput("\r"); expect(f.done.mock.calls).toEqual([["1. Alpha"]]);
+		}
+	});
+	it("rejects pre-render, closed and disposed input; reopening has fresh ownership", () => {
+		const f = form(); const p = { x: 10, y: 1, width: 80, height: 7 };
+		expect(f.comp.handleMouse(event(p, "press"))).toBeUndefined();
+		const target = position(f, "2");
+		f.comp.handleMouse(event(target, "press")); f.comp.handleInput("\x1b");
+		for (const type of ["release", "click"]) expect(f.comp.handleMouse(event(target, type))).toBeUndefined();
+		f.comp.handleInput("\r"); expect(f.done.mock.calls).toEqual([[null]]);
+		const fresh = form(); click(fresh, "2"); fresh.comp.handleInput("\r");
+		expect(fresh.done.mock.calls).toEqual([["2. Beta"]]);
+		const disposed = form(); position(disposed, "2"); disposed.comp.dispose();
+		expect(disposed.comp.handleMouse(event(target, "press"))).toBeUndefined();
+	});
+	it("regular mode keeps keyboard operation without a Click hint and width10 fits", () => {
+		const f = form(3, "regular"); const p = position(f, "2");
+		expect(plain(f.comp.render(80)).join("\n")).not.toContain("Click");
+		expect(f.comp.handleMouse(event(p, "press"))).toBeUndefined();
+		expect(plain(f.comp.render(10)).every((line) => visibleWidth(line) <= 10)).toBe(true);
+		f.comp.handleInput("2"); f.comp.handleInput("\r"); expect(f.done.mock.calls).toEqual([["2. Beta"]]);
+	});
+	it("matches the 10 active-form frames; dismissal is checked separately", () => {
+		const names = ["01-default-80", "02-numbered-with-notes-80", "03-canned-120", "04-write-in-empty-80", "05-write-in-filled-40", "06-default-40", "07-nine-options-40", "08-compact-20", "09-regular-mode-80", "10-dismissed-80", "11-numbered-notes-focused-80"];
+		const states = [
+			[3, 0, "options", "", 0], [3, 1, "options", "keep this", 9], [3, 3, "options", "keep this", 9],
+			[3, 4, "notes", "", 0], [3, 4, "notes", "keep this", 9], [3, 0, "options", "", 0],
+			[9, 8, "options", "", 0], [3, 4, "notes", "", 0], [3, 0, "options", "", 0],
+			[3, 0, "options", "", 0], [3, 1, "notes", "keep this", 4],
+		] as const;
+		for (const [i, name] of names.entries()) {
+			if (name === "10-dismissed-80") continue; // restored prompt is owned by Pi, not the closed form
+			const [count, selectedChipIndex, focus, notesText, notesCursorPos] = states[i];
+			const width = Number(name.split("-").at(-1));
+			const expected = (JSON.parse(readFileSync(new URL("./fixtures/rbf-question-form/pi40-frames.json", import.meta.url), "utf8")) as Record<string, string>)[name].trimEnd();
+			const actual = plain(renderQuestionFormLines({ chips: buildChips(Array.from({ length: count }, (_, j) => normalizeToolOption(`Option ${j + 1}`, j))), selectedChipIndex, focus, notesText, notesCursorPos, theme }, width, name !== "09-regular-mode-80")).join("\n");
+			expect(actual.trimEnd(), name).toBe(expected);
+		}
+	});
+});
+
+describe("pi-40: native fullscreen dispatch and custom-UI restoration", () => {
+	it.each([20, 40, 80, 120])("routes SGR gestures through the real host at width %i", async (width) => {
+		const { InteractiveMode, initTheme } = await import("@earendil-works/pi-coding-agent");
+		initTheme("dark", false);
+		let input: (data: string) => void = () => {};
+		const terminal: any = {
+			columns: width, rows: 50, kittyProtocolActive: false,
+			start: (onInput: (data: string) => void) => { input = onInput; },
+			stop() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {},
+			clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+		};
+		const ui = new TuiAltScreen(terminal);
+		const editor = { render: () => ["restored prompt"], getText: () => "retained prompt", setText: vi.fn(), handleInput: vi.fn(), invalidate() {} };
+		const editorContainer = new Container(); editorContainer.addChild(editor);
+		ui.setLayoutRoot(new VStack([{ component: new Text("question transcript", 0, 0), grow: 1 }, editorContainer]));
+		const host: any = { ui, editor, editorContainer, keybindings: undefined, disposeActiveSelector() {} };
+		const done = vi.fn();
+		let comp: ReturnType<typeof createQuestionFormComponent>;
+		const result = (InteractiveMode.prototype as any).showExtensionCustom.call(host, (tui: any, theme: any, kb: any, close: any) => {
+			comp = createQuestionFormComponent(["Alpha", "Beta", "Gamma"].map(normalizeToolOption), tui, theme, (text) => { done(text); close(text); }, kb);
+			return comp;
+		});
+		await Promise.resolve();
+		ui.start();
+		try {
+			const find = (label: string) => {
+				ui.renderNow(true);
+				const lines: string[] = (ui as any).currentLayout.lines.map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+				const y = lines.findIndex((line) => line.includes(label));
+				expect(y, label).toBeGreaterThanOrEqual(0);
+				return { x: lines[y].indexOf(label), y };
+			};
+			const send = (p: { x: number; y: number }, button: number, release = false) => input(`\x1b[<${button};${p.x + 1};${p.y + 1}${release ? "m" : "M"}`);
+			const mouseSpy = vi.spyOn(comp!, "handleMouse");
+			const two = find("[ 2 ]");
+			send(two, 0); ui.renderNow(true); send(two, 3, true);
+			expect(done).not.toHaveBeenCalled();
+			expect(ui.hasActiveSelection()).toBe(false);
+			input("\t"); input("keep this\n雪🙂");
+			const w = find("[ W. Write-in ]"); send(w, 0); send(w, 0, true);
+			input("!");
+			const canned = find(width === 20 ? "[ C ]" : "[ C. /convo-is-very-best ]");
+			send(canned, 0); send({ ...canned, x: canned.x + 1 }, 32); send(canned, 3, true);
+			// A drag does not leave Write-in; Enter still submits the retained custom text.
+			input("\r");
+			expect(await result, JSON.stringify(mouseSpy.mock.calls)).toBe("keep this\n雪🙂!");
+			expect(done.mock.calls).toEqual([["keep this\n雪🙂!"]]);
+			expect(editorContainer.children).toEqual([editor]);
+			expect(editor.setText).toHaveBeenCalledWith("retained prompt");
+			expect(comp!.render(width)).toEqual([]);
+			input("x"); expect(editor.handleInput).toHaveBeenCalledWith("x");
+		} finally { ui.stop(); }
+	});
+});
+
+describe("pi-40: temporary hover feedback", () => {
+	function setup(mode = "fullscreen") {
+		let inputListener: ((position?: { x: number; y: number }) => void) | undefined;
+		const removeListener = vi.fn();
+		const tui: any = { mode, requestRender: vi.fn(), addInputListener: vi.fn((listener) => { inputListener = listener; return removeListener; }) };
+		const theme: any = { fg: (_: string, text: string) => text, bold: (text: string) => text };
+		const done = vi.fn();
+		const comp = createQuestionFormComponent(["Alpha", "Beta", "Gamma"].map(normalizeToolOption), tui, theme, done, undefined, (listener) => { inputListener = listener; return removeListener; });
+		const lines = comp.render(80);
+		const x = lines[1].replace(/\x1b\[[0-9;]*m/g, "").indexOf("[ 2 ]");
+		const move: any = { type: "move", button: "none", x, y: 1, screenX: x, screenY: 1, width: 80, height: lines.length, shift: false, alt: false, ctrl: false };
+		const hovered = () => comp.render(80).some((line) => line.includes("\x1b[7m[ 2 ]\x1b[0m"));
+		return { comp, tui, done, move, hovered, removeListener, input: (point?: { x: number; y: number }) => inputListener?.(point) };
+	}
+	it("highlights the whole chip without selecting, focusing or submitting", () => {
+		const f = setup();
+		expect(f.comp.handleMouse(f.move)).toBeUndefined();
+		expect(f.hovered()).toBe(true);
+		expect(f.comp.render(80)[1]).toContain("\x1b[1m 1 ");
+		f.comp.handleInput("a");
+		expect(f.hovered()).toBe(false);
+		f.comp.handleInput("\r");
+		expect(f.done).toHaveBeenCalledWith("1. Alpha");
+	});
+	it("does not redraw unchanged hover and clears on gaps and field movement", () => {
+		const f = setup();f.comp.handleMouse(f.move);f.tui.requestRender.mockClear();
+		expect(f.comp.handleMouse(f.move)).toBeUndefined();
+		expect(f.tui.requestRender).not.toHaveBeenCalled();
+		f.comp.handleMouse({ ...f.move, x: f.move.x - 1 });expect(f.hovered()).toBe(false);
+		f.comp.handleMouse(f.move);f.comp.handleMouse({ ...f.move, y: 3 });expect(f.hovered()).toBe(false);
+	});
+	it("clears on an observed pointer outside the entire component, without consuming it", async () => {
+		const f = setup();f.comp.handleMouse(f.move);f.input(f.move);expect(f.hovered()).toBe(true);
+		expect(f.input()).toBeUndefined();await Promise.resolve();expect(f.hovered()).toBe(false);
+	});
+	it("preserves hover when the observed pointer stays within the chip", async () => {
+		const f = setup();f.comp.handleMouse(f.move);f.input(f.move);f.comp.handleMouse(f.move);
+		await Promise.resolve();expect(f.hovered()).toBe(true);
+	});
+	it("preserves notes, cursor and write-in focus when hovering other choices", () => {
+		const f = setup();f.comp.handleInput("w");f.comp.handleInput("keep this");
+		const height = f.comp.render(80).length;f.comp.handleMouse({ ...f.move, height });
+		f.comp.handleInput("!");f.comp.handleInput("\r");expect(f.done).toHaveBeenCalledWith("keep this!");
+	});
+	it("clears on resize, invalidation and disposal and removes its passive listener", async () => {
+		const f = setup();f.comp.handleMouse(f.move);f.comp.render(40);expect(f.hovered()).toBe(false);
+		f.comp.handleMouse(f.move);f.comp.invalidate();expect(f.hovered()).toBe(false);
+		f.comp.handleMouse(f.move);f.input();f.comp.dispose();await Promise.resolve();
+		expect(f.removeListener).toHaveBeenCalledTimes(1);expect(f.comp.render(80)).toEqual([]);expect(f.comp.handleMouse(f.move)).toBeUndefined();
+	});
+	it("retains click ownership and cancels drag without hover selecting", () => {
+		const f = setup();f.comp.handleMouse(f.move);
+		const press = { ...f.move, type: "press", button: "left" };f.comp.handleMouse(press);
+		f.comp.handleMouse({ ...press, type: "drag" });f.comp.handleMouse({ ...press, type: "release", button: "none" });f.comp.handleMouse({ ...press, type: "click", button: "none" });
+		f.comp.handleInput("\r");expect(f.done).toHaveBeenCalledWith("1. Alpha");
+	});
+	it("ignores pre-render, stale bounds, modifier motion and regular mode", () => {
+		const f = setup();f.comp.invalidate();f.comp.handleMouse(f.move);expect(f.hovered()).toBe(false);
+		f.comp.handleMouse({ ...f.move, width: 40 });expect(f.hovered()).toBe(false);
+		f.comp.handleMouse({ ...f.move, shift: true });expect(f.hovered()).toBe(false);
+		const regular = setup("regular");expect(regular.removeListener).not.toHaveBeenCalled();expect(regular.comp.handleMouse(regular.move)).toBeUndefined();expect(regular.hovered()).toBe(false);
+	});
+});
