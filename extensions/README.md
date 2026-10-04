@@ -576,19 +576,19 @@ Local Pi extension that registers Codex as the model provider `codex-harness`, s
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-codex.ts`. Codex threads, credentials, and settings are untouched; `codex resume` still opens any thread. The provider's entry in Pi's model store stays behind and is inert
 
 
-# 🔵⋯ rbf-path-labels candidate
+# 🔵⋯ rbf-path-labels
 
-Unreleased pi-39.1 candidate. Shortens eligible assistant file references, native footer directory segments, `/session` File values and file-autocomplete descriptions by display cells. It keeps the filename first, omits whole interior directories with `…`, and restores more location when the pane widens. Spaced/CJK reference labels that native wrapping can split receive their own line. The existing pi-rbf basename footer remains unchanged.
+Introduced in pi-rbf v0.22.0 (pi-39.1). Shortens eligible assistant file references, native footer directory segments, `/session` File values and file-autocomplete descriptions by display cells. It keeps the filename first, omits whole interior directories with `…`, and restores more location when the pane widens. Spaced/CJK reference labels that native wrapping can split receive their own line. The existing pi-rbf basename footer remains unchanged.
 
-Run the candidate from its engineering worktree:
+Install the extension, then start Pi or run `/reload` in an existing session:
 ```sh
-cd /Volumes/tom-ssd/src/worktrees/pi-rbf/pi-39.1
-pi --no-extensions -e ./extensions/rbf-path-labels.ts
+cp ./extensions/rbf-path-labels.ts ~/.pi/agent/extensions/rbf-path-labels.ts
+pi
 ```
-This activates it for that process. Omit the `-e` argument on the next launch to roll back. Daily activation and release are separate gates. Component compatibility is verified against checkout Pi 0.85.1 and daily Pi 1.0.2; private layout changes fall back to native output with a bounded warning.
+Once installed, it activates automatically. Remove only `~/.pi/agent/extensions/rbf-path-labels.ts` and reload/restart to roll back. For a per-process comparison, use `pi --no-extensions -e ./extensions/rbf-path-labels.ts` directly; macOS `script` can freeze the child terminal width and invalidate resize checks. Component compatibility is verified against checkout Pi 0.85.1 and daily Pi 1.0.2; private layout changes fall back to native output with a bounded warning.
 
 Eligible references are local-file link labels, one path in inline code, or a strong-prefix bare path in explicit reference prose. Ambiguous instructions, commands, flags, wildcards, multiple operands, fenced/indented code, HTML literals, thinking, tools and user text retain native rendering. Unsupported syntax delegates. Terminal hyperlinks retain the original destination; without hyperlinks, the label is plain text. Same filenames can share shortened labels; nearby prose and original destinations distinguish them.
 
 Terminal selection copies what is visible, including `…`. `/copy` retrieves the original last assistant response. For an older response, clear selection, open `/tree`, select the message and use the footer's copy action (default Ctrl+X), then Escape without Enter. It copies original text without navigating. Completion inserts its original full value. No new clipboard or per-path action is added.
 
-Run `bun run test -- extensions/rbf-path-labels.test.ts` and `bun run typecheck` from a checkout with its pinned dependencies installed. The canonical pi-39 brief's verification receipts contain the isolated offline terminal probe and its captured source hashes. Human font/scan comfort, same-name ambiguity and recovery friction remain pending.
+Run `bun run test -- extensions/rbf-path-labels.test.ts` and `bun run typecheck` from a checkout with its pinned dependencies installed. The canonical pi-39 brief's verification receipts contain the isolated offline terminal probe and its captured source hashes. Both exercised human scenarios passed, user-reported. Offline daily-stack checks passed in regular/fullscreen mode with resize, reload, fork/resume and original source preserved. Optional additional color/assistive modes and continued daily use are separate evidence.

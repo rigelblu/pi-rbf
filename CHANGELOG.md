@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.22.0 (2026-10-04)
+## 🟠⋯ Added for End Users
+- 2026-10-04 - feat (ux) | read file references within the pane width while keeping filenames visible: long paths shorten in the middle and refit on resize; file links, `/copy`, and `/tree` keep the original targets and text. Commands, file contents, and approval text stay literal (#pi-39.1)
+
+---
+
 # 🔵⋯ v0.21.12 (2026-09-28)
 ## 🟠⋯ Added for End Users
 - 2026-09-28 - feat (ux) | compact context in a bound Codex conversation with `/compact` without touching Pi's transcript: Pi intercepts `/compact` on `codex-harness` models before its native short-session guard, verifies the recorded branch against Codex history, and routes compaction directly to the bound Codex thread; instructions with `/compact` are safely rejected with the command preserved in the editor; ordinary prompts require Codex CLI >= 0.157.1 and fail closed when history cannot verify the branch (#pi-10.5) [@pi]
