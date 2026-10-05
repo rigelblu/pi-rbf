@@ -219,3 +219,307 @@ describe("pi-17.2: footer guardian countdown and status-line cache lifecycle", (
 	});
 });
 
+
+// pi-43: last-message age on the token row. Each case loads a fresh status-line module, the
+// way Pi does on /reload, over a two-row native footer whose token row has padding.
+describe("pi-43: last-message age footer lifecycle", () => {
+	const MIN = 60_000;
+	const T0 = Date.UTC(2026, 9, 5, 12, 0);
+	const CWD = "/Volumes/tom-ssd/src/rb/craftmans-shop/pi-rbf";
+	const TOKEN_ROW = `↑10k ↓5k $0.01${" ".repeat(40)}gate-model`;
+	const AGE_GETTER = Symbol.for("rbf.statusLine.getAgeState");
+	const AGE_WRAPPER = Symbol.for("rbf.statusLine.ageWrapper");
+	const AGE_WARNED = Symbol.for("rbf.statusLine.ageRestartWarned");
+	const PATCHED = Symbol.for("rbf.statusLine.footerPatched");
+	const proto = FooterComponent.prototype as any;
+	let nativeRender: any;
+	let nativeCalls = 0;
+	let nativeRows: () => string[];
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.setSystemTime(T0);
+		vi.resetModules();
+		nativeRender = FooterComponent.prototype.render;
+		nativeCalls = 0;
+		nativeRows = () => [`${CWD} (detached)`, TOKEN_ROW];
+		FooterComponent.prototype.render = function (): string[] {
+			nativeCalls++;
+			return nativeRows();
+		};
+	});
+
+	afterEach(() => {
+		FooterComponent.prototype.render = nativeRender;
+		for (const key of [
+			PATCHED,
+			Symbol.for("rbf.statusLine.originalFooterRender"),
+			Symbol.for("rbf.statusLine.invalidateCache"),
+			AGE_GETTER,
+			AGE_WRAPPER,
+			AGE_WARNED,
+		]) {
+			delete proto[key];
+		}
+		delete (globalThis as any)[Symbol.for("rbf.statusLine.cache")];
+		vi.useRealTimers();
+	});
+
+	async function load(entries: any[] = [], options: { hasUI?: boolean; mode?: string; throwingSetStatus?: boolean } = {}) {
+		const mod = await import("./rbf-status-line.ts");
+		const pi = createMockExtensionAPI();
+		const branch = { entries };
+		const setStatus = vi.fn(() => {
+			if (options.throwingSetStatus) throw new Error("status boom");
+		});
+		const notify = vi.fn();
+		const ctx = {
+			hasUI: options.hasUI ?? true,
+			mode: options.mode ?? "tui",
+			ui: { setStatus, notify },
+			sessionManager: { getBranch: () => branch.entries },
+		};
+		mod.default(pi.api as any);
+		const emit = (event: string, payload: unknown = {}) => pi.emit(event, payload, ctx);
+		await emit("session_start");
+		return { mod, pi, branch, setStatus, notify, ctx, emit };
+	}
+	const userEntry = (timestamp: number) => ({ type: "message", message: { role: "user", timestamp } });
+	const render = (width = 120): string[] =>
+		FooterComponent.prototype.render.call(createMockFooter({ cwd: CWD, sessionName: "s" }) as any, width);
+	const seedCache = (mod: any, ageMs: number) =>
+		mod.setCachedStatusLine({ cwd: CWD, sessionName: "s", line: "📁 SEEDED", timestamp: Date.now() - ageMs });
+
+	describe("age baseline cache", () => {
+		it("follows the two-second workspace expiry exactly as a render without the cue", async () => {
+			const s = await load([userEntry(T0 - 5 * MIN)]);
+			for (const withAge of [true, false]) {
+				if (!withAge) delete proto[AGE_GETTER];
+				seedCache(s.mod, 1000);
+				render();
+				expect(s.mod.getCachedStatusLine()?.line, `warm, age ${withAge}`).toBe("📁 SEEDED");
+
+				seedCache(s.mod, 2500);
+				render();
+				const refreshed = s.mod.getCachedStatusLine();
+				expect(refreshed?.line, `expired, age ${withAge}`).not.toBe("📁 SEEDED");
+				expect(refreshed?.timestamp).toBe(Date.now());
+			}
+		});
+
+		it("deletes the cache on the baseline events only, not on tree navigation or compaction", async () => {
+			const s = await load([userEntry(T0 - 5 * MIN)]);
+			for (const event of ["session_start", "turn_start", "turn_end", "agent_settled", "user_bash"]) {
+				seedCache(s.mod, 0);
+				await s.emit(event);
+				expect(s.mod.getCachedStatusLine(), event).toBeNull();
+			}
+			for (const event of ["session_tree", "session_compact"]) {
+				seedCache(s.mod, 0);
+				await s.emit(event);
+				expect(s.mod.getCachedStatusLine()?.line, event).toBe("📁 SEEDED");
+			}
+			seedCache(s.mod, 0);
+			await s.emit("message_start", { message: { role: "user", timestamp: T0 } });
+			expect(s.mod.getCachedStatusLine()?.line).toBe("📁 SEEDED");
+		});
+
+		it("calls the native render once, keeps a native error's identity, and survives a throwing redraw request", async () => {
+			const s = await load([userEntry(T0 - 5 * MIN)], { throwingSetStatus: true });
+			seedCache(s.mod, 0);
+			nativeCalls = 0;
+			const rows = render();
+			expect(nativeCalls).toBe(1);
+			expect(rows[1].startsWith("💬 5m | ")).toBe(true);
+
+			await expect(s.emit("message_start", { message: { role: "user", timestamp: T0 } })).resolves.toBeUndefined();
+			expect(s.setStatus).toHaveBeenCalled();
+
+			const boom = new Error("native boom");
+			nativeRows = () => {
+				throw boom;
+			};
+			expect(() => render()).toThrow(boom);
+			nativeRows = () => [];
+			expect(render()).toEqual([]);
+		});
+	});
+
+	describe("age timer lifecycle", () => {
+		it("fires only at minute boundaries of the selected timestamp and redraws only on a changed label", async () => {
+			const s = await load();
+			expect(vi.getTimerCount()).toBe(0);
+			await s.emit("message_start", { message: { role: "user", timestamp: T0 } });
+			const afterDelivery = s.setStatus.mock.calls.length;
+			expect(afterDelivery).toBe(1);
+			expect(vi.getTimerCount(), "no timer until the cue is drawn").toBe(0);
+
+			const armed = vi.spyOn(globalThis, "setTimeout");
+			vi.advanceTimersByTime(12_345);
+			expect(render()[1].startsWith("💬 <1m | ")).toBe(true);
+			expect(vi.getTimerCount()).toBe(1);
+			expect(armed.mock.calls.map((call) => call[1]), "one timer, aimed at the minute boundary").toEqual([MIN - 12_345]);
+			armed.mockRestore();
+			render();
+			render();
+			expect(vi.getTimerCount(), "repeated renders keep one timer").toBe(1);
+
+			vi.advanceTimersByTime(MIN - 12_345 - 1);
+			expect(s.setStatus.mock.calls.length, "no tick inside the first minute").toBe(afterDelivery);
+			vi.advanceTimersByTime(1);
+			expect(s.setStatus.mock.calls.length).toBe(afterDelivery + 1);
+			expect(vi.getTimerCount(), "a tick waits for the render to re-arm").toBe(0);
+			expect(render()[1].startsWith("💬 1m | ")).toBe(true);
+			expect(vi.getTimerCount()).toBe(1);
+
+			vi.advanceTimersByTime(MIN);
+			expect(s.setStatus.mock.calls.length).toBe(afterDelivery + 2);
+		});
+
+		it("holds no timer while the cue is hidden by width, unknown, empty, headless or shut down", async () => {
+			const s = await load([userEntry(T0 - 5 * MIN)]);
+			render(120);
+			expect(vi.getTimerCount()).toBe(1);
+
+			nativeRows = () => [`${CWD}`, "↑10k ↓5k $0.01 gate-model"]; // no padding: the cue cannot fit
+			expect(render(30)[1]).toBe("↑10k ↓5k $0.01 gate-model");
+			expect(vi.getTimerCount(), "width-hidden").toBe(0);
+
+			nativeRows = () => [`${CWD}`, TOKEN_ROW];
+			expect(render(120)[1].startsWith("💬 5m | ")).toBe(true);
+			expect(vi.getTimerCount(), "widening re-arms").toBe(1);
+
+			await s.emit("message_start", { message: { role: "user" } });
+			expect(render(120)[1].startsWith("💬 ? | ")).toBe(true);
+			expect(vi.getTimerCount(), "unknown").toBe(0);
+
+			await s.emit("session_shutdown");
+			expect(render(120)[1]).toBe(TOKEN_ROW);
+			expect(vi.getTimerCount(), "shutdown").toBe(0);
+
+			vi.resetModules();
+			const empty = await load([]);
+			expect(render(120)[1]).toBe(TOKEN_ROW);
+			expect(vi.getTimerCount(), "empty branch").toBe(0);
+			await empty.emit("session_shutdown");
+
+			vi.resetModules();
+			await load([userEntry(T0 - 5 * MIN)], { hasUI: false, mode: "print" });
+			expect(render(120)[1]).toBe(TOKEN_ROW);
+			expect(vi.getTimerCount(), "print").toBe(0);
+
+			vi.resetModules();
+			const rpc = await load([userEntry(T0 - 5 * MIN)], { hasUI: true, mode: "rpc" });
+			expect(render(120)[1]).toBe(TOKEN_ROW);
+			expect(vi.getTimerCount(), "rpc").toBe(0);
+			expect(rpc.setStatus).not.toHaveBeenCalled();
+		});
+
+		it("checks a future timestamp at most once a minute and recomputes after a wall-clock jump", async () => {
+			const s = await load([userEntry(T0 + 150_000)]);
+			expect(render()[1].startsWith("💬 ? | ")).toBe(true);
+			expect(vi.getTimerCount()).toBe(1);
+			const before = s.setStatus.mock.calls.length;
+			vi.advanceTimersByTime(59_999);
+			expect(vi.getTimerCount(), "one check per minute").toBe(1);
+			vi.advanceTimersByTime(150_000);
+			render();
+			expect(render()[1].startsWith("💬 <1m | ")).toBe(true);
+			expect(s.setStatus.mock.calls.length).toBeLessThanOrEqual(before + 4);
+
+			vi.setSystemTime(T0 + 150_000 + 5 * 60 * MIN + 1);
+			expect(render()[1].startsWith("💬 5h | "), "wake recomputes without replaying ticks").toBe(true);
+			expect(vi.getTimerCount()).toBe(1);
+		});
+
+		it("re-arms on the new message's minute when the selection changes without changing the label", async () => {
+			const s = await load();
+			await s.emit("message_start", { message: { role: "user", timestamp: T0 } });
+			render();
+			vi.advanceTimersByTime(20_000);
+			await s.emit("message_start", { message: { role: "user", timestamp: T0 + 20_000 } });
+			const calls = s.setStatus.mock.calls.length;
+			vi.advanceTimersByTime(40_000); // old message's boundary
+			expect(s.setStatus.mock.calls.length, "label is still <1m for the newer message").toBe(calls);
+			vi.advanceTimersByTime(20_000); // new message's boundary
+			expect(s.setStatus.mock.calls.length).toBe(calls + 1);
+		});
+	});
+
+	describe("age fresh ownership", () => {
+		it("dispatches to the current module after reloads and survives late disposal of the old one", async () => {
+			const first = await load([userEntry(T0 - 2 * MIN)]);
+			expect(render()[1].startsWith("💬 2m | ")).toBe(true);
+
+			vi.resetModules();
+			const second = await load([userEntry(T0 - 7 * MIN)]);
+			expect(second.mod).not.toBe(first.mod);
+			expect(render()[1].startsWith("💬 7m | "), "current callbacks, not first-factory").toBe(true);
+
+			await first.emit("session_shutdown"); // old disposal after new activation
+			expect(render()[1].startsWith("💬 7m | "), "old disposal must not clear the new slot").toBe(true);
+
+			vi.resetModules();
+			const third = await load([userEntry(T0 - 9 * MIN)]);
+			await second.emit("session_shutdown");
+			const row = render()[1];
+			expect(row.startsWith("💬 9m | ")).toBe(true);
+			expect(row.match(/💬/g)?.length, "one cue").toBe(1);
+			expect(vi.getTimerCount(), "one timer").toBe(1);
+			expect(third.notify).not.toHaveBeenCalled();
+		});
+
+		it("leaves the footer as it was when a factory fails partway", async () => {
+			const mod = await import("./rbf-status-line.ts");
+			const control = (() => {
+				mod.patchFooterComponent();
+				return render();
+			})();
+			const pi = createMockExtensionAPI();
+			const failing = {
+				...pi.api,
+				on: (event: string, handler: any) => {
+					if (event === "message_start") throw new Error("factory boom");
+					pi.api.on(event, handler);
+				},
+			};
+			expect(() => mod.default(failing as any)).toThrow("factory boom");
+			expect(render()).toEqual(control);
+			expect(vi.getTimerCount()).toBe(0);
+		});
+
+		for (const [label, version] of [
+			["no version, as released in v0.23.0", undefined],
+			["a lower version", 0],
+		] as const) {
+			it(`stays off and warns once over a wrapper with ${label}`, async () => {
+				// A wrapper from before this feature: patched, top row only, never reads the age slot.
+				const inner = FooterComponent.prototype.render;
+				FooterComponent.prototype.render = function (this: any, width: number): string[] {
+					const lines = inner.call(this, width);
+					lines[0] = "📁 legacy";
+					return lines;
+				};
+				proto[PATCHED] = true;
+				if (version !== undefined) proto[AGE_WRAPPER] = version;
+				const control = render();
+
+				const first = await load([userEntry(T0 - 5 * MIN)]);
+				expect(render()).toEqual(control);
+				expect(first.notify).toHaveBeenCalledTimes(1);
+				expect(first.notify).toHaveBeenCalledWith("Last msg needs a Pi restart to appear.", "warning");
+				await first.emit("session_start");
+				await first.emit("message_start", { message: { role: "user", timestamp: T0 } });
+				expect(first.notify).toHaveBeenCalledTimes(1);
+
+				vi.resetModules();
+				const second = await load([userEntry(T0 - 5 * MIN)]);
+				await second.emit("session_start");
+				expect(second.notify, "a fresh factory in the same process must not warn again").not.toHaveBeenCalled();
+				expect(render()).toEqual(control);
+				expect(vi.getTimerCount()).toBe(0);
+				FooterComponent.prototype.render = inner;
+			});
+		}
+	});
+});

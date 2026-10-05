@@ -29,7 +29,7 @@ import sys
 import termios
 import time
 
-KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f", "ctrl-u": b"\x15"}
+KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f", "ctrl-u": b"\x15", "alt-enter": b"\x1b\r"}
 # CSI sequences; OSC sequences ended by BEL or by ST (ESC \), never spanning a later ESC; charset and keypad selects; CR.
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|\r")
 

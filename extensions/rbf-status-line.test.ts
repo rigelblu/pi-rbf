@@ -9,14 +9,20 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import rbfStatusLine, {
+	AGE_STATE_GETTER_KEY,
+	ageCueFor,
 	formatFooterLineWithRightSide,
+	formatLastMessageAge,
 	formatStatusLine,
 	getCachedStatusLine,
 	invalidateStatusLineCache,
 	patchFooterComponent,
+	prependAgeCue,
 	resolveAgentTree,
 	resolveJjWorkspace,
 	resolveStatusLineComponents,
+	scanBranchAgeMaximum,
+	selectAge,
 	setCachedStatusLine,
 	STATUS_LINE_PATCHED_KEY,
 	unpatchFooterComponent,
@@ -938,5 +944,228 @@ describe("rbfStatusLine extension lifecycle", () => {
 
 		expect(content).not.toMatch(/node:net|node:http|fetch/);
 		expect(content).not.toMatch(/process\.exit/);
+	});
+});
+
+describe("last-message age formatting", () => {
+	const MIN = 60_000;
+
+	it("shows no seconds and floors minutes, hours and days", () => {
+		const cases: Array<[number, string]> = [
+			[0, "<1m"],
+			[59_000, "<1m"],
+			[60_000, "1m"],
+			[3_599_000, "59m"],
+			[3_600_000, "1h"],
+			[86_399_000, "23h"],
+			[86_400_000, "1d"],
+		];
+		for (const [elapsed, label] of cases) {
+			expect(formatLastMessageAge(1_000_000, 1_000_000 + elapsed), `${elapsed}ms`).toBe(label);
+		}
+	});
+
+	it("gives ? for a missing, negative or nonfinite candidate even beside valid ones", () => {
+		for (const bad of [undefined, null, -1, Number.NaN, Number.POSITIVE_INFINITY, "5"]) {
+			const branch = scanBranchAgeMaximum([
+				{ type: "message", message: { role: "user", timestamp: 5 * MIN } },
+				{ type: "message", message: { role: "user", timestamp: bad } },
+				{ type: "message", message: { role: "user", timestamp: 9 * MIN } },
+			]);
+			const selection = selectAge(branch, { unknown: false });
+			expect(selection.kind, String(bad)).toBe("unknown");
+			expect(ageCueFor(selection, 10 * MIN)).toEqual({ text: "💬 ?", kind: "unknown" });
+		}
+	});
+
+	it("selects the greatest timestamp, shows ? for a future one until reached, and equal times give equal age", () => {
+		const future = selectAge({ submittedAt: 5 * MIN, unknown: false }, { submittedAt: 12 * MIN, unknown: false });
+		expect(future).toEqual({ kind: "timed", submittedAt: 12 * MIN });
+		expect(ageCueFor(future, 10 * MIN)).toEqual({ text: "💬 ?", kind: "future" });
+		expect(ageCueFor(future, 12 * MIN)).toEqual({ text: "💬 <1m", kind: "timed" });
+
+		const equal = selectAge({ submittedAt: 7 * MIN, unknown: false }, { submittedAt: 7 * MIN, unknown: false });
+		expect(ageCueFor(equal, 10 * MIN)?.text).toBe("💬 3m");
+	});
+
+	it("recomputes from the wall clock after a sleep jump, and hides with no user message", () => {
+		const selection = selectAge({ submittedAt: 0, unknown: false }, { unknown: false });
+		expect(ageCueFor(selection, 30_000)?.text).toBe("💬 <1m");
+		expect(ageCueFor(selection, 5 * 3_600_000 + 1)?.text).toBe("💬 5h");
+		expect(ageCueFor(selectAge({ unknown: false }, { unknown: false }), 1)).toBeUndefined();
+	});
+
+	it("ignores non-user and non-message entries when scanning a branch", () => {
+		expect(
+			scanBranchAgeMaximum([
+				{ type: "message", message: { role: "assistant", timestamp: 99 * MIN } },
+				{ type: "message", message: { role: "custom" } },
+				{ type: "compaction", timestamp: 98 * MIN },
+				{ type: "message", message: { role: "user", timestamp: 3 * MIN } },
+			]),
+		).toEqual({ submittedAt: 3 * MIN, unknown: false });
+	});
+});
+
+describe("age row fitting", () => {
+	const CUE = "💬 2m";
+	const CUE_CELLS = 5 + 3; // icon 2 + space + "2m", then " | "
+	const strip = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+
+	beforeEach(() => {
+		initTheme();
+		unpatchFooterComponent();
+		unpatchTasksFooter();
+		unpatchTodosFooter();
+	});
+	afterEach(() => {
+		unpatchFooterComponent();
+		unpatchTasksFooter();
+		unpatchTodosFooter();
+		invalidateStatusLineCache();
+	});
+
+	function footer(statuses: Array<[string, string]> = []) {
+		return {
+			session: {
+				sessionManager: {
+					getCwd: () => "/Volumes/tom-ssd/src/rb/craftmans-shop/pi-rbf",
+					getSessionName: () => undefined,
+					getEntries: () => [],
+				},
+				state: { model: { id: "gpt-5.6-luna", provider: "openai-codex" } },
+				modelRuntime: { isUsingSubscription: () => false },
+				getContextUsage: () => ({ percent: 5, contextWindow: 200000 }),
+			},
+			footerData: {
+				getGitBranch: () => "main",
+				getAvailableProviderCount: () => 1,
+				getExtensionStatuses: () => new Map(statuses),
+			},
+			autoCompactEnabled: true,
+		};
+	}
+
+	function seed() {
+		setCachedStatusLine({
+			cwd: "/Volumes/tom-ssd/src/rb/craftmans-shop/pi-rbf",
+			line: "📁 pi-rbf | 📦 pi-rbf |  main @mm",
+			timestamp: Date.now(),
+		});
+	}
+
+	function renderPair(width: number, statuses: Array<[string, string]> = []) {
+		patchFooterComponent();
+		seed();
+		const proto = FooterComponent.prototype as any;
+		delete proto[AGE_STATE_GETTER_KEY];
+		const control: string[] = FooterComponent.prototype.render.call(footer(statuses) as any, width);
+		const reports: boolean[] = [];
+		proto[AGE_STATE_GETTER_KEY] = () => ({
+			cue: () => ({ text: CUE, kind: "timed" }),
+			report: (_cue: unknown, drawn: boolean) => reports.push(drawn),
+		});
+		seed();
+		const withAge: string[] = FooterComponent.prototype.render.call(footer(statuses) as any, width);
+		return { control, withAge, reports };
+	}
+
+	it("puts the cue at the start of the token row at the native width, with every other row unchanged", () => {
+		for (const width of [76, 78, 80, 120]) {
+			const { control, withAge, reports } = renderPair(width, [["zz", "status row"]]);
+			expect(withAge.length, `rows at ${width}`).toBe(control.length);
+			expect(withAge[0], `top row at ${width}`).toBe(control[0]);
+			expect(withAge.slice(2), `rows 3+ at ${width}`).toEqual(control.slice(2));
+
+			const native = strip(control[1]);
+			const row = strip(withAge[1]);
+			expect(row.startsWith(`${CUE} | `), `${width}: ${row}`).toBe(true);
+			expect(visibleWidth(withAge[1]), `width at ${width}`).toBe(visibleWidth(control[1]));
+			const [numbers, model] = native.split(/ {2,}/);
+			expect(row).toContain(numbers);
+			expect(row.endsWith(model!), `model at right edge at ${width}`).toBe(true);
+			expect(reports).toEqual([true]);
+			expect(visibleWidth(withAge[1])).toBeLessThanOrEqual(width);
+		}
+	});
+
+	it("keeps exactly two padding cells at the threshold and hides one cell narrower", () => {
+		const row = (pad: number) => `\x1b[2m↑29k ↓14 $0.003\x1b[22m\x1b[2m${" ".repeat(pad)}gpt-5.6-luna\x1b[22m`;
+		const fits = prependAgeCue(row(CUE_CELLS + 2), CUE);
+		expect(strip(fits)).toBe(`${CUE} | ↑29k ↓14 $0.003  gpt-5.6-luna`);
+		expect(fits.startsWith(`\x1b[2m${CUE} | `)).toBe(true);
+		expect(visibleWidth(fits)).toBe(visibleWidth(row(CUE_CELLS + 2)));
+		const tooNarrow = row(CUE_CELLS + 1);
+		expect(prependAgeCue(tooNarrow, CUE)).toBe(tooNarrow);
+	});
+
+	it("draws no cue on a token row without padding, a one-row footer, or a narrow native row", () => {
+		const bare = "\x1b[2m↑29k ↓14 $0.003\x1b[22m";
+		expect(prependAgeCue(bare, CUE)).toBe(bare);
+
+		const narrow = renderPair(32);
+		expect(narrow.withAge).toEqual(narrow.control);
+		expect(narrow.reports).toEqual([false]);
+
+		patchFooterComponent();
+		const proto = FooterComponent.prototype as any;
+		const reports: boolean[] = [];
+		proto[AGE_STATE_GETTER_KEY] = () => ({
+			cue: () => ({ text: CUE, kind: "timed" }),
+			report: (_cue: unknown, drawn: boolean) => reports.push(drawn),
+		});
+		const inner = proto[Symbol.for("rbf.statusLine.originalFooterRender")];
+		unpatchFooterComponent();
+		const nativeRender = FooterComponent.prototype.render;
+		FooterComponent.prototype.render = () => ["only row"];
+		try {
+			patchFooterComponent();
+			proto[AGE_STATE_GETTER_KEY] = () => ({
+				cue: () => ({ text: CUE, kind: "timed" }),
+				report: (_cue: unknown, drawn: boolean) => reports.push(drawn),
+			});
+			seed();
+			const oneRow: string[] = FooterComponent.prototype.render.call(footer() as any, 120);
+			expect(oneRow.length).toBe(1);
+			expect(oneRow.join("")).not.toContain("💬");
+			expect(reports).toEqual([false]);
+		} finally {
+			unpatchFooterComponent();
+			FooterComponent.prototype.render = nativeRender;
+		}
+		expect(inner).toBeTypeOf("function");
+	});
+
+	it("fits rows with CJK and emoji content and restores the cue when widened", () => {
+		const wide = `\x1b[2m↑29k 模型 🧪\x1b[22m\x1b[2m${" ".repeat(20)}claude-模型\x1b[22m`;
+		const fitted = prependAgeCue(wide, CUE);
+		expect(visibleWidth(fitted)).toBe(visibleWidth(wide));
+		expect(strip(fitted)).toBe(`${CUE} | ↑29k 模型 🧪${" ".repeat(12)}claude-模型`);
+
+		expect(renderPair(32).reports).toEqual([false]);
+		const again = renderPair(120);
+		expect(strip(again.withAge[1]).startsWith(`${CUE} | `)).toBe(true);
+	});
+
+	it("works with todos and background-task footer wrappers loaded in either order", () => {
+		for (const order of ["before", "after"] as const) {
+			unpatchFooterComponent();
+			unpatchTasksFooter();
+			unpatchTodosFooter();
+			if (order === "before") {
+				patchTodosFooter();
+				patchTasksFooter();
+			}
+			patchFooterComponent();
+			if (order === "after") {
+				patchTodosFooter();
+				patchTasksFooter();
+			}
+			const { control, withAge } = renderPair(120);
+			expect(withAge.length, order).toBe(control.length);
+			expect(withAge[0], order).toBe(control[0]);
+			expect(strip(withAge[1]).startsWith(`${CUE} | `), order).toBe(true);
+			expect(visibleWidth(withAge[1]), order).toBe(visibleWidth(control[1]));
+		}
 	});
 });
