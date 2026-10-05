@@ -608,7 +608,7 @@ Run `bun run test -- extensions/rbf-path-labels.test.ts` and `bun run typecheck`
 # 🔵⋯ rbf-cd
 
 ## 🟠⋯ Overview
-Local Pi extension registering `/cd <path>`, which moves the running conversation to another directory inside the running Pi. Same session, same history: from the next prompt the agent's tools, your `!` shell, the project rules and the footer use the destination, and the conversation reopens there. Verified offline against checkout Pi 0.85.1 and daily Pi 1.0.2.
+Local Pi extension registering `/cd <path>`, which moves the running conversation to another directory inside the running Pi. Same session, same history: from the next prompt the agent's tools, your `!` shell, the project rules and the footer use the destination, and the conversation reopens there. Verified offline against checkout Pi 0.85.1 and daily Pi 1.0.3.
 
 ## 🟠⋯ Capabilities & Behavior
 - Syntax: one literal path after the command
