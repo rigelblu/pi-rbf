@@ -117,15 +117,16 @@ Local Pi extension that blends collapsed tool executions into the terminal backg
 # 🔵⋯ rbf-edit-glance
 
 ## 🟠⋯ Overview
-Local Pi extension that provides a clean, unboxed glance presentation for the `edit` tool matching Claude Code's diff UI: blends into the terminal background, displays an immediate line-count summary (`└ Added <A> lines, removed <R> lines`), caps collapsed diffs to 8 changed lines with an expansion hint, and highlights added and removed lines with subtle line-level background tints.
+Local Pi extension that provides a clean, unboxed glance presentation for the `edit` tool matching Claude Code's diff UI: blends into the terminal background, displays an immediate line-count summary (`└  Added <A> lines, removed <R> lines`), caps collapsed diffs to 8 changed lines with an expansion hint, and highlights added and removed lines with subtle line-level background tints.
 
 ## 🟠⋯ Capabilities & Behavior
 - Unboxed background: removes the solid colored card background and vertical padding from `edit` executions (`bgFn = undefined`, `paddingY = 0`, `paddingX = 0`), allowing edits to blend directly into the terminal background
-- Line-count summary: calculates added and removed lines from the diff and displays `└ Added <A> line(s), removed <R> line(s)` immediately beneath the file path header
+- Line-count summary: calculates added and removed lines from the diff and displays `└  Added <A> line(s), removed <R> line(s)`, with two spaces after the `└`, immediately beneath the file path header
 - Glance truncation cap: in collapsed mode (default), displays context lines plus up to 8 changed lines; diffs exceeding this cap append `... (<N> more lines, ctrl+o to expand)`
 - Expanded full diff: pressing `Ctrl+O` or clicking expands the component to display the entire diff with all context and changed lines
 - Line-level tinting: context lines remain plain with dim line numbers on transparent background; removed lines `-` receive subtle red background tinting with red text; added lines `+` receive subtle green background tinting with green text; single-line replacements retain word-level reverse video highlighting
 - Idempotent: wraps `ToolExecutionComponent.prototype.updateDisplay` safely, guarded by a unique Symbol, and cleanly restores via `restoreEditGlance()`
+- With `rbf-tool-parts-indent` loaded: the header moves right one column to line up with other tool rows, the summary and the diff hang under it, and the red and green tints start at the indented column and run to the pane's right edge. Without it the row draws at the left edge as before, apart from the summary's second space
 
 ## 🟠⋯ Setup & Verification
 - Local verification: launch `pi -e ./extensions/rbf-edit-glance.ts`, execute a file edit, and observe the unboxed diff with summary line and line-level tinting
@@ -642,3 +643,18 @@ Local Pi extension registering `/cd <path>`, which moves the running conversatio
 - In a real terminal, offline: `bash extensions/test-support/rbf-cd-verify.sh <pi-executable> <scenario>` types into an interactive Pi under a pseudo-terminal with a scripted provider and a fake `trash`, and prints `PASS` or `FAIL` with the reason. Scenarios: `move`, `reopen`, `branch`, `busy`, `cancel`, `fail`, `leftovers`, `fresh`, `trust`, `decline`, `load-error`, `vanish`. Needs `python3`. Roots go under `/Volumes/tom-ssd/tmp/pi-41.2`, or `$RBF_CD_VERIFY_TMP`
 - Global installation: `cp ./extensions/rbf-cd.ts ~/.pi/agent/extensions/rbf-cd.ts` and `cp ./extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-background-tasks.ts`, then start Pi or run `/reload`
 - Removal: `rm -f ~/.pi/agent/extensions/rbf-cd.ts`. Moved conversations are ordinary Pi session files that stock Pi opens in their directory
+
+# 🔵⋯ rbf-tool-parts-indent
+
+Introduced in pi-rbf v0.25.0 (pi-45.1). Every line under a tool call's header starts 3 columns right of the header, and the first of them carries a dim `└` under the header's first character, so a header is the only thing at a row's left column. It covers the rows Pi draws for tool calls (shell, read, write, edit, grep, find, ls, Codex rows, and other extensions' tools that use Pi's row shapes) and the rows for commands typed with `!` or `!!`, collapsed and expanded alike. The text itself is unchanged, and the blank row between a header and its first line is gone.
+
+Install both files, then quit Pi and start it again:
+```sh
+mkdir -p /Volumes/tom-ssd/tmp/pi-45/backup && command cp -f ~/.pi/agent/extensions/rbf-edit-glance.ts /Volumes/tom-ssd/tmp/pi-45/backup/
+command cp -f ./extensions/rbf-tool-parts-indent.ts ./extensions/rbf-edit-glance.ts ~/.pi/agent/extensions/
+```
+Activation and rollback both need a restart of Pi. `/reload` is not enough: `rbf-edit-glance` keeps the copy it loaded when Pi started, so until a restart the edit summary's text sits one column left of the diff under it. To roll back, run `rm -f ~/.pi/agent/extensions/rbf-tool-parts-indent.ts && command cp -f /Volumes/tom-ssd/tmp/pi-45/backup/rbf-edit-glance.ts ~/.pi/agent/extensions/`, then restart Pi. The two files don't need each other, and either one alone leaves every row drawing without error.
+
+What it leaves alone: headers, a `!` row's two border lines, the skill row, images in a tool result, and a tool row that has no renderer. In a pane narrower than 20 columns no row is indented. Text copied from the screen carries the indent, and `/copy` does not, because nothing drawn reaches the saved session. If a row can't be drawn indented without running past the pane's edge, or a piece throws, that row draws as it does without the extension.
+
+To check it locally, start Pi with the extension, ask for `seq 1 12`, and type `!seq 1 30` yourself: in both rows the numbers hang under the `$` header with a `└` on the first. To try it without installing, and without touching your own Pi settings, run `PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions -e extensions/rbf-tool-execution-blended.ts -e extensions/rbf-edit-glance.ts -e extensions/rbf-clean-markdown-code.ts -e extensions/rbf-tool-parts-indent.ts` from the checkout, then type `!seq 1 30`. Pi writes its settings into its agent directory on start, so the command gives it a throwaway one. That profile has no model signed in, so only `!` commands can be tried this way. Run `bun run test -- extensions/rbf-tool-parts-indent.test.ts extensions/rbf-tool-parts-indent-pty.test.ts` and `bun run typecheck` from a checkout with its pinned dependencies installed. Rows are verified by captures from checkout Pi 0.85.1 and daily Pi 1.0.2 at 100 and 60 columns; other Pi versions are not.

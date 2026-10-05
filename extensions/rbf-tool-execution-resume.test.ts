@@ -105,7 +105,7 @@ describe("pi-17.2: tool execution lifecycle across shutdown and fresh module loa
 
 		const edit1Comp = new ToolExecutionComponent("edit", "c3", { path: "f.ts" }, {}, createMockEditToolDef(diff) as any, mockUi as any, "/cwd");
 		expect((edit1Comp as any).callRendererComponent.paddingY).toBe(0);
-		expect(stripAnsi(edit1Comp.render(80).join("\n"))).toContain("└ Added 1 line, removed 1 line");
+		expect(stripAnsi(edit1Comp.render(80).join("\n"))).toContain("└  Added 1 line, removed 1 line");
 
 		// Invoke real background-tasks session shutdown
 		await pi1.emit("session_shutdown", {}, {});
@@ -140,7 +140,7 @@ describe("pi-17.2: tool execution lifecycle across shutdown and fresh module loa
 		const edit2Comp = new ToolExecutionComponent("edit", "c6", { path: "f.ts" }, {}, createMockEditToolDef(diff) as any, mockUi as any, "/cwd");
 		expect((edit2Comp as any).callRendererComponent.paddingY, "collapsed edit must have zero padding").toBe(0);
 		expect((edit2Comp as any).callRendererComponent.bgFn, "collapsed edit must have transparent background").toBeUndefined();
-		expect(stripAnsi(edit2Comp.render(80).join("\n")), "collapsed edit must show unboxed glance summary").toContain("└ Added 1 line, removed 1 line");
+		expect(stripAnsi(edit2Comp.render(80).join("\n")), "collapsed edit must show unboxed glance summary").toContain("└  Added 1 line, removed 1 line");
 
 		// Expanded row keeps Pi's card
 		edit2Comp.setExpanded(true);
@@ -176,6 +176,6 @@ describe("pi-17.2: tool execution lifecycle across shutdown and fresh module loa
 
 		const edit3Comp = new ToolExecutionComponent("edit", "c9", { path: "f.ts" }, {}, createMockEditToolDef(diff) as any, mockUi as any, "/cwd");
 		expect((edit3Comp as any).callRendererComponent.paddingY).toBe(0);
-		expect(stripAnsi(edit3Comp.render(80).join("\n"))).toContain("└ Added 1 line, removed 1 line");
+		expect(stripAnsi(edit3Comp.render(80).join("\n"))).toContain("└  Added 1 line, removed 1 line");
 	});
 });
