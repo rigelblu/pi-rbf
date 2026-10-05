@@ -609,6 +609,19 @@ def scenario_fresh():
         check("MARKER_CD_B" in "\n".join(session["lines"]), "[new] the first prompt's bash printed B's marker")
     check(run.trashed() == [], "[new] nothing went to the trash")
 
+    # A ! command before any prompt saves no file on either Pi version, so the move is still a fresh one.
+    run = Run("after-a-command")
+    result = run.tui("fresh", [
+        {"submit": "!pwd"}, {"sleep": 1.5},
+        {"submit": f"/cd {run.B}"}, shows(f"Working directory changed to {run.B}."), {"sleep": 1.0},
+        {"submit": "first prompt after the move"}, run.said("STEP_1"), {"sleep": 1.5},
+    ])
+    check(squeeze(f"Working directory changed to {run.B}.") in squeeze(result["screen"]) and "session file is missing" not in result["screen"], "[after a ! command] /cd shows the success copy")
+    turns, sessions = run.records("turn"), run.sessions()
+    if check(len(turns) == 1, "[after a ! command] one turn ran"):
+        turn_in(run, turns[0], run.B, "RULE_CD_B", "RULE_CD_A", "[after a ! command] the first prompt")
+    check(len(sessions) == 1 and sessions[0]["header"]["cwd"] == run.B, f"[after a ! command] one session file exists, in B ({[s['path'] for s in sessions]})")
+
     run = Run("no-session")
     copy = f"Can't change directory in a session that isn't being saved. Working directory is still {run.A}."
     result = run.tui("fresh", [{"submit": f"/cd {run.B}"}, shows(copy), {"sleep": 0.5}], extra=["--no-session"])

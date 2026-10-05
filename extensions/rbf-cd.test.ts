@@ -22,8 +22,10 @@ import rbfCd, {
 	CD_COMMAND_NAME,
 	CD_MOVE_ENTRY_TYPE,
 	CD_PENDING_MOVE_KEY,
-	copyStateOf,
+	createRbfCd,
 	decideFailedSwitch,
+	FAILED_SWITCH_EXIT_WINDOW_MS,
+	inspectCopy,
 	launchedWithSandbox,
 	reopenCommand,
 	resolveCdPath,
@@ -39,6 +41,10 @@ let home: string;
 let trashDir: string;
 const saved = { path: process.env.PATH, agentDir: process.env.PI_CODING_AGENT_DIR, argv: process.argv, cwd: process.cwd() };
 const shared = globalThis as Record<symbol, unknown>;
+// The clock and the exit hook's output are injected: no test sleeps, and none writes to the real stderr.
+const clock = { now: 0 };
+let printedAtExit: string[];
+const exitHooks = () => process.listeners("exit").filter((listener) => listener.name === "onFailedSwitchExit") as (() => void)[];
 
 beforeEach(() => {
 	root = realpathSync(mkdtempSync(join(tmpdir(), "rbf-cd-test-")));
@@ -56,6 +62,8 @@ beforeEach(() => {
 	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 	process.argv = ["node", "/opt/pi/dist/cli.js"];
 	process.chdir(dirA);
+	clock.now = 1_000_000;
+	printedAtExit = [];
 });
 
 afterEach(() => {
@@ -66,7 +74,7 @@ afterEach(() => {
 	process.argv = saved.argv;
 	delete shared[CD_PENDING_MOVE_KEY];
 	// A test that leaves the failed-switch hook armed must not have it fire when the test process exits.
-	for (const listener of process.listeners("exit")) if (listener.name === "onFailedSwitchExit") process.removeListener("exit", listener);
+	for (const listener of exitHooks()) process.removeListener("exit", listener);
 	vi.restoreAllMocks();
 	rmSync(root, { recursive: true, force: true });
 });
@@ -180,7 +188,7 @@ function createHarness(
 		switchSession,
 		navigateTree,
 	} as unknown as ExtensionCommandContext;
-	rbfCd(pi);
+	createRbfCd({ now: () => clock.now, printAtExit: (text) => printedAtExit.push(text) })(pi);
 
 	return {
 		calls,
@@ -299,6 +307,11 @@ describe("/cd without a move", () => {
 		expect(CD_BUSY_QUERY_CHANNEL).toBe("rbf-background-tasks:busy/v1");
 		expect(harness.description).toBe("Change this session's working directory.");
 		expect(CD_COMMAND_DESCRIPTION).toBe(harness.description);
+
+		// The default export is what Pi loads: the same extension, on the real clock.
+		const registerCommand = vi.fn();
+		rbfCd({ on: vi.fn(), registerCommand } as unknown as ExtensionAPI);
+		expect(registerCommand).toHaveBeenCalledWith("cd", expect.objectContaining({ description: CD_COMMAND_DESCRIPTION }));
 	});
 
 	it("shows the directory and usage as one two-line notification for a bare /cd", async () => {
@@ -354,7 +367,7 @@ describe("/cd refusals", () => {
 		expectNothingWritten(harness, before);
 	});
 
-	it.each<[string, (manager: SessionManager) => { options?: object; idle?: boolean[]; copy: string; level?: string }]>([
+	it.each<[string, (manager: SessionManager) => { options?: object; idle?: boolean[]; copy: string; level?: string; session?: SessionManager }]>([
 		[
 			"a response or compaction is running",
 			() => ({ idle: [false], copy: "Can't change directory while a response or compaction is running. Finish or stop it, then retry /cd." }),
@@ -405,6 +418,24 @@ describe("/cd refusals", () => {
 			},
 		],
 		[
+			"the file went missing after Pi 1.0.2 saved a prompt that got no reply",
+			() => {
+				// Pi 1.0.2 writes the file with the first user message. This is that session with its file gone.
+				const session = SessionManager.create(dirA);
+				session.appendMessage({ role: "user", content: "a prompt whose turn was stopped", timestamp: Date.now() } as any);
+				return { session, copy: `Can't change directory: this conversation's session file is missing. Working directory is still ${dirA}.`, level: "error" };
+			},
+		],
+		[
+			"the file went missing from a session whose only message is a reply",
+			() => {
+				const session = SessionManager.create(dirA);
+				session.appendMessage({ role: "assistant", content: [{ type: "text", text: "a reply" }], stopReason: "stop", timestamp: Date.now() } as any);
+				rmSync(session.getSessionFile()!);
+				return { session, copy: `Can't change directory: this conversation's session file is missing. Working directory is still ${dirA}.`, level: "error" };
+			},
+		],
+		[
 			"Pi was started with --sandbox",
 			() => {
 				process.argv = ["node", "/opt/pi/dist/cli.js", "--model", "x/y", "--sandbox"];
@@ -413,9 +444,9 @@ describe("/cd refusals", () => {
 		],
 	])("refuses when %s, writes nothing, and puts the typed command back", async (_name, arrange) => {
 		const manager = savedSession(dirA);
-		const { options, idle, copy, level } = arrange(manager);
+		const { options, idle, copy, level, session } = arrange(manager);
 		const before = sessionFilesIn(dirname(manager.getSessionFile()!));
-		const harness = createHarness(manager, options);
+		const harness = createHarness(session ?? manager, options);
 		harness.idle.answers = idle ?? [];
 
 		await harness.run(dirB);
@@ -578,11 +609,16 @@ describe("same-ID rule for the destination folder", () => {
 
 // ─── Copy state ──────────────────────────────────────────────────────────────
 
-describe("copyStateOf", () => {
+describe("inspectCopy", () => {
 	it("is finished when a same-ID parent exists and the last move entry names the file's own directory", () => {
 		const session = savedSession(dirA);
 
-		expect(copyStateOf(movedCopy(session, dirB).getSessionFile()!)).toBe("finished");
+		expect(inspectCopy(movedCopy(session, dirB).getSessionFile()!)).toEqual({
+			state: "finished",
+			sessionId: session.getSessionId(),
+			parentFile: session.getSessionFile(),
+			parentCwd: dirA,
+		});
 	});
 
 	it("is finished in A after A to B to A, where both move entries are in the file", () => {
@@ -595,14 +631,14 @@ describe("copyStateOf", () => {
 			[dirA, dirB],
 			[dirB, dirA],
 		]);
-		expect(copyStateOf(backInA)).toBe("finished");
+		expect(inspectCopy(backInA).state).toBe("finished");
 	});
 
 	it("is unfinished when a same-ID parent exists and no move entry was written", () => {
 		const session = savedSession(dirA);
 		const copy = sameIdCopy(session, dirB);
 
-		expect(copyStateOf(copy.getSessionFile()!)).toBe("unfinished");
+		expect(inspectCopy(copy.getSessionFile()!).state).toBe("unfinished");
 	});
 
 	it("is unfinished when the last move entry names another directory", () => {
@@ -612,7 +648,7 @@ describe("copyStateOf", () => {
 		mkdirSync(dirC);
 		const interrupted = sameIdCopy(inB, dirC);
 
-		expect(copyStateOf(interrupted.getSessionFile()!)).toBe("unfinished");
+		expect(inspectCopy(interrupted.getSessionFile()!).state).toBe("unfinished");
 	});
 
 	it("is ordinary for a stock fork of a moved session, which has a new ID", () => {
@@ -621,23 +657,23 @@ describe("copyStateOf", () => {
 		const fork = SessionManager.forkFrom(inB.getSessionFile()!, dirB);
 
 		expect(fork.getSessionId()).not.toBe(session.getSessionId());
-		expect(copyStateOf(fork.getSessionFile()!)).toBe("ordinary");
+		expect(inspectCopy(fork.getSessionFile()!).state).toBe("ordinary");
 	});
 
 	it("is ordinary with no parent, and once the parent file is gone", () => {
 		const session = savedSession(dirA);
 		const copy = movedCopy(session, dirB).getSessionFile()!;
 
-		expect(copyStateOf(session.getSessionFile()!)).toBe("ordinary");
+		expect(inspectCopy(session.getSessionFile()!).state).toBe("ordinary");
 		rmSync(session.getSessionFile()!);
-		expect(copyStateOf(copy)).toBe("ordinary");
+		expect(inspectCopy(copy).state).toBe("ordinary");
 	});
 
 	it("is ordinary for a file that isn't a session", () => {
 		writeFileSync(join(root, "notes.jsonl"), "not json\n");
 
-		expect(copyStateOf(join(root, "notes.jsonl"))).toBe("ordinary");
-		expect(copyStateOf(join(root, "missing.jsonl"))).toBe("ordinary");
+		expect(inspectCopy(join(root, "notes.jsonl")).state).toBe("ordinary");
+		expect(inspectCopy(join(root, "missing.jsonl")).state).toBe("ordinary");
 	});
 });
 
@@ -889,13 +925,39 @@ describe("/cd move", () => {
 		expect(process.listeners("exit").filter((listener) => listener.name === "onFailedSwitchExit")).toEqual([]);
 	});
 
-	it("cleans up and keeps the exit hook armed when the switch error is handed back instead of ending Pi", async () => {
+	const reopenLines = (dir: string, file: string) => `\n/cd failed and Pi stopped. This conversation is saved in ${dir}.\nReopen it with:\npi --session '${file}'\n`;
+	const printed = () => printedAtExit.map((text) => text.replaceAll("\r\x1b[K", ""));
+
+	it("deletes the new file and prints the reopen lines when Pi exits inside the switch", async () => {
+		const session = savedSession(dirA);
+		const own = session.getSessionFile()!;
+		const bytes = readFileSync(own);
+		const harness = createHarness(session);
+		let atExit: { newFiles: string[]; hooks: number } | undefined;
+		harness.switchSession.mockImplementationOnce(async () => {
+			// Pi's fatal handler calls `process.exit(1)` here: the hook runs and nothing after the switch does.
+			const hooks = exitHooks();
+			for (const hook of hooks) hook();
+			atExit = { newFiles: sessionFilesIn(defaultFolder(dirB)), hooks: hooks.length };
+			return new Promise<never>(() => {});
+		});
+
+		void harness.run(dirB);
+		await vi.waitFor(() => expect(atExit).toBeDefined());
+
+		expect(atExit).toEqual({ newFiles: [], hooks: 1 });
+		expect(printed()).toEqual([reopenLines(dirA, own)]);
+		expect(readFileSync(own).equals(bytes)).toBe(true);
+		expect(trashed()).toEqual([]);
+		delete shared[CD_PENDING_MOVE_KEY];
+	});
+
+	it("cleans up at once when the switch error is handed back instead of ending Pi", async () => {
 		const session = savedSession(dirA);
 		const own = session.getSessionFile()!;
 		const bytes = readFileSync(own);
 		const harness = createHarness(session);
 		harness.switchSession.mockRejectedValueOnce(new Error("ENOENT: no such file or directory, uv_cwd"));
-		const armed = () => process.listeners("exit").filter((listener) => listener.name === "onFailedSwitchExit");
 
 		await expect(harness.run(dirB)).rejects.toThrow("uv_cwd");
 
@@ -905,8 +967,43 @@ describe("/cd move", () => {
 		expect(process.cwd()).toBe(dirA);
 		expect(shared[CD_PENDING_MOVE_KEY]).toBeUndefined();
 		expect(harness.notify).not.toHaveBeenCalled();
-		// Pi is on its way out: the hook prints the reopen lines when it goes.
-		expect(armed()).toHaveLength(1);
+		expect(printed()).toEqual([]);
+	});
+
+	it.each([
+		["at the end of the window, Pi's exit still prints the reopen lines", FAILED_SWITCH_EXIT_WINDOW_MS, true],
+		["a millisecond past it, the hook does nothing: Pi lived on, and this exit isn't the failed switch's", FAILED_SWITCH_EXIT_WINDOW_MS + 1, false],
+	])("after a switch error that reached /cd: %s", async (_name, elapsed, prints) => {
+		const session = savedSession(dirA);
+		const harness = createHarness(session);
+		let newFile = "";
+		harness.switchSession.mockImplementationOnce(async (file) => {
+			newFile = file;
+			throw new Error("ENOENT: no such file or directory, uv_cwd");
+		});
+		await expect(harness.run(dirB)).rejects.toThrow("uv_cwd");
+		// Something at the new file's path that the hook would delete if it acted.
+		writeFileSync(newFile, "not ours to remove once the window has passed\n");
+
+		expect(FAILED_SWITCH_EXIT_WINDOW_MS).toBe(10_000);
+		clock.now += elapsed;
+		for (const hook of exitHooks()) hook();
+
+		expect(exitHooks()).toHaveLength(1);
+		expect(printed()).toEqual(prints ? [reopenLines(dirA, session.getSessionFile()!)] : []);
+		expect(existsSync(newFile)).toBe(!prints);
+	});
+
+	it("moves a conversation that has only run a ! command as a new session: Pi saves no file for one", async () => {
+		const fresh = SessionManager.create(dirA);
+		fresh.appendMessage({ role: "bashExecution", command: "pwd", output: `${dirA}\n`, exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now() } as any);
+		const harness = createHarness(fresh);
+
+		await harness.run(dirB);
+
+		expect(existsSync(fresh.getSessionFile()!)).toBe(false);
+		expect(harness.notify).not.toHaveBeenCalled();
+		expect(harness.next!.notify.mock.calls).toEqual([[`Working directory changed to ${dirB}.`, "info"]]);
 	});
 
 	it("moves a conversation with nothing saved yet as a new session, and records the new session's ID", async () => {
@@ -1078,5 +1175,11 @@ describe("leftover check on session_start", () => {
 		expect(moving.notify).not.toHaveBeenCalled();
 		expect(moveEntriesOf(copy.getSessionFile()!)).toEqual([{ from: dirA, to: dirB, sessionId: old.getSessionId() }]);
 		expect(trashed()).toEqual([]);
+
+		// Another session that starts while that move is pending isn't the move's, and gets none of its entry or pick.
+		const bystander = createHarness(savedSession(dirA));
+		await start(bystander);
+		expect(bystander.pi.appendEntry).not.toHaveBeenCalled();
+		expect(bystander.calls.setThinkingLevel).not.toHaveBeenCalled();
 	});
 });
