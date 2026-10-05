@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.25.0 (2026-10-05)
+## 🟠⋯ Added for End Users
+- 2026-10-05 - feat (ux) | tell at a glance which lines belong to which tool call or `!` command: the lines under a header hang 3 columns in, with one dim `└` on the first line. Covers shell, read, write and edit rows, Codex rows, and `!` rows, collapsed and expanded. Clicks and Ctrl+O work as before. Needs a full Pi restart to load. Known limit: a row that changes on every draw and holds non-ASCII lines costs 14 to 21 ms more per draw at 1,000 expanded lines
+
+---
+
 # 🔵⋯ v0.24.0 (2026-10-05)
 ## 🟠⋯ Added for End Users
 - 2026-10-05 - feat | use `/cd` to change the active session's working directory: `/cd <path>` moves the running conversation to another directory without restarting Pi. The conversation, its session ID, the selected branch point, model and thinking level stay; from the next prompt the agent's tools, your `!` shell, the project rules and the footer use the new directory, and the conversation reopens there. Bare `/cd` shows the current directory. `/cd` refuses while a response, compaction, background task or `!` command is running and puts the typed command back in the editor. Not yet for Codex conversations, which are refused with a message; sandboxed and `--no-session` sessions can't move. The previous session file goes to the Trash. If a switch fails, Pi stops with the conversation intact and prints the command that reopens it
