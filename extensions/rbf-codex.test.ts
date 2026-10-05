@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
-import { validateToolArguments } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, getSupportedThinkingLevels, validateToolArguments } from "@earendil-works/pi-ai";
 import { Box, Editor } from "@earendil-works/pi-tui";
 import { initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
 import { writeInterruptionFixture } from "./test-support/rbf-codex-interruption-fixture.ts";
@@ -23,7 +23,7 @@ type Entry = { type: string; customType?: string; data?: unknown; message?: { ro
 type Tool = { name: string; execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: ((p: any) => void) | undefined, ctx: ExtensionContext) => Promise<any>; renderCall: (args: any, theme: any, context: any) => any; renderResult: (result: any, opts: any, theme: any, context: any) => any };
 const fakeTheme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-function makePi() {
+function makePi(opts?: { getThinkingLevel?: () => string }) {
 	const handlers = new Map<string, Handler>();
 	const entries: { customType: string; data: unknown }[] = [];
 	const tools = new Map<string, Tool>();
@@ -35,6 +35,7 @@ function makePi() {
 		registerProvider: vi.fn((name: string, config: ProviderConfig) => {
 			provider = { name, config };
 		}),
+		getThinkingLevel: vi.fn(opts?.getThinkingLevel ?? (() => "medium")),
 	} as unknown as ExtensionAPI;
 	return {
 		pi,
@@ -159,7 +160,15 @@ describe("rbf-codex", () => {
 		// Close every fake child this test spawned; leaked children made the full suite flaky under load.
 		await Promise.all(booted.splice(0).map((b) => b.shutdown()));
 		process.env = { ...savedEnv };
-		rmSync(dir, { recursive: true, force: true });
+		try {
+			for (const s of sent().filter((m) => m.method === "turn/start")) {
+				const params = s.params as Record<string, unknown> | undefined;
+				expect(typeof params?.effort).toBe("string");
+				expect((params?.effort as string).length).toBeGreaterThan(0);
+			}
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	function scenario(s: FakeScenario) {
@@ -177,8 +186,8 @@ describe("rbf-codex", () => {
 	}
 
 	/** Boot an extension instance with `session_start` already fired, ready to stream. */
-	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number; persistAppends?: boolean } = {}) {
-		const fx = makePi();
+	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number; persistAppends?: boolean; thinkingLevel?: string } = {}) {
+		const fx = makePi(opts.thinkingLevel ? { getThinkingLevel: () => opts.thinkingLevel! } : undefined);
 		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [], compactTimeoutMs: opts.compactTimeoutMs })(fx.pi);
 		const c = makeCtx(opts);
 		if (opts.persistAppends) vi.mocked(fx.pi.appendEntry).mockImplementation((customType, data) => {
@@ -226,7 +235,7 @@ describe("rbf-codex", () => {
 			expect(typeof b.provider.config.refreshModels).toBe("function");
 			expect(b.provider.config.models).toEqual([BOOTSTRAP_MODEL]);
 			expect(BOOTSTRAP_MODEL.reasoning).toBe(true);
-			expect(BOOTSTRAP_MODEL.thinkingLevelMap).toEqual({ minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+			expect(BOOTSTRAP_MODEL.thinkingLevelMap).toEqual({ off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 		});
 
 		it("registers nothing when --sandbox is in argv", () => {
@@ -237,9 +246,15 @@ describe("rbf-codex", () => {
 		});
 	});
 
-	describe("catalog", () => {
-		const codexModel = (id: string, efforts: string[], extra: Record<string, unknown> = {}) => ({ id, model: id, displayName: id.toUpperCase(), hidden: false, supportedReasoningEfforts: efforts.map((e) => ({ reasoningEffort: e })), ...extra });
+	const codexModel = (id: string, efforts: string[], extra: Record<string, unknown> = {}) => ({ id, model: id, displayName: id.toUpperCase(), hidden: false, supportedReasoningEfforts: efforts.map((e) => ({ reasoningEffort: e })), ...extra });
 
+	function refreshCtx(opts: { allowNetwork: boolean; force?: boolean; stored?: RefreshModelsContext["stored"] }) {
+		const publish = vi.fn(async () => true);
+		const ctx = { allowNetwork: opts.allowNetwork, force: opts.force, stored: opts.stored, publish, signal: new AbortController().signal } as unknown as RefreshModelsContext;
+		return { ctx, publish };
+	}
+
+	describe("catalog", () => {
 		it("maps a Codex model to a Pi model with only listed efforts, minimal null, and xhigh and max named", () => {
 			const m = toProviderModel(codexModel("gpt-x", ["medium", "high", "ultra"], { inputModalities: ["text", "image"] }));
 			expect(m).toMatchObject({ id: "gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text", "image"] }); // the provider tag keeps the row apart from openai-codex
@@ -247,15 +262,10 @@ describe("rbf-codex", () => {
 			expect(codexModelId("gpt-x")).toBe("gpt-x");
 			expect(codexModelId("codex-gpt-x")).toBe("gpt-x"); // a store from the brief prefix era
 			expect(codexModelId(BOOTSTRAP_MODEL_ID)).toBeUndefined();
-			expect(m.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null });
-			expect(toProviderModel(codexModel("gpt-y", ["low", "xhigh", "max"])).thinkingLevelMap).toEqual({ minimal: null, low: "low", medium: null, high: null, xhigh: "xhigh", max: "max" });
+			expect(m.thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null });
+			expect(toProviderModel(codexModel("gpt-y", ["low", "xhigh", "max"])).thinkingLevelMap).toEqual({ off: null, minimal: null, low: "low", medium: null, high: null, xhigh: "xhigh", max: "max" });
 		});
 
-		function refreshCtx(opts: { allowNetwork: boolean; force?: boolean; stored?: RefreshModelsContext["stored"] }) {
-			const publish = vi.fn(async () => true);
-			const ctx = { allowNetwork: opts.allowNetwork, force: opts.force, stored: opts.stored, publish, signal: new AbortController().signal } as unknown as RefreshModelsContext;
-			return { ctx, publish };
-		}
 		const storedEntry = (checkedAt: number) => ({ models: [{ ...model("codex-gpt-stored", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), name: "GPT-STORED (Codex agent)" }], checkedAt }); // prefixed id, as a store from the prefix era would hold
 
 		it("returns the stored list without network and never spawns", async () => {
@@ -281,7 +291,7 @@ describe("rbf-codex", () => {
 			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-fake-1", "gpt-fake-2"]);
 			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text", "image"], reasoning: true });
 			expect(list[1]).toMatchObject({ input: ["text"] });
-			expect(list[2].thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+			expect(list[2].thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 			expect(forced.publish).toHaveBeenCalledTimes(1);
 			const persisted = (forced.publish.mock.calls[0] as unknown as [{ persist: { models: Model<any>[]; checkedAt: number } }])[0].persist;
 			expect(persisted.checkedAt).toBe(now);
@@ -312,23 +322,24 @@ describe("rbf-codex", () => {
 			expect(start.params).toMatchObject({ model: "gpt-fake-2", effort: "high" });
 		});
 
-		it("sends effort but no model for the bootstrap id, and neither effort when the level is unsupported or off", async () => {
+		it("sends effort but no model for the bootstrap id, uses displayed thinking level when none is passed, and refuses an unsupported level", async () => {
 			const b = await boot();
 			await b.turn("one", model(), { reasoning: "medium" });
 			await b.turn("two", model(), {});
-			await b.turn("three", model("gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
+			const errTurn = await b.turn("three", model("gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
+			expect(errTurn.final?.errorMessage).toBe(COPY["unsupported-thinking-level"]);
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts[0]).toMatchObject({ effort: "medium" });
 			expect(starts[0]).not.toHaveProperty("model");
-			expect(starts[1]).not.toHaveProperty("effort");
+			expect(starts[1]).toMatchObject({ effort: "medium" });
 			expect(starts[1]).not.toHaveProperty("model");
-			expect(starts[2]).toMatchObject({ model: "gpt-fake-1" });
-			expect(starts[2]).not.toHaveProperty("effort");
+			expect(starts).toHaveLength(2);
 			expect(mapEffort(model(), "max")).toBe("max");
 			expect(mapEffort(model(), "minimal")).toBeUndefined();
+			expect(mapEffort(model(), "off")).toBeUndefined();
 		});
 
-		it("retries once without model and effort when Codex rejects the persisted model id, with the retired-model notice", async () => {
+		it("retries once without model but with the same effort when Codex rejects the persisted model id, with the retired-model notice", async () => {
 			scenario({ retiredModel: "gpt-gone" });
 			const b = await boot();
 			const r = await b.turn("hi", model("gpt-gone"), { reasoning: "high" });
@@ -336,8 +347,8 @@ describe("rbf-codex", () => {
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts).toHaveLength(2);
 			expect(starts[0]).toMatchObject({ model: "gpt-gone", effort: "high" });
+			expect(starts[1]).toMatchObject({ effort: "high" });
 			expect(starts[1]).not.toHaveProperty("model");
-			expect(starts[1]).not.toHaveProperty("effort");
 			expect(b.notify).toHaveBeenCalledWith(NOTICE.retiredModel("gpt-gone"), "warning");
 		});
 	});
@@ -2672,6 +2683,211 @@ describe("rbf-codex", () => {
 					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknownNavigated, "warning")
 				);
 			});
+		});
+	});
+
+	describe("pi-10.7 thinking levels and effort dispatch", () => {
+		const cachedWithoutOff = {
+			models: [
+				{
+					...model("gpt-stored-no-off", {
+						minimal: null,
+						low: "low",
+						medium: "medium",
+						high: "high",
+						xhigh: null,
+						max: null,
+					}),
+					name: "GPT Stored No Off (Codex agent)",
+				},
+			],
+			checkedAt: Date.now(),
+		};
+
+		it("Sources: bootstrap, live catalog, and restored cached model without off all have seven keys with off: null and minimal: null", async () => {
+			const b = await boot();
+			// Source 1: the bootstrap model from the registered provider
+			const bootstrap = b.provider.config.models![0];
+			expect(bootstrap.id).toBe(BOOTSTRAP_MODEL_ID);
+
+			// Source 2: a model built from the live catalog via refreshModels
+			const liveCtx = refreshCtx({ allowNetwork: true, force: true });
+			const liveCatalog = await b.provider.config.refreshModels!(liveCtx.ctx);
+			const liveModel = liveCatalog.find((m) => m.id === "gpt-fake-2")!;
+			expect(liveModel).toBeDefined();
+
+			// Source 3: a model restored from a stored cache entry whose map has NO off key
+			const storedCtx = refreshCtx({ allowNetwork: false, stored: cachedWithoutOff });
+			const storedList = await b.provider.config.refreshModels!(storedCtx.ctx);
+			const restoredModel = storedList.find((m) => m.id === "gpt-stored-no-off")!;
+			expect(restoredModel).toBeDefined();
+
+			const expectedKeys = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+			for (const m of [bootstrap, liveModel, restoredModel]) {
+				expect(Object.keys(m.thinkingLevelMap!)).toEqual(expectedKeys);
+				expect(m.thinkingLevelMap!.off).toBeNull();
+				expect(m.thinkingLevelMap!.minimal).toBeNull();
+			}
+
+			expect(bootstrap.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: "max",
+			});
+			expect(liveModel.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: null,
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: "max",
+			});
+			expect(restoredModel.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: null,
+				max: null,
+			});
+		});
+
+		it("Pi's real rule: getSupportedThinkingLevels excludes off and minimal, and clampThinkingLevel clamps appropriately", async () => {
+			const b = await boot();
+			const bootstrap = b.provider.config.models![0] as Model<any>;
+
+			const liveCtx = refreshCtx({ allowNetwork: true, force: true });
+			const liveCatalog = await b.provider.config.refreshModels!(liveCtx.ctx);
+			const liveModel = liveCatalog.find((m) => m.id === "gpt-fake-2")! as Model<any>;
+
+			const storedCtx = refreshCtx({ allowNetwork: false, stored: cachedWithoutOff });
+			const storedList = await b.provider.config.refreshModels!(storedCtx.ctx);
+			const restoredModel = storedList.find((m) => m.id === "gpt-stored-no-off")! as Model<any>;
+
+			for (const m of [bootstrap, liveModel, restoredModel]) {
+				const supported = getSupportedThinkingLevels(m);
+				expect(supported).not.toContain("off");
+				expect(supported).not.toContain("minimal");
+			}
+
+			expect(clampThinkingLevel(bootstrap, "off")).toBe("low");
+			expect(clampThinkingLevel(bootstrap, "minimal")).toBe("low");
+
+			const medHighModel = toProviderModel(codexModel("gpt-med-high", ["medium", "high"])) as Model<any>;
+			expect(getSupportedThinkingLevels(medHighModel)).toEqual(["medium", "high"]);
+			expect(clampThinkingLevel(medHighModel, "off")).toBe("medium");
+			expect(clampThinkingLevel(medHighModel, "minimal")).toBe("medium");
+		});
+
+		it("Effort always sent: one turn at each of low, medium, high, xhigh, max records exactly one turn/start whose effort equals that level", async () => {
+			const b = await boot();
+			const levels = ["low", "medium", "high", "xhigh", "max"] as const;
+			for (let i = 0; i < levels.length; i++) {
+				const lvl = levels[i];
+				const r = await b.turn(`turn at ${lvl}`, BOOTSTRAP_MODEL as Model<any>, { reasoning: lvl });
+				expect(r.text).toBe("FAKE_OK");
+				const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+				expect(starts).toHaveLength(i + 1);
+				expect(starts[i].effort).toBe(lvl);
+			}
+		});
+
+		it("No level passed but Pi displays high -> one turn/start with effort: high", async () => {
+			const b = await boot({ thinkingLevel: "high" });
+			const r = await b.turn("no level passed");
+			expect(r.text).toBe("FAKE_OK");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+			expect(starts).toHaveLength(1);
+			expect(starts[0].effort).toBe("high");
+		});
+
+		it("Refusal, displayed off: errors with new sentence, zero thread/turn requests, no branch entries, no child spawn, and subsequent call starts normally", async () => {
+			const b = await boot({ thinkingLevel: "off" });
+			const r = await b.turn("prompt while displayed thinking is off");
+			expect(r.final?.stopReason).toBe("error");
+			expect(r.final?.errorMessage).toBe(COPY["unsupported-thinking-level"]);
+			expect(r.final?.errorMessage).toBe("This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.");
+
+			const threadOrTurnRequests = sent().filter((m) => m.method?.startsWith("thread/") || m.method?.startsWith("turn/"));
+			expect(threadOrTurnRequests).toHaveLength(0);
+
+			expect(b.entries.filter((e) => e.customType === ENTRY_TYPE || e.customType === TURN_ENTRY_TYPE)).toHaveLength(0);
+
+			expect(sent().filter((m) => m.method === "initialize")).toHaveLength(0);
+
+			const r2 = await b.turn("following valid turn", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			expect(r2.text).toBe("FAKE_OK");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+			expect(starts).toHaveLength(1);
+			expect(starts[0].effort).toBe("low");
+		});
+
+		it("Refusal, unmapped level: reasoning: xhigh on model with xhigh: null errors with same sentence and zero thread/turn requests", async () => {
+			const b = await boot();
+			const m = toProviderModel(codexModel("gpt-no-xhigh", ["low", "medium", "high"])) as Model<any>;
+			expect(m.thinkingLevelMap?.xhigh).toBeNull();
+
+			const r = await b.turn("unmapped level turn", m, { reasoning: "xhigh" });
+			expect(r.final?.stopReason).toBe("error");
+			expect(r.final?.errorMessage).toBe(COPY["unsupported-thinking-level"]);
+			expect(r.final?.errorMessage).toBe("This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.");
+
+			const threadOrTurnRequests = sent().filter((m) => m.method?.startsWith("thread/") || m.method?.startsWith("turn/"));
+			expect(threadOrTurnRequests).toHaveLength(0);
+		});
+
+		it("Not refused: tool-result continuation and aborted-tool re-call both proceed when displayed thinking is off", async () => {
+			// Continuation path A: tool-result continuation of a running turn
+			scenario({ turn: [{ kind: "command", id: "c1", command: "pwd", output: ["/tmp\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+			const b1 = await boot();
+			const first = await b1.turn("go", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			expect(first.toolCall?.name).toBe(TOOL_COMMAND);
+			const result = await b1.exec(first.toolCall!);
+			vi.mocked(b1.pi.getThinkingLevel).mockReturnValue("off");
+			const next = await b1.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result)], BOOTSTRAP_MODEL as Model<any>);
+			expect(next.final?.stopReason).toBe("stop");
+			expect(next.text).toBe("done");
+
+			// Continuation path B: Pi's re-call after an aborted tool
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
+			const b2 = await boot({ persistAppends: true });
+			const f = await b2.turn("go", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			const ac = new AbortController();
+			const p = b2.exec(f.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
+			vi.mocked(b2.pi.getThinkingLevel).mockReturnValue("off");
+			const recall = await b2.turn([userMessage("go"), f.final!], BOOTSTRAP_MODEL as Model<any>, { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			expect(recall.events.map((e) => e.type)).toEqual(["error"]);
+			expect(b2.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
+		});
+
+		it("A refused steer that becomes its own turn carries effort", async () => {
+			scenario({
+				retainHistory: true,
+				turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }],
+				laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }],
+				steerError: "turn already ended",
+			});
+			const b = await boot({ persistAppends: true, thinkingLevel: "high" });
+			const first = await b.turn("go", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			const result = await b.exec(first.toolCall!);
+			const steer = userMessage("steer now");
+			const r = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result), steer], BOOTSTRAP_MODEL as Model<any>);
+			expect(r.final?.stopReason).toBe("stop");
+			expect(r.text).toBe("woketook the steer");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+			expect(starts).toHaveLength(2);
+			expect(starts[0].effort).toBe("low");
+			expect(starts[1].effort).toBe("high");
 		});
 	});
 });

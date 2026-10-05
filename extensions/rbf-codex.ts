@@ -16,7 +16,7 @@
 // announced its thread. A turn running when Pi exits is not recovered.
 import { keyHint, parseArgs, renderDiff, truncateToVisualLines, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { AssistantMessage, AssistantMessageEventStream, Context, Model, RefreshModelsContext, SimpleStreamOptions, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEventStream, Context, Model, ModelThinkingLevel, RefreshModelsContext, SimpleStreamOptions, ToolCall } from "@earendil-works/pi-ai";
 import { Box, Container, Editor, Spacer, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -61,6 +61,7 @@ export const COPY = {
 	"codex-logged-out": "Codex is not logged in. Run `codex login`, then send again.",
 	"workspace-mismatch": "This conversation's Codex thread belongs to another directory. Start a new Pi conversation here, or reopen it from that directory.",
 	"unsupported-input": "This Codex model accepts plain text only. Remove the image, or pick an image-capable Codex model.",
+	"unsupported-thinking-level": "This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.",
 	"codex-stopped": "Codex stopped unexpectedly. Send your message again to continue this conversation.",
 	"turn-failed": "Codex could not complete this request. Send your message again or start a new Pi conversation.",
 	"history-unverified": "Codex history for this branch could not be verified. Your message was not sent. Try /fork and resend, or /new to start cold.",
@@ -312,7 +313,14 @@ export function approvalTitle(kind: RowKind, req: Rec, changes: PatchChangeArg[]
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const ZERO_USAGE = { ...ZERO_COST, totalTokens: 0, cost: { ...ZERO_COST, total: 0 } };
 const SENTINEL = 1_000_000_000; // keeps Pi's threshold compaction from ever firing
-const PI_LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const CODEX_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/** Pi hides a level only when its entry is null and treats a missing entry as selectable, so every Codex map names all seven levels with off and minimal always null. */
+export function withFixedThinkingLevels(map?: Record<string, string | null>): Record<string, string | null> {
+	const out: Record<string, string | null> = { off: null, minimal: null };
+	for (const level of CODEX_LEVELS) out[level] = map?.[level] ?? null;
+	return out;
+}
 
 /** The user pressed Escape while a setup request or a row's wait was in flight. */
 class AbortedError extends Error {}
@@ -353,7 +361,7 @@ export const BOOTSTRAP_MODEL: ProviderModelConfig = {
 	id: BOOTSTRAP_MODEL_ID,
 	name: "Codex agent",
 	reasoning: true,
-	thinkingLevelMap: { minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+	thinkingLevelMap: withFixedThinkingLevels({ low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" }),
 	input: ["text"],
 	contextWindow: SENTINEL,
 	maxTokens: SENTINEL,
@@ -371,13 +379,13 @@ export function codexModelId(piModelId: string): string | undefined {
 /** One Codex `model/list` entry → Pi model config. Pi offers `xhigh` and `max` only when the map names them; Pi's editor accepts a paste only when `input` lists `image`. */
 export function toProviderModel(m: CodexModel): ProviderModelConfig {
 	const efforts = new Set(m.supportedReasoningEfforts.map((e) => e.reasoningEffort));
-	const thinkingLevelMap: Record<string, string | null> = { minimal: null };
-	for (const level of PI_LEVELS) if (level !== "minimal") thinkingLevelMap[level] = efforts.has(level) ? level : null;
+	const supported: Record<string, string | null> = {};
+	for (const level of CODEX_LEVELS) if (efforts.has(level)) supported[level] = level;
 	return {
 		id: m.id, // Codex's own id; the provider tag in the picker row tells it apart from openai-codex
 		name: `${m.displayName} (Codex agent)`,
 		reasoning: true,
-		thinkingLevelMap,
+		thinkingLevelMap: withFixedThinkingLevels(supported),
 		input: m.inputModalities?.includes("image") ? ["text", "image"] : ["text"],
 		contextWindow: SENTINEL,
 		maxTokens: SENTINEL,
@@ -390,14 +398,14 @@ function storedToConfigs(stored: RefreshModelsContext["stored"]): ProviderModelC
 	return (stored?.models ?? [])
 		.filter((m) => m.id !== BOOTSTRAP_MODEL_ID)
 		// A store written during the brief `codex-` prefix holds prefixed ids; normalize so no session ever sees both forms.
-		.map((m) => ({ id: m.id.startsWith(LEGACY_ID_PREFIX) ? m.id.slice(LEGACY_ID_PREFIX.length) : m.id, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: m.cost }));
+		.map((m) => ({ id: m.id.startsWith(LEGACY_ID_PREFIX) ? m.id.slice(LEGACY_ID_PREFIX.length) : m.id, name: m.name, reasoning: m.reasoning, thinkingLevelMap: withFixedThinkingLevels(m.thinkingLevelMap), input: m.input, contextWindow: m.contextWindow, maxTokens: m.maxTokens, cost: m.cost }));
 }
 
 function toStoredModel(c: ProviderModelConfig): Model<typeof API_ID> {
 	return { id: c.id, name: c.name, api: API_ID, provider: PROVIDER_ID, baseUrl: "stdio://codex", reasoning: c.reasoning, thinkingLevelMap: c.thinkingLevelMap, input: c.input, cost: c.cost, contextWindow: c.contextWindow, maxTokens: c.maxTokens };
 }
 
-export function mapEffort(model: Model<any>, level: ThinkingLevel | undefined): string | undefined {
+export function mapEffort(model: Model<any>, level: ModelThinkingLevel | undefined): string | undefined {
 	if (!level) return undefined;
 	const mapped = model.thinkingLevelMap?.[level];
 	return typeof mapped === "string" ? mapped : undefined;
@@ -1422,10 +1430,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		}
 
-		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, reasoning: ThinkingLevel | undefined): Promise<ActiveTurn> {
-			const effort = mapEffort(model, reasoning);
-			const turnParams: Rec = { threadId, input: items };
-			if (effort) turnParams.effort = effort;
+		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, effort: string): Promise<ActiveTurn> {
+			const turnParams: Rec = { threadId, input: items, effort };
 			const codexId = codexModelId(model.id);
 			if (codexId) turnParams.model = codexId;
 			// Subscribe before sending: readline hands over every line of one stdout chunk at once, so a notification can share a chunk with the response.
@@ -1440,7 +1446,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					if (!(turnParams.model && detail.includes(String(turnParams.model)))) throw e;
 					// Codex retired the persisted model id: one retry on Codex's default, then the user picks another.
 					notify(NOTICE.retiredModel(String(turnParams.model)), "warning");
-					started = rec(await client.request("turn/start", { threadId, input: items }));
+					started = rec(await client.request("turn/start", { threadId, input: items, effort }));
 				}
 			} catch (e) {
 				turn.dispose();
@@ -1527,6 +1533,9 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				const signal = options?.signal;
 				if (signal?.aborted) return out.finish("aborted");
 				try {
+					const level = options?.reasoning ?? pi.getThinkingLevel();
+					const effort = mapEffort(model, level);
+					if (!effort) return fail(new CodexError("unsupported-thinking-level"));
 					const cwd = realpathSync.native(ctx.sessionManager.getCwd());
 					const client = await ensureClient(cwd, signal);
 					const bound = await bindThread(client, ctx, cwd, signal);
@@ -1535,7 +1544,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 						notify(NOTICE.policy(bound.policy, bound.sandbox));
 					}
 					if (signal?.aborted) return out.finish("aborted");
-					const started = await startTurn(client, bound.threadId, items, model, options?.reasoning);
+					const started = await startTurn(client, bound.threadId, items, model, effort);
 					if (signal?.aborted) {
 						await started.interrupt();
 						return drain(started, { silent: true });

@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.23.2 (2026-10-05)
+## 🟠⋯ Fixed for End Users
+- 2026-10-05 - fix (ux) | choose a thinking level in Pi and have Codex use that level: a Codex model now offers only the levels Codex can run (`low`, `medium`, `high`, and `xhigh` or `max` where the model supports them); `off` and `minimal` are no longer offered, and a saved `off` or `minimal` shows as the lowest supported level. Every Codex turn runs at the level Pi shows. Known limits: right after installing and `/reload`, a session still showing `off` gets one refused turn with `This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.`; and Pi's thinking menu still describes levels with token budgets that do not apply to Codex (#pi-10.7)
+
+---
+
 # 🔵⋯ v0.23.1 (2026-10-05)
 ## 🟠⋯ Fixed for End Users
 - 2026-10-05 - fix (ux) | stop Codex mid-turn and continue the same conversation: after Escape on a first or later turn, the next prompt starts exactly one new turn on the same verified Codex thread, also after reopening the branch; the stopped prompt is not replayed and no `/fork` or `/new` is needed. Failed, still-running, or unreadable Codex history still refuses the prompt. Known limits, fix planned as `pi-10.8`: a prompt sent before Codex has ended the stopped turn joins that turn and ends aborted (send it again), and a stopped turn that actually completed can be remembered on a sibling branch you move to. Stopping a command row still shows `This operation was aborted` (#pi-10.6)
