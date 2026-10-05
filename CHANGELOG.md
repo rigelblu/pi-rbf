@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.26.0 (2026-10-05)
+## 🟠⋯ Added for End Users
+- 2026-10-05 - feat (ux) | see how long ago I sent my last message in the status bar: the footer's token row now starts with `💬` and the age of your last message, as `💬 <1m` for the first minute, then minutes, hours and days. It updates once a minute and counts time away after a resume. A message you queue while Pi works keeps the earlier age on screen until Pi delivers it, then shows its own age with the wait included. `💬 ?` means the message's time could not be read. The cue hides when the token row has no room for it. Needs a full Pi restart to load; a Pi that was already running shows no cue and warns once to restart. Not yet run: opposite-order delivery of two queued messages, native dequeue, input held during compaction, and a Codex conversation (#pi-43)
+
+---
+
 # 🔵⋯ v0.25.0 (2026-10-05)
 ## 🟠⋯ Added for End Users
 - 2026-10-05 - feat (ux) | tell at a glance which lines belong to which tool call or `!` command: the lines under a header hang 3 columns in, with one dim `└` on the first line. Covers shell, read, write and edit rows, Codex rows, and `!` rows, collapsed and expanded. Clicks and Ctrl+O work as before. Needs a full Pi restart to load. Known limit: a row that changes on every draw and holds non-ASCII lines costs 14 to 21 ms more per draw at 1,000 expanded lines
