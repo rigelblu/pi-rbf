@@ -4,6 +4,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-cd`](extensions/rbf-cd.ts) (v0.24.0) — Use `/cd <path>` to move the running conversation to another directory and reopen it there; ordinary Pi sessions, not yet Codex conversations. [Activation and limits](extensions/README.md#-rbf-cd).
 - [`rbf-path-labels`](extensions/rbf-path-labels.ts) (v0.22.0) — Fit assistant file references and native full-path labels within their pane; keep original targets, source text and completion values. [Activation and recovery](extensions/README.md#-rbf-path-labels).
 - [`rbf-rename`](extensions/rbf-rename.ts) (v0.17.0) — Use `/rename` to name or rename the current Pi session while preserving native `/name`.
 - [`rbf-rewind`](extensions/rbf-rewind.ts) (v0.16.0) — Use `/rewind` as a first-class alias for `/tree` to navigate session branches and checkpoints.

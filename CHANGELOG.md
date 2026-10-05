@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.24.0 (2026-10-05)
+## 🟠⋯ Added for End Users
+- 2026-10-05 - feat | use `/cd` to change the active session's working directory: `/cd <path>` moves the running conversation to another directory without restarting Pi. The conversation, its session ID, the selected branch point, model and thinking level stay; from the next prompt the agent's tools, your `!` shell, the project rules and the footer use the new directory, and the conversation reopens there. Bare `/cd` shows the current directory. `/cd` refuses while a response, compaction, background task or `!` command is running and puts the typed command back in the editor. Not yet for Codex conversations, which are refused with a message; sandboxed and `--no-session` sessions can't move. The previous session file goes to the Trash. If a switch fails, Pi stops with the conversation intact and prints the command that reopens it
+
+---
+
 # 🔵⋯ v0.23.2 (2026-10-05)
 ## 🟠⋯ Fixed for End Users
 - 2026-10-05 - fix (ux) | choose a thinking level in Pi and have Codex use that level: a Codex model now offers only the levels Codex can run (`low`, `medium`, `high`, and `xhigh` or `max` where the model supports them); `off` and `minimal` are no longer offered, and a saved `off` or `minimal` shows as the lowest supported level. Every Codex turn runs at the level Pi shows. Known limits: right after installing and `/reload`, a session still showing `off` gets one refused turn with `This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.`; and Pi's thinking menu still describes levels with token budgets that do not apply to Codex (#pi-10.7)
