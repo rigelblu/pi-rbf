@@ -602,3 +602,43 @@ Eligible references are local-file link labels, one path in inline code, or a st
 Terminal selection copies what is visible, including `…`. `/copy` retrieves the original last assistant response. For an older response, clear selection, open `/tree`, select the message and use the footer's copy action (default Ctrl+X), then Escape without Enter. It copies original text without navigating. Completion inserts its original full value. No new clipboard or per-path action is added.
 
 Run `bun run test -- extensions/rbf-path-labels.test.ts` and `bun run typecheck` from a checkout with its pinned dependencies installed. The canonical pi-39 brief's verification receipts contain the isolated offline terminal probe and its captured source hashes. Both exercised human scenarios passed, user-reported. Offline daily-stack checks passed in regular/fullscreen mode with resize, reload, fork/resume and original source preserved. Optional additional color/assistive modes and continued daily use are separate evidence.
+
+---
+
+# 🔵⋯ rbf-cd
+
+## 🟠⋯ Overview
+Local Pi extension registering `/cd <path>`, which moves the running conversation to another directory inside the running Pi. Same session, same history: from the next prompt the agent's tools, your `!` shell, the project rules and the footer use the destination, and the conversation reopens there. Verified offline against checkout Pi 0.85.1 and daily Pi 1.0.2.
+
+## 🟠⋯ Capabilities & Behavior
+- Syntax: one literal path after the command
+  - `/cd /Volumes/work/api` — absolute
+  - `/cd ../api` — relative to the session's current directory
+  - `/cd ~` and `/cd ~/src/api` — your home directory
+  - `/cd "my project"` — one pair of outer quotes, single or double, for a path with spaces. A path with spaces also works unquoted
+- Never a shell: `$HOME`, `$(…)`, `;`, `*` and backticks are ordinary characters in a name. Nothing is expanded or run. Symlinks resolve to the real directory
+- Bare `/cd` shows `Working directory: <path>` and `Usage: /cd <path>`, and changes nothing. A path that resolves to the current directory answers `Already working in <path>.`
+- What moves: the session ID, every history entry with its id and parent, the selected branch point, labels, the session name, the model and the thinking level
+- What changes: Pi rebuilds its tools, project rules (`AGENTS.md`, the project's `.pi/` settings and extensions) and system prompt for the destination. The old project's rules stay in the history as quoted text. Only the live rules are the destination's
+- What success looks like: `Working directory changed to <path>.` with the full path, shown once, after the move. No model turn starts by itself
+- How it works: the session file is the only record of a session's directory. `/cd` writes the conversation into a new session file for the destination under the same session ID, switches Pi to it, then sends the old file to the system Trash with the `trash` command. One conversation, one copy. If the Trash step fails, the move still succeeds and the message names the file that was left
+- Reopening: `pi -c` in the destination, or Pi's session list, opens the conversation in the last directory `/cd` reached. A refused, cancelled or failed `/cd` never becomes that directory
+- A conversation with nothing saved yet (no reply so far) moves as a new, empty session in the destination, with a new session ID. The model and thinking level you picked come along
+- Busy refusals: `/cd` refuses while a response or compaction runs, while another `/cd` is in progress, while a background task runs, and while a `!` command runs. The work keeps running, the warning says what to finish or stop, and the full typed `/cd <path>` goes back into the editor, so Enter retries it
+- Path refusals: a missing path, a file, a directory you can't read and enter, or an unmatched outer quote is refused before anything is written, and the typed command goes back into the editor
+- Sessions that can't move: one started with `--sandbox`, one that isn't being saved (`--no-session`), one whose session file has gone missing while Pi runs, and any session when `rbf-background-tasks` isn't loaded, because `/cd` asks it whether a command is running. Outside interactive mode `/cd` refuses: `/cd works in interactive mode only.`
+- Codex conversations aren't supported yet: a session that has ever run a turn on the `codex-harness` provider is refused and left alone, whatever model is selected now. Support is slice `pi-41.3`
+- Trust is Pi's own prompt: a destination with project `.pi/` resources raises Pi's `Trust project folder?` prompt during the move. Trusting loads them. Declining doesn't, and the move still completes. Trust isn't a sandbox, and `/cd` never widens one
+- Cancelled by another extension: the conversation stays in the original directory, `Directory change cancelled.` shows, and the typed command goes back into the editor
+- A switch that fails stops Pi: Pi exits when a session switch throws, and no extension can prevent that. The conversation is intact in the original directory, and the terminal's last lines are `/cd failed and Pi stopped. This conversation is saved in <path>.`, `Reopen it with:` and the `pi --session '<file>'` command that reopens it
+- Leftovers from a Pi that died mid-move are judged by content, never deleted outright: an old copy that holds nothing new goes to the Trash the next time the conversation opens or the next `/cd` into its directory. A copy that holds turns the conversation lacks is kept and named in a warning. An unfinished copy opened by itself warns, names the directory the conversation is saved in, and gives the `pi --session <id>` command to run there
+- Each finished move leaves one `rbf-cd-move/v1` entry `{ from, to, sessionId }` in the session file. Pi ignores it and it isn't sent to the model
+- Not included: a directory picker, path completion, `/cd -`, moving running background tasks, and changing directory from print, JSON or RPC mode
+
+## 🟠⋯ Setup & Verification
+- Needs two files: `rbf-cd.ts` and this checkout's `rbf-background-tasks.ts`. An older installed copy of `rbf-background-tasks.ts` can't answer `/cd`'s question, and `/cd` then refuses every move
+- Local dogfood without installing, against a throwaway profile so the installed extensions don't load beside the checkout's: `PI_CODING_AGENT_DIR=<throwaway dir> pi --no-extensions -e ./extensions/rbf-cd.ts -e ./extensions/rbf-background-tasks.ts`, then `/cd`, `/cd <path>`, and ask for `pwd`. A throwaway profile has no login, so pick a model it can reach or copy `auth.json` into it
+- Automated: `bun run test -- extensions/rbf-cd.test.ts` covers the path resolver, every refusal, the same-ID and copy-state rules and the exit hook
+- In a real terminal, offline: `bash extensions/test-support/rbf-cd-verify.sh <pi-executable> <scenario>` types into an interactive Pi under a pseudo-terminal with a scripted provider and a fake `trash`, and prints `PASS` or `FAIL` with the reason. Scenarios: `move`, `reopen`, `branch`, `busy`, `cancel`, `fail`, `leftovers`, `fresh`, `trust`, `decline`, `load-error`, `vanish`. Needs `python3`. Roots go under `/Volumes/tom-ssd/tmp/pi-41.2`, or `$RBF_CD_VERIFY_TMP`
+- Global installation: `cp ./extensions/rbf-cd.ts ~/.pi/agent/extensions/rbf-cd.ts` and `cp ./extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-background-tasks.ts`, then start Pi or run `/reload`
+- Removal: `rm -f ~/.pi/agent/extensions/rbf-cd.ts`. Moved conversations are ordinary Pi session files that stock Pi opens in their directory

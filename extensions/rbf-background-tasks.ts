@@ -35,6 +35,9 @@ export const DEFAULT_LOG_BASE_DIR = "/tmp/pi-tasks";
 export const BACKGROUND_TASKS_STATUS_KEY = "rbf-background-tasks";
 export const TASK_ID_LENGTH = 8;
 
+/** `rbf-cd.ts` asks this before it switches sessions: the switch stops every tracked task and aborts a running command. */
+export const BUSY_QUERY_CHANNEL = "rbf-background-tasks:busy/v1";
+
 export const BASH_EXECUTION_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.bashExecutionPatched");
 export const LOADER_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.loaderPatched");
 export const TOOL_EXECUTION_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.toolExecutionPatched");
@@ -70,6 +73,13 @@ export interface ActiveForegroundExecution {
 	task: BackgroundTask;
 	detach: () => void;
 	abort: () => void;
+}
+
+/** Filled in by the listener before `emit` returns. Flags are only ever raised, so a second listener can't hide running work. */
+export interface BusyQuery {
+	answered?: boolean;
+	backgroundTask?: boolean;
+	command?: boolean;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1517,6 +1527,20 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 	// Patch FooterComponent to render task count to right of stats line
 	patchFooterComponent(taskManager, () => getIsFooterSelected());
 
+	// ─── Busy query ───────────────────────────────────────────────────────────
+
+	// Another extension can't import this task manager: a bare import may reach a different module instance.
+	const stopAnsweringBusyQuery =
+		typeof pi.events?.on === "function"
+			? pi.events.on(BUSY_QUERY_CHANNEL, (data) => {
+					const query = data as BusyQuery;
+					query.answered = true;
+					if (taskManager.getRunningTasks().length > 0) query.backgroundTask = true;
+					// A `!` command or the agent's bash tool, still in the foreground.
+					if (taskManager.getActiveForeground()) query.command = true;
+				})
+			: undefined;
+
 	// ─── Agent bash tool registration ─────────────────────────────────────────
 
 	let currentSessionCtx: ExtensionContext | null = null;
@@ -1833,6 +1857,7 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 	// ─── Session Shutdown Cleanup ─────────────────────────────────────────────
 
 	pi.on("session_shutdown", async () => {
+		stopAnsweringBusyQuery?.();
 		unpatchBashExecutionComponent();
 		unpatchFooterComponent();
 		taskManager.stopAllTasks();

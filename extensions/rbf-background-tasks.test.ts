@@ -7,6 +7,7 @@ import {
 	applyElapsedHint,
 	BASH_EXECUTION_PATCHED_KEY,
 	BACKGROUND_TASKS_STATUS_KEY,
+	BUSY_QUERY_CHANNEL,
 	calculateBadgeBounds,
 	createBackgroundableOperations,
 	createTasksModalComponent,
@@ -38,8 +39,9 @@ import {
 	unpatchFooterComponent,
 	updateFooterBadge,
 	type BackgroundTask,
+	type BusyQuery,
 } from "./rbf-background-tasks.ts";
-import { BashExecutionComponent, FooterComponent, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, createEventBus, FooterComponent, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 
 describe("rbf-background-tasks", () => {
@@ -960,6 +962,54 @@ describe("rbf-background-tasks", () => {
 			expect(commands.has("bashes")).toBe(true);
 			expect(commands.has("cancel")).toBe(true);
 			expect(commands.has("kill")).toBe(true);
+		});
+
+		it("answers the busy query for a foreground command and a tracked task, and stops answering on shutdown", async () => {
+			const eventHandlers = new Map<string, Function>();
+			const events = createEventBus();
+			const mockPi: any = {
+				events,
+				on: vi.fn((event: string, handler: Function) => {
+					eventHandlers.set(event, handler);
+				}),
+				registerCommand: vi.fn(),
+			};
+			const ask = (): BusyQuery => {
+				const query: BusyQuery = {};
+				events.emit(BUSY_QUERY_CHANNEL, query);
+				return query;
+			};
+			expect(BUSY_QUERY_CHANNEL).toBe("rbf-background-tasks:busy/v1");
+			expect(ask()).toEqual({});
+
+			rbfBackgroundTasks(mockPi);
+			expect(ask()).toEqual({ answered: true });
+
+			// A `!` command in the foreground.
+			const mockCtx: any = { ui: { setStatus: vi.fn() }, sessionManager: { getSessionId: () => "sess-busy" } };
+			const { operations } = await eventHandlers.get("user_bash")!({ command: "sleep 10" }, mockCtx);
+			const running = operations.exec("sleep 10", tempDir, { onData: vi.fn() });
+			await new Promise((r) => setTimeout(r, 100));
+			expect(ask()).toEqual({ answered: true, command: true });
+
+			// The same command, moved to the background: now a tracked task and no longer a foreground command.
+			getActiveTaskManager()!.detachActiveForeground();
+			await running;
+			expect(ask()).toEqual({ answered: true, backgroundTask: true });
+
+			// A flag another listener raised is never lowered.
+			const raised: BusyQuery = { command: true };
+			events.emit(BUSY_QUERY_CHANNEL, raised);
+			expect(raised).toEqual({ answered: true, backgroundTask: true, command: true });
+
+			await eventHandlers.get("session_shutdown")!();
+			expect(ask()).toEqual({});
+		});
+
+		it("loads on a Pi that has no event bus", () => {
+			const mockPi: any = { on: vi.fn(), registerCommand: vi.fn() };
+
+			expect(() => rbfBackgroundTasks(mockPi)).not.toThrow();
 		});
 
 		it("session_start wires onTerminalInput to intercept Ctrl+B when active task exists", async () => {
