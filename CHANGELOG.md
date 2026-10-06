@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.27.0 (2026-10-06)
+## 🟠⋯ Added for End Users
+- 2026-10-06 - feat | scan agent shell activity as a command count and expand to inspect commands: shell commands an agent runs one after another now show as one line, such as `▸ ran 3 shell commands · 1 failed`, instead of a row per command. Click the line in fullscreen, or press Ctrl+O in either mode, to see the same command rows and results as before. The line names what needs attention while closed: `running`, `background` with its Task ID, `failed`, `cancelled`, `not run`. Covers Pi's own bash and Codex commands run through Pi. After you quit and reopen a session the groups read `status unknown`, because Pi no longer holds proof of how each command ended. A click on a command inside an open group does nothing, so links and text selection work as before. Needs three files installed together and a Pi restart. Unchanged: sandbox sessions, `!` and `!!` commands, nested calls, what runs and what is saved. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, light and monochrome themes, and telling a sub-agent's count from its parent's (#pi-42)
+
+---
+
 # 🔵⋯ v0.26.0 (2026-10-05)
 ## 🟠⋯ Added for End Users
 - 2026-10-05 - feat (ux) | see how long ago I sent my last message in the status bar: the footer's token row now starts with `💬` and the age of your last message, as `💬 <1m` for the first minute, then minutes, hours and days. It updates once a minute and counts time away after a resume. A message you queue while Pi works keeps the earlier age on screen until Pi delivers it, then shows its own age with the wait included. `💬 ?` means the message's time could not be read. The cue hides when the token row has no room for it. Needs a full Pi restart to load; a Pi that was already running shows no cue and warns once to restart. Not yet run: opposite-order delivery of two queued messages, native dequeue, input held during compaction, and a Codex conversation (#pi-43)

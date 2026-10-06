@@ -4,6 +4,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 ## Extensions
 
+- [`rbf-shell-command-groups`](extensions/rbf-shell-command-groups.ts) (v0.27.0) — Scan an agent's shell commands as one count line, such as `▸ ran 3 shell commands · 1 failed`, and open it to see each command and result. Pi's own bash and Codex through Pi; sandbox sessions, `!` commands and nested calls keep their rows. [Install and roll back](extensions/README.md#-rbf-shell-command-groups)
 - [`rbf-tool-parts-indent`](extensions/rbf-tool-parts-indent.ts) (v0.25.0) — Lines under a tool call's or a `!` command's header hang 3 columns in, under a branch. [Install and roll back](extensions/README.md#-rbf-tool-parts-indent)
 - [`rbf-cd`](extensions/rbf-cd.ts) (v0.24.0) — Use `/cd <path>` to move the running conversation to another directory and reopen it there; ordinary Pi sessions, not yet Codex conversations. [Activation and limits](extensions/README.md#-rbf-cd).
 - [`rbf-path-labels`](extensions/rbf-path-labels.ts) (v0.22.0) — Fit assistant file references and native full-path labels within their pane; keep original targets, source text and completion values. [Activation and recovery](extensions/README.md#-rbf-path-labels).

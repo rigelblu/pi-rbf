@@ -660,3 +660,41 @@ Activation and rollback both need a restart of Pi. `/reload` is not enough: `rbf
 What it leaves alone: headers, a `!` row's two border lines, the skill row, images in a tool result, and a tool row that has no renderer. In a pane narrower than 20 columns no row is indented. Text copied from the screen carries the indent, and `/copy` does not, because nothing drawn reaches the saved session. If a row can't be drawn indented without running past the pane's edge, or a piece throws, that row draws as it does without the extension.
 
 To check it locally, start Pi with the extension, ask for `seq 1 12`, and type `!seq 1 30` yourself: in both rows the numbers hang under the `$` header with a `└` on the first. To try it without installing, and without touching your own Pi settings, run `PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions -e extensions/rbf-tool-execution-blended.ts -e extensions/rbf-edit-glance.ts -e extensions/rbf-clean-markdown-code.ts -e extensions/rbf-tool-parts-indent.ts` from the checkout, then type `!seq 1 30`. Pi writes its settings into its agent directory on start, so the command gives it a throwaway one. That profile has no model signed in, so only `!` commands can be tried this way. Run `bun run test -- extensions/rbf-tool-parts-indent.test.ts extensions/rbf-tool-parts-indent-pty.test.ts` and `bun run typecheck` from a checkout with its pinned dependencies installed. Rows are verified by captures from checkout Pi 0.85.1 and daily Pi 1.0.2 at 100 and 60 columns; other Pi versions are not.
+
+# 🔵⋯ rbf-shell-command-groups
+
+Introduced in pi-rbf v0.27.0 (pi-42.1). Shell commands an agent runs one after another show as one line with a count, and the commands themselves are hidden until you open it:
+```
+ ▸ ran 3 shell commands · 1 failed
+```
+```
+ ▾ ran 3 shell commands · 1 failed
+ $ pwd
+ └  /Users/me/project
+ $ printf SHELL-CHECK
+ └  SHELL-CHECK
+ $ exit 7
+ └  (no output)
+    Command exited with code 7
+```
+The open view is drawn with `rbf-tool-parts-indent` loaded. Without it the results sit flush under each command, with no `└`.
+
+- The count is the number of shell commands the agent started in a row. Text from the agent, or any other tool call, ends a group and the next command starts a new one
+- The closed line names what needs attention: `running 1 shell command`, `1 shell command · background` with a `Task ID:` line under it, `1 failed`, cancelled and not-run commands
+- Open and close a group by clicking its line in fullscreen mode. Ctrl+O opens and closes every group and tool row, in fullscreen and regular mode. A click on a command inside an open group does nothing, so links and text selection work as they do on any row
+- Opening a group shows Pi's own command rows and results, unchanged. Nothing about what runs, or what is saved in the session, changes
+- After you quit and reopen a session, groups read `status unknown`, for example `3 shell commands · 1 error (status unknown) · 2 unknown`. Pi no longer holds proof of how those commands ended, so it doesn't claim they ran. A Codex command whose saved record carries a numeric exit code keeps its result
+- Covered: Pi's own bash tool and Codex commands run through `rbf-codex`. Not covered, and drawn as before: a session started with `--sandbox`, commands you type with `!` or `!!`, and shell calls nested inside another tool
+- Ctrl+B still sends Pi's own running bash command to the background. It does not control Codex commands
+- If grouping can't attach to this Pi, rows stay as they were and one warning says `Shell command groups unavailable; showing native tool rows.`
+
+Install the three files together, then quit Pi and start it again. The view needs this checkout's `rbf-background-tasks.ts` and `rbf-codex.ts`, which tell it how each command ended; with older copies of those two, rows stay as they were:
+```sh
+mkdir -p /Volumes/tom-ssd/tmp/pi-42/backup && command cp -f ~/.pi/agent/extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-codex.ts /Volumes/tom-ssd/tmp/pi-42/backup/
+command cp -f ./extensions/rbf-shell-command-groups.ts ./extensions/rbf-background-tasks.ts ./extensions/rbf-codex.ts ~/.pi/agent/extensions/
+```
+To roll back the display only, run `rm -f ~/.pi/agent/extensions/rbf-shell-command-groups.ts` and restart Pi. The two updated files can stay: without the view they only keep a small in-memory record that nothing reads. To roll back all three, also run `command cp -f /Volumes/tom-ssd/tmp/pi-42/backup/rbf-background-tasks.ts /Volumes/tom-ssd/tmp/pi-42/backup/rbf-codex.ts ~/.pi/agent/extensions/`, unless either file has been updated again since.
+
+To try it without installing, and without touching your own Pi settings, run `PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions -e extensions/rbf-shell-command-groups.ts -e extensions/rbf-background-tasks.ts -e extensions/rbf-codex.ts -e extensions/rbf-tool-parts-indent.ts --tui-mode fullscreen` from the checkout. That profile has no model signed in; pick a `[codex-harness]` model if the Codex CLI is logged in.
+
+Verified on Pi 0.85.1 and 1.0.3. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, and light or monochrome themes.
