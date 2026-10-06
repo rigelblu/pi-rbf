@@ -387,6 +387,20 @@ describe("/cd refusals", () => {
 			}),
 		],
 		[
+			"a watch is running",
+			() => ({
+				options: { answer: { watch: true } },
+				copy: "Can't change directory while a watch is running. Stop it with /monitors stop all, then retry /cd.",
+			}),
+		],
+		[
+			"a tracked background task and a watch are both running",
+			() => ({
+				options: { answer: { backgroundTask: true, watch: true } },
+				copy: "Can't change directory while a background task is running. Finish or stop it, then retry /cd.",
+			}),
+		],
+		[
 			"a ! or foreground command is running",
 			() => ({
 				options: { answer: { command: true } },

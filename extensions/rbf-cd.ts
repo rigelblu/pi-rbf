@@ -23,7 +23,7 @@ const CODEX_THREAD_ENTRY_TYPE = "rbf-codex-thread/v1";
 
 /** Answered by `rbf-background-tasks.ts`, which fills the payload in before `emit` returns. */
 export const CD_BUSY_QUERY_CHANNEL = "rbf-background-tasks:busy/v1";
-export type BusyQuery = { answered?: boolean; backgroundTask?: boolean; command?: boolean };
+export type BusyQuery = { answered?: boolean; backgroundTask?: boolean; command?: boolean; watch?: boolean };
 
 /** The move in flight, from just before the switch until `/cd` returns. The re-created extension instance reads it. */
 export const CD_PENDING_MOVE_KEY = Symbol.for("rbf.cd.pendingMove");
@@ -63,6 +63,7 @@ const COPY = {
 	busyResponse: "Can't change directory while a response or compaction is running. Finish or stop it, then retry /cd.",
 	busyMove: "A directory change is already in progress. Wait for it to finish, then retry /cd.",
 	busyBackgroundTask: "Can't change directory while a background task is running. Finish or stop it, then retry /cd.",
+	busyWatch: "Can't change directory while a watch is running. Stop it with /monitors stop all, then retry /cd.",
 	busyCommand: "Can't change directory while a command is running. Wait for it to finish or stop it, then retry /cd.",
 	pathMissing: (path: string) => `Can't change directory: path does not exist: ${path}.`,
 	pathNotDirectory: (path: string) => `Can't change directory: not a directory: ${path}.`,
@@ -295,6 +296,7 @@ function rbfCd(pi: ExtensionAPI, deps: CdDeps): void {
 		pi.events.emit(CD_BUSY_QUERY_CHANNEL, busy);
 		if (!busy.answered) return warn(COPY.noAnswer(ctx.cwd));
 		if (busy.backgroundTask) return warn(COPY.busyBackgroundTask);
+		if (busy.watch) return warn(COPY.busyWatch);
 		if (busy.command) return warn(COPY.busyCommand);
 
 		if (entries.some((entry) => entry.type === "custom" && entry.customType === CODEX_THREAD_ENTRY_TYPE)) return warn(COPY.codex(ctx.cwd));
