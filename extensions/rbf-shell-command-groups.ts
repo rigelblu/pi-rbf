@@ -27,7 +27,6 @@ export type ShellMember = {
 	threadId?: string;
 	agentPath?: string;
 	cwd: string;
-	command: string;
 	/** Pi's own row. The group draws it and never copies its output. */
 	nativeRow: unknown;
 	executionEvidence: ExecutionEvidence;
@@ -73,7 +72,6 @@ export type OwnerEvidence = {
 
 /**
  * What an owner saw, as it saw it and as it publishes it. The reducer decides what it proves.
- * - `host`: what Pi did around the command. None of it is evidence
  * - `start`: the owner confirmed the spawn, or Codex admitted the item's start
  * - `background`: Pi's detach. The tool returned and the process runs on under this task id
  * - `cut`: a Codex command's row was cut by an interruption. Codex doesn't kill it, so it runs on under this item id, if it had started
@@ -85,7 +83,6 @@ export type OwnerEvidence = {
  * - `lost`: the owner was replaced, closed or reloaded, or a completion named another thread
  */
 export type OwnerFact =
-	| { kind: "host"; event: "row-open" | "partial" | "output" | "approval-open" | "approval-accepted" | "agent-end" }
 	| { kind: "start" }
 	| { kind: "background"; identity: string }
 	| { kind: "cut"; identity: string }
@@ -117,13 +114,14 @@ function closeOutcome(prev: OwnerEvidence, fact: { code: number | null; signal?:
 }
 
 /**
- * A numeric exit decides: nonzero failed, even beside `completed`, the status the native row defaults to. Exit 0 beside `failed`, and any exit beside `declined`, contradict.
+ * A numeric exit decides: nonzero failed, even beside `completed`, the status the native row defaults to. Exit 0 beside a status that is there and is not `completed`,
+ * and any exit beside `declined`, contradict.
  * With no exit only an explicit `failed` or `declined` decides: `completed` alone proves nothing.
  */
 function completionOutcome(prev: OwnerEvidence, fact: { exitCode?: unknown; status?: unknown }): Outcome {
 	if (Number.isInteger(fact.exitCode)) {
 		if (fact.status === "declined") return "conflict";
-		if (fact.exitCode === 0) return fact.status === "failed" ? "conflict" : "succeeded";
+		if (fact.exitCode === 0) return fact.status === undefined || fact.status === null || fact.status === "completed" ? "succeeded" : "conflict";
 		return "failed";
 	}
 	if (fact.status === "failed") return "failed";
@@ -152,8 +150,6 @@ function settle(prev: OwnerEvidence, outcome: Outcome, started: boolean): OwnerE
 export function reduceEvidence(prev: OwnerEvidence, fact: OwnerFact): OwnerEvidence {
 	const state = prev.executionEvidence.state;
 	switch (fact.kind) {
-		case "host":
-			return prev;
 		case "start":
 			// A start can't revive a member that ended or went unknown, and can't pull one back from the background.
 			if (state === "waiting") return { ...prev, executionEvidence: { state: "running" }, executionStarted: true };
@@ -180,6 +176,32 @@ export function reduceEvidence(prev: OwnerEvidence, fact: OwnerFact): OwnerEvide
 			return settle(prev, prev.executionStarted ? "conflict" : "notRun", false);
 		case "completion":
 			return settle(prev, completionOutcome(prev, fact), Number.isInteger(fact.exitCode));
+		default:
+			// A newer owner may tell a kind of fact this view was not written for. It proves nothing here.
+			return prev;
+	}
+}
+
+/** Whether a fact is one of the kinds above, with the fields its kind needs. Anything else an owner sends is ignored, not folded. */
+export function isOwnerFact(fact: unknown): fact is OwnerFact {
+	if (!fact || typeof fact !== "object") return false;
+	const told = fact as Record<string, unknown>;
+	switch (told.kind) {
+		case "start":
+		case "child-error":
+		case "not-run":
+		case "completion":
+		case "lost":
+			return true;
+		case "background":
+		case "cut":
+			return typeof told.identity === "string" && told.identity !== "";
+		case "stop-request":
+			return told.reason === "cancel" || told.reason === "timeout";
+		case "close":
+			return told.code === null || typeof told.code === "number";
+		default:
+			return false;
 	}
 }
 
@@ -206,22 +228,8 @@ export function replayEvidence(source: ShellSource, record: ReplayRecord | undef
 
 // ── grouping ──
 
-/** What a transcript row that is not a grouped shell call is. `tool` is any other tool row, a shell row with no declared owner included. `user` is a delivered message; queued input is not in the transcript. */
-export type ContentKind =
-	| "text"
-	| "thinking"
-	| "tool"
-	| "user"
-	| "diagnostic"
-	| "cache-miss"
-	| "usage"
-	| "custom"
-	| "compaction"
-	| "session"
-	| "branch";
-
-/** One row of the transcript in drawn order. `visible` is false for a row that draws no line, as a tool-only assistant placeholder does. */
-export type TranscriptRow = { kind: "shell"; member: ShellMember } | { kind: "content"; what: ContentKind; visible: boolean };
+/** One row of the transcript in drawn order: a grouped shell call, or anything else. `visible` is false for a row that draws no line, as a tool-only assistant placeholder does. */
+export type TranscriptRow = { kind: "shell"; member: ShellMember } | { kind: "content"; visible: boolean };
 
 /** Two adjacent calls share a group only within one session, source, agent and working directory. */
 function sameRun(a: ShellMember, b: ShellMember): boolean {
@@ -662,8 +670,10 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	let sessionId: string | undefined;
 	let stopListening: (() => void) | undefined;
 	let warningHeld = false;
+	/** Why the view let go, if it did: the error, and which of its own steps met it. Kept for whoever has to find out; never printed. */
+	let fault: { where: string; error: unknown } | undefined;
 	const announcements = new Map<ShellSource, Announcement>();
-	/** Rows Pi rebuilt from history. Their calls are over, whatever `pendingTools` holds. */
+	/** Rows Pi rebuilt from history, for calls that were not open when it rebuilt them. Those calls are over, whatever `pendingTools` holds. */
 	let restored = new WeakSet<object>();
 	let rowOf = new Map<string, any>();
 	let idOf = new Map<any, string>();
@@ -719,9 +729,10 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	}
 
 	/** The groups can't go on: every call goes to Pi from now, the frame redraws natively, and one warning says so. */
-	function fail(): void {
+	function fail(where: string, error: unknown): void {
 		if (inert) return;
 		inert = true;
+		fault = { where, error };
 		layout = undefined;
 		armed = undefined;
 		const ui = host?.ui;
@@ -733,12 +744,12 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	}
 
 	/** Runs view-only work. A throw here is the view's fault, never Pi's, and ends the view rather than the call. */
-	function guard(work: () => void): void {
+	function guard(where: string, work: () => void): void {
 		if (inert) return;
 		try {
 			work();
-		} catch {
-			fail();
+		} catch (error) {
+			fail(where, error);
 		}
 	}
 
@@ -770,7 +781,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 			typeof self.toolOutputExpanded === "boolean" &&
 			typeof self.ui?.requestRender === "function";
 		if (!supported || !CONTAINER_METHODS.every((name) => installWrapper(chat, name))) {
-			fail();
+			fail("capture", new Error("InteractiveMode does not have the transcript container, pending tools, expansion flag or redraw request the view reads"));
 			return;
 		}
 		if (container && container !== chat) for (const name of CONTAINER_METHODS) removeWrapper(container, name);
@@ -811,7 +822,6 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 				threadId: codex && typeof args.threadId === "string" ? args.threadId : undefined,
 				agentPath: codex && typeof args.agentPath === "string" ? args.agentPath : undefined,
 				cwd: String((codex && typeof args.cwd === "string" && args.cwd) || row.cwd || ""),
-				command: typeof args.command === "string" ? args.command : "",
 				nativeRow: row,
 				...NO_EVIDENCE,
 				rowError: false,
@@ -918,9 +928,12 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 				view.owners.delete(source);
 				requestRender();
 				break;
-			case "fact":
-				if (applyEvidence(view, message as FactMessage)) requestRender();
+			case "fact": {
+				const told = message as Partial<FactMessage>;
+				if (typeof told.toolCallId !== "string" || typeof told.revision !== "number" || !isOwnerFact(told.fact)) return;
+				if (applyEvidence(view, told as FactMessage)) requestRender();
 				break;
+			}
 		}
 	}
 
@@ -933,7 +946,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		const rows: TranscriptRow[] = entries.map((entry) =>
 			entry.announced
 				? { kind: "shell", member: candidateFor(entry.child, entry.announced) }
-				: { kind: "content", what: entry.child instanceof ToolExecutionComponent ? "tool" : "text", visible: entry.lines!.length > 0 },
+				: { kind: "content", visible: entry.lines!.length > 0 },
 		);
 		reconcileMembership(view, rows, host.toolOutputExpanded === true);
 		const known = rowOf;
@@ -1046,7 +1059,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 			return project(width);
 		} catch (error) {
 			if (error instanceof NativeFault) throw error.error;
-			fail();
+			fail("render", error);
 			return original.call(self, width);
 		}
 	}
@@ -1076,7 +1089,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		} catch (error) {
 			if (error instanceof NativeFault) throw error.error;
 			// The click was aimed at a frame that can't be trusted any more: drop it, don't replay it against native rows.
-			fail();
+			fail("mouse", error);
 			return { handled: true };
 		}
 	}
@@ -1096,17 +1109,20 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	function afterEvent(event: any): void {
 		if (!host || !event) return;
 		if (typeof event.toolCallId === "string") refresh(idOfCall.get(event.toolCallId));
-		else if (event.type === "agent_end" || event.type === "agent_start") {
+		// A message that ends in an error or an abort closes its calls there, without an event of their own.
+		else if (event.type === "message_end" || event.type === "agent_end" || event.type === "agent_start") {
 			for (const [id, member] of view.members) if (member.callOpen) refresh(id);
 		}
 	}
 
 	/** Marks the rows a replay built, and lets a rebuilt transcript take its disclosure from the global setting again. */
-	function afterReplay(before: Set<unknown>): void {
+	function afterReplay(before: Set<unknown>, open: Set<string>): void {
 		if (!container) return;
 		const now = new Set<unknown>(container.children);
 		for (const child of now) {
-			if (!before.has(child) && child instanceof ToolExecutionComponent) restored.add(child);
+			if (before.has(child) || !(child instanceof ToolExecutionComponent)) continue;
+			// A row of history is over. A row Pi rebuilt for a call that was open a moment ago is that call, still open.
+			if (!open.has((child as any).toolCallId)) restored.add(child);
 		}
 		let kept = false;
 		for (const row of rowOf.values()) kept ||= now.has(row);
@@ -1137,24 +1153,29 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 					return self === container ? mouse(self, original, args[0]) : original.apply(self, args);
 				case "setToolsExpanded": {
 					const result = original.apply(self, args);
-					guard(() => {
+					guard("setToolsExpanded", () => {
 						capture(self);
 						if (self === host) mirrorExpansion(args[0] === true);
 					});
 					return result;
 				}
 				case "renderSessionItems": {
-					guard(() => capture(self));
+					guard("capture", () => capture(self));
 					const before = new Set<unknown>(self === host ? container.children : []);
+					// Calls still open before the rebuild stay open after it: Pi puts their new rows back among its pending tools.
+					const open = new Set<string>();
+					if (self === host) guard("renderSessionItems", () => {
+						for (const [id, row] of host.pendingTools) if (!restored.has(row)) open.add(id);
+					});
 					const result = original.apply(self, args);
-					if (self === host) guard(() => afterReplay(before));
+					if (self === host) guard("renderSessionItems", () => afterReplay(before, open));
 					return result;
 				}
 				case "handleEvent": {
-					guard(() => capture(self));
+					guard("capture", () => capture(self));
 					const result = original.apply(self, args);
 					const after = () => {
-						if (self === host) guard(() => afterEvent(args[0]));
+						if (self === host) guard("handleEvent", () => afterEvent(args[0]));
 					};
 					if (result && typeof result.then === "function") {
 						return result.then((value: unknown) => {
@@ -1166,7 +1187,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 					return result;
 				}
 				default:
-					guard(() => capture(self));
+					guard("capture", () => capture(self));
 					return original.apply(self, args);
 			}
 		},
@@ -1178,7 +1199,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 				warningHeld = false;
 				warn();
 			}
-			guard(() => {
+			guard("session_start", () => {
 				let id: string | undefined;
 				try {
 					id = context.sessionManager.getSessionId();
@@ -1189,7 +1210,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 					view = createShellView();
 					signature = [];
 				}
-				if (typeof pi.events?.on === "function") stopListening ??= pi.events.on(SHELL_DISPLAY_CHANNEL, (data) => guard(() => onMessage(data)));
+				if (typeof pi.events?.on === "function") stopListening ??= pi.events.on(SHELL_DISPLAY_CHANNEL, (data) => guard("message", () => onMessage(data)));
 				requestSnapshot();
 			});
 		},
@@ -1208,15 +1229,16 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		get state(): ShellView {
 			return view;
 		},
-		get attached(): boolean {
-			return !inert && !stopped && host !== undefined;
+		/** Why this view let go and draws nothing, when a fault made it. Undefined while it works, and after an ordinary stop. */
+		get fault(): { where: string; error: unknown } | undefined {
+			return fault;
 		},
 	};
 
 	// Attach: the newest view is the live one. A host without the four methods is one this view can't follow.
 	(globalThis as any)[VIEW_KEY] = api;
 	const prototype = (InteractiveMode as any)?.prototype;
-	if (!prototype || !HOST_METHODS.every((name) => installWrapper(prototype, name))) fail();
+	if (!prototype || !HOST_METHODS.every((name) => installWrapper(prototype, name))) fail("attach", new Error("InteractiveMode does not have the four methods the view wraps"));
 	return api;
 }
 

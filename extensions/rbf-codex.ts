@@ -1031,10 +1031,9 @@ export function createShellDisplayOwner<Fact extends { kind: string }>(
 	};
 }
 
-
 // ── the Codex side of one turn, across every streamSimple call and tool execution it spans ──
 type UserInputItem = { type: "text"; text: string; text_elements: [] } | { type: "image"; url: string };
-type TurnItem = { kind: RowKind; threadId: string; agentPath: string; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec; server?: string; tool?: string; arguments?: unknown; appName?: string; answered?: Answer; aborted?: boolean; display?: CodexDisplayCall };
+type TurnItem = { kind: RowKind; threadId: string; agentPath: string; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec; server?: string; tool?: string; arguments?: unknown; appName?: string; answered?: Answer; aborted?: boolean; display?: CodexDisplayCall; /** Display only: Pi called this row's execute, which reports its own ending. */ executed?: boolean };
 /** A sub-agent Codex announced on this turn; `turnId` is known once its `turn/started` arrives (a live parent re-drives an interrupted child with a new turn on the same thread). */
 type ChildThread = { turnId: string | null; agentPath: string };
 type PendingRequest = { id: number | string; method: string; params: Rec; kind: RequestKind; itemId: string };
@@ -1148,6 +1147,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				const call = displayCallFor(client, itemId, it, rootThreadId);
 				if (call?.started) displayLost(call);
 				else call?.tell({ kind: "not-run" });
+			} catch {}
+		}
+		/** The turn ended. A command that started and whose row Pi never executed has no execute left to say how it went: nobody watches it now. */
+		function displayTurnEnded(items: Iterable<TurnItem>): void {
+			try {
+				for (const it of items) {
+					if (it.display?.started && !it.completed && !it.executed) displayLost(it.display);
+				}
 			} catch {}
 		}
 		/** The client is gone, and with it the only owner that could say how its open commands ended. */
@@ -1268,6 +1275,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				for (const req of this.requests.splice(0)) this.client.respondError(req.id, "pi-rbf-codex: the turn ended before this request could be asked");
 				this.endController.abort();
 				for (const fn of this.endWaiters.splice(0)) fn();
+				displayTurnEnded(this.items.values());
 				this.push({ kind: "end", status: end.status, error: end.error });
 			}
 
@@ -1980,6 +1988,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			const it = turn?.items.get(itemId);
 			// Thrown, not returned: Pi tints only a thrown error and hands the model an error result, so a model that calls this tool by hand learns at once (human check 2026-09-14: a returned `isError` drew as success).
 			if (!turn || !it) throw new RowError("No active Codex turn holds this item; this tool cannot be called directly.");
+			it.executed = true;
 			const onAbort = () => void turn.interrupt();
 			signal?.addEventListener("abort", onAbort, { once: true });
 			if (kind === "commandExecution" || kind === "mcpToolCall") onUpdate?.(textResult("", { itemId, status: "inProgress" })); // Pi's bash row does the same, so `Elapsed` shows before any output

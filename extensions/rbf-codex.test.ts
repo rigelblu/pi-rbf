@@ -2941,12 +2941,13 @@ describe("rbf-codex", () => {
 			return { ...b, events, seen, facts, told, identity, drive, options };
 		}
 
-		/** Start the turn's first row, then cut it with Pi's abort as Escape does. */
-		async function cutFirstRow(b: Awaited<ReturnType<typeof watched>>, text = "wait") {
+		/** Start the turn's first row, then cut it with Pi's abort as Escape does: once `ready` holds, or after a moment. */
+		async function cutFirstRow(b: Awaited<ReturnType<typeof watched>>, text = "wait", ready?: () => void) {
 			const first = await b.turn(text);
 			const ac = new AbortController();
 			const row = b.exec(first.toolCall!, { signal: ac.signal });
-			await sleep(50);
+			if (ready) await vi.waitFor(ready);
+			else await sleep(50);
 			ac.abort();
 			const error = await row.then(() => undefined, (e) => e as Error);
 			await b.turn([userMessage(text), first.final!], model(), { signal: ac.signal });
@@ -3102,11 +3103,13 @@ describe("rbf-codex", () => {
 			it("Escape on an approval that never started: not run, then the cut, which names the item but admits no start", async () => {
 				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'touch /etc/x'", approvals: [{ when: "before" }] }, { kind: "hang" }] });
 				const b = await watched();
-				const { error } = await cutFirstRow(b, "go");
+				// Escape lands while the dialog is open. Earlier than that there is no dialog to close and no refusal to tell, only the cut.
+				const { error } = await cutFirstRow(b, "go", () => expect(b.dialogs).toHaveLength(1));
 				expect(error?.message).toContain(ROW_STATUS.aborted);
 				// The abort ends the turn, the ended turn closes the dialog, and `answerRequest` answers Codex `decline` for it: the owner itself refused the command.
-				const approvalReplies = sent().filter((m) => m.id !== undefined && !m.method && (m as any).result?.decision !== undefined);
-				expect(approvalReplies.map((m) => (m as any).result)).toEqual([{ decision: "decline" }]);
+				// The fake logs a reply when it reads it, a moment after Pi wrote it.
+				const approvalReplies = () => sent().filter((m) => m.id !== undefined && !m.method && (m as any).result?.decision !== undefined).map((m) => (m as any).result);
+				await vi.waitFor(() => expect(approvalReplies()).toEqual([{ decision: "decline" }]));
 				expect(b.dialogs).toHaveLength(1);
 				expect(b.told("codex-c1")).toEqual([{ kind: "not-run" }, { kind: "cut", identity: "c1" }]);
 				// The view reads the pair as not run: the cut adds nothing to a command its owner refused.
@@ -3202,6 +3205,47 @@ describe("rbf-codex", () => {
 					{ ...b.identity("codex-c2"), revision: 1, fact: { kind: "start" } },
 					{ ...b.identity("codex-c2"), revision: 2, fact: { kind: "completion", exitCode: 0, status: "completed" } },
 				]);
+			});
+
+			it("a start that names the item on another thread than the one it was first seen on is not this command's start", async () => {
+				// The root's approval opens the row for c1. While its dialog is open, an admitted child's turn reports an item with the same id as started.
+				scenario({
+					turn: [
+						{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+						{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", detached: true, events: [{ kind: "sleep", ms: 80 }, { kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }] },
+						{ kind: "command", id: "c1", command: SLEEP, approvals: [{ when: "before", command: SLEEP }] },
+						{ kind: "hang" },
+					],
+				});
+				const b = await watched();
+				const first = await b.turn("go");
+				expect(first.toolCall!.arguments).toMatchObject({ itemId: "c1", threadId: "" });
+				const row = b.exec(first.toolCall!).catch(() => undefined);
+				await vi.waitFor(() => expect(b.dialogs).toHaveLength(1));
+				await sleep(300);
+				// The root's command is still waiting on its approval: no start was told for it.
+				expect(b.told("codex-c1")).toEqual([]);
+				await b.shutdown();
+				await row;
+			});
+
+			it("a command that started and whose row Pi never executed has nobody watching it once its turn ends: the owner says so, and its late completion still lands", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "sleep", ms: 150 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] });
+				const b = await watched();
+				const first = await b.turn("wait");
+				expect(first.toolCall!.id).toBe("codex-c1");
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }]);
+				// Pi is interrupted before it executes the row: its next call arrives already aborted, and the turn ends.
+				const ac = new AbortController();
+				ac.abort();
+				const recall = await b.turn([userMessage("wait"), first.final!], model(), { signal: ac.signal });
+				expect(recall.final?.stopReason).toBe("aborted");
+				await vi.waitFor(() => expect(b.told("codex-c1").slice(0, 2)).toEqual([{ kind: "start" }, { kind: "lost" }]));
+				// The view reads that as unknown, not as still running.
+				expect(b.told("codex-c1").slice(0, 2).reduce(reduceEvidence, NO_EVIDENCE).executionEvidence).toEqual({ state: "unknown" });
+				// Codex still reports the command when it finishes, and that proves how it ended.
+				await vi.waitFor(() => expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "lost" }, { kind: "completion", exitCode: 0, status: "completed" }]));
+				expect(b.told("codex-c1").reduce(reduceEvidence, NO_EVIDENCE)).toEqual({ executionEvidence: { state: "succeeded" }, executionStarted: true });
 			});
 
 			it("a completion that names the item on another thread is not this command's: the owner stops vouching and tells no completion", async () => {

@@ -16,6 +16,7 @@ import rbfShellCommandGroups, {
 	CONTAINER_METHODS,
 	createShellGroupsView,
 	HOST_METHODS,
+	isOwnerFact,
 	isSandboxLaunch,
 	SHELL_DISPLAY_CHANNEL,
 	UNAVAILABLE_WARNING,
@@ -44,7 +45,6 @@ import {
 	wrapFields,
 } from "./rbf-shell-command-groups.ts";
 import type {
-	ContentKind,
 	EvidenceState,
 	FactMessage,
 	Field,
@@ -67,7 +67,6 @@ function member(state: EvidenceState, over: Partial<ShellMember> = {}): ShellMem
 		toolCallId: `call-${++calls}`,
 		source: "pi-bash",
 		cwd: "/work",
-		command: "pwd",
 		nativeRow: undefined,
 		executionEvidence: state === "background" ? { state, identity: "task-123" } : { state },
 		executionStarted: started,
@@ -105,7 +104,9 @@ function header(members: ShellMember[], expanded = false): string | undefined {
 }
 
 const shell = (m: ShellMember): TranscriptRow => ({ kind: "shell", member: m });
-const content = (what: ContentKind, visible = true): TranscriptRow => ({ kind: "content", what, visible });
+/** A row that is not a grouped shell call: one that draws lines, and one that draws none. */
+const drawn = (): TranscriptRow => ({ kind: "content", visible: true });
+const silent = (): TranscriptRow => ({ kind: "content", visible: false });
 const ids = (groups: ShellGroup[]): string[][] => groups.map((group) => group.memberIds);
 
 const START: OwnerFact = { kind: "start" };
@@ -114,7 +115,6 @@ const TIMEOUT: OwnerFact = { kind: "stop-request", reason: "timeout" };
 const KILLED: OwnerFact = { kind: "close", code: null, signal: "SIGTERM" };
 const exit = (code: number | null): OwnerFact => ({ kind: "close", code });
 const completion = (exitCode?: unknown, status?: unknown): OwnerFact => ({ kind: "completion", exitCode, status });
-const HOST_EVENTS = ["row-open", "partial", "output", "approval-open", "approval-accepted", "agent-end"] as const;
 
 const GENERATION = "pi-bash:gen-1";
 let revisions = 0;
@@ -410,7 +410,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 		});
 
 		describe("Counting invocations", () => {
-			const ran = (command: string, over: Partial<ShellMember> = {}) => member("succeeded", { command, ...over });
+			const ran = () => member("succeeded");
 			const headerOf = (rows: TranscriptRow[]) => {
 				const view = createShellView();
 				reconcileMembership(view, rows, false);
@@ -419,32 +419,22 @@ describe("extensions/rbf-shell-command-groups", () => {
 
 			it("no shell rows make no group", () => {
 				expect(groupRows([], [], false)).toEqual([]);
-				expect(groupRows([content("text"), content("tool")], [], false)).toEqual([]);
+				expect(groupRows([drawn(), drawn()], [], false)).toEqual([]);
 			});
 
-			it.each([["pwd"], ["python3 - <<'PY'\nimport os\nprint(os.getcwd())\nPY"], ["printf a; printf b"], ["ls | wc -l"]])(
-				"%j is one invocation",
-				(command) => {
-					expect(headerOf([shell(ran(command))])).toEqual(["▸ ran 1 shell command"]);
-				},
-			);
-
-			it("three calls are three", () => {
-				const rows = [shell(ran("pwd")), shell(ran("python3 - <<'PY'\nprint(1)\nPY")), shell(ran("printf a; printf b"))];
-				expect(headerOf(rows)).toEqual(["▸ ran 3 shell commands"]);
+			// The rules never see a command's text: a member is a call id. What a heredoc or a pipeline counts as is asked of real rows, under "real commands" below.
+			it("one call is one, and three calls are three", () => {
+				expect(headerOf([shell(ran())])).toEqual(["▸ ran 1 shell command"]);
+				expect(headerOf([shell(ran()), shell(ran()), shell(ran())])).toEqual(["▸ ran 3 shell commands"]);
 			});
 
 			it("one running of three reads 3 shell commands · 1 running", () => {
-				expect(headerOf([shell(ran("pwd")), shell(ran("ls")), shell(member("running"))])).toEqual(["▸ 3 shell commands · 1 running"]);
-			});
-
-			it("the same command text under different ids counts each id", () => {
-				expect(headerOf([shell(ran("pwd")), shell(ran("pwd")), shell(ran("pwd"))])).toEqual(["▸ ran 3 shell commands"]);
+				expect(headerOf([shell(ran()), shell(ran()), shell(member("running"))])).toEqual(["▸ 3 shell commands · 1 running"]);
 			});
 
 			it("a row seen twice for one id counts once", () => {
-				const a = ran("pwd");
-				const b = ran("pwd");
+				const a = ran();
+				const b = ran();
 				const again = { ...a };
 				expect(headerOf([shell(a), shell(again), shell(b), shell(a)])).toEqual(["▸ ran 2 shell commands"]);
 			});
@@ -453,10 +443,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const a = member("running");
 				const b = member("running");
 				const view = viewOf([shell(a), shell(b)]);
-				for (let i = 0; i < 5; i++) {
-					updateMember(view, memberId(a));
-					tell(view, a, { kind: "host", event: "output" });
-				}
+				for (let i = 0; i < 5; i++) updateMember(view, memberId(a));
 				tell(view, a, exit(0));
 				tell(view, a, exit(0));
 				expect(view.groups).toHaveLength(1);
@@ -471,21 +458,33 @@ describe("extensions/rbf-shell-command-groups", () => {
 		});
 
 		describe("Evidence from the owner", () => {
-			it("a row that opened, took a partial result or had its approval accepted is still waiting", () => {
-				for (const event of HOST_EVENTS) {
-					expect(fold({ kind: "host", event })).toBe(NO_EVIDENCE);
+			it("a member no owner has said a thing about is waiting: an open row, a partial result and an accepted approval are not facts", () => {
+				expect(NO_EVIDENCE).toEqual({ executionEvidence: { state: "waiting" }, executionStarted: false });
+				expect(header([reduced([])])).toBe("▸ waiting for 1 shell command");
+			});
+
+			it("a fact of a kind this reducer was not written for changes nothing, whatever the member's state", () => {
+				const newer = { kind: "paused", until: 3 } as unknown as OwnerFact;
+				for (const facts of [[], [START], [START, exit(0)], [START, { kind: "lost" }], [START, exit(0), exit(7)]] as OwnerFact[][]) {
+					const state = fold(...facts);
+					expect(reduceEvidence(state, newer)).toBe(state);
 				}
-				const facts = HOST_EVENTS.map((event): OwnerFact => ({ kind: "host", event }));
-				expect(header([reduced(facts)])).toBe("▸ waiting for 1 shell command");
+			});
+
+			it("a fact is taken only when it is one of the known kinds with the fields its kind needs", () => {
+				const known: unknown[] = [START, CANCEL, TIMEOUT, KILLED, exit(0), exit(null), completion(), completion(0, "completed"), { kind: "background", identity: "t" }, { kind: "cut", identity: "i" }, { kind: "child-error" }, { kind: "not-run" }, { kind: "lost" }];
+				for (const fact of known) expect(isOwnerFact(fact), JSON.stringify(fact)).toBe(true);
+				const not: unknown[] = [undefined, null, "start", 7, [], {}, { kind: "paused" }, { kind: "host", event: "output" }, { kind: "background" }, { kind: "background", identity: "" }, { kind: "cut", identity: 3 }, { kind: "stop-request" }, { kind: "stop-request", reason: "shutdown" }, { kind: "close" }, { kind: "close", code: "0" }];
+				for (const fact of not) expect(isOwnerFact(fact), JSON.stringify(fact)).toBe(false);
 			});
 
 			it("an owner-confirmed start is running", () => {
 				expect(fold(START)).toEqual({ executionEvidence: { state: "running" }, executionStarted: true });
-				expect(header([reduced([{ kind: "host", event: "approval-accepted" }, START])])).toBe("▸ running 1 shell command");
+				expect(header([reduced([START])])).toBe("▸ running 1 shell command");
 			});
 
 			it("a detach that resolved the tool with exit 0 is background, not ran", () => {
-				const facts: OwnerFact[] = [START, { kind: "background", identity: "task-123" }, { kind: "host", event: "partial" }];
+				const facts: OwnerFact[] = [START, { kind: "background", identity: "task-123" }];
 				expect(fold(...facts)).toEqual({ executionEvidence: { state: "background", identity: "task-123" }, executionStarted: true });
 				expect(header([reduced(facts)])).toBe("▸ 1 shell command · background");
 			});
@@ -565,6 +564,8 @@ describe("extensions/rbf-shell-command-groups", () => {
 				["an exit that is not a number", completion("0", "completed")],
 				["exit 0 beside a failed status", completion(0, "failed")],
 				["exit 0 beside a declined status", completion(0, "declined")],
+				["exit 0 beside a status that says it is still in progress", completion(0, "inProgress")],
+				["exit 0 beside a status nobody defined", completion(0, "paused")],
 				["exit 7 beside a declined status", completion(7, "declined")],
 			])("Codex completion with %s is unknown, never success", (_name, fact) => {
 				expect(fold(START, fact).executionEvidence).toEqual({ state: "unknown" });
@@ -573,7 +574,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 
 			it("Codex's explicit failed status with no exit is failed without ran, and a decline before the start is not run", () => {
 				expect(header([reduced([completion(undefined, "failed")])])).toBe("▸ 1 shell command · 1 failed");
-				expect(header([reduced([{ kind: "host", event: "approval-open" }, completion(undefined, "declined")])])).toBe("▸ 1 shell command · not run");
+				expect(header([reduced([completion(undefined, "declined")])])).toBe("▸ 1 shell command · not run");
 			});
 
 			it("a completion that arrives before its start resolves the member and the late start cannot revive it", () => {
@@ -589,7 +590,6 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const late: OwnerFact[] = [
 					exit(7),
 					START,
-					{ kind: "host", event: "output" },
 					{ kind: "background", identity: "task-9" },
 					CANCEL,
 					{ kind: "child-error" },
@@ -630,7 +630,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 			});
 
 			it("a Codex command cut before its start was admitted is unknown, never still running", () => {
-				const facts: OwnerFact[] = [{ kind: "host", event: "approval-open" }, { kind: "cut", identity: "item-9" }];
+				const facts: OwnerFact[] = [{ kind: "cut", identity: "item-9" }];
 				expect(fold(...facts)).toEqual({ executionEvidence: { state: "unknown" }, executionStarted: false });
 				const member9 = reduced(facts, { source: "codex-command", rowError: true });
 				expect(header([member9])).toBe("▸ 1 shell command · error · status unknown");
@@ -736,7 +736,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 			it("a fact that changes nothing touches no group", () => {
 				const a = member("running");
 				const view = viewOf([shell(a)]);
-				expect(tell(view, a, { kind: "host", event: "output" })).toBe(false);
+				expect(tell(view, a, START)).toBe(false);
 				expect(tell(view, a, START)).toBe(false);
 				expect(view.groups[0]!.updates).toBe(0);
 			});
@@ -772,12 +772,12 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(view.groups[0]!.updates).toBe(2);
 			});
 
-			it("a host fact still advances the revision, so its replay is dropped", () => {
-				const a = member("waiting");
+			it("a fact that changes nothing still advances the revision, so nothing replayed at or below it folds", () => {
+				const a = member("running");
 				const view = viewOf([shell(a)]);
-				tell(view, a, { kind: "host", event: "output" }, { revision: 3 });
+				expect(tell(view, a, START, { revision: 3 })).toBe(false);
 				expect(tell(view, a, exit(0), { revision: 3 })).toBe(false);
-				expect(headersOf(view)).toEqual(["▸ waiting for 1 shell command"]);
+				expect(headersOf(view)).toEqual(["▸ running 1 shell command"]);
 			});
 
 			it("a new owner generation starts its revisions over", () => {
@@ -903,13 +903,13 @@ describe("extensions/rbf-shell-command-groups", () => {
 
 			it("tool-only model turns between calls do not split it: their placeholders draw nothing", () => {
 				const [a, b, c] = abc();
-				const rows = [content("text", false), shell(a), content("text", false), shell(b), content("thinking", false), shell(c)];
+				const rows = [silent(), shell(a), silent(), shell(b), silent(), shell(c)];
 				expect(ids(groupRows(rows, [], false))).toEqual([keys(a, b, c)]);
 			});
 
 			it("a member id is its session, source and call id, so one item id in two sessions is two members", () => {
 				const a = run({ toolCallId: "codex-item-1", source: "codex-command" });
-				const sameCall: ShellMember = { ...a, command: "other", cwd: "/elsewhere" };
+				const sameCall: ShellMember = { ...a, agentPath: "other", cwd: "/elsewhere" };
 				expect(memberId(a)).toBe(memberId(sameCall));
 				expect(memberId(a)).not.toBe(memberId({ ...a, sessionId: "s2" }));
 				expect(memberId(a)).not.toBe(memberId({ ...a, source: "pi-bash" }));
@@ -918,14 +918,13 @@ describe("extensions/rbf-shell-command-groups", () => {
 		});
 
 		describe("What ends a group", () => {
-			it.each(["text", "thinking", "tool", "user", "diagnostic", "cache-miss", "usage", "custom", "compaction", "session", "branch"] as const)(
-				"a visible %s row between two calls splits them",
-				(what) => {
-					const [a, b, c] = abc();
-					const groups = groupRows([shell(a), content(what), shell(b), shell(c)], [], false);
-					expect(ids(groups)).toEqual([keys(a), keys(b, c)]);
-				},
-			);
+			// The rule knows one thing about a row that is not a member: whether it draws a line. Which of Pi's rows do is asked of Pi's own rows, under "boundaries and order: Pi's own rows".
+			it("a row that draws a line between two calls splits them, and one that draws none does not", () => {
+				const [a, b, c] = abc();
+				expect(ids(groupRows([shell(a), drawn(), shell(b), shell(c)], [], false))).toEqual([keys(a), keys(b, c)]);
+				expect(ids(groupRows([shell(a), silent(), shell(b), shell(c)], [], false))).toEqual([keys(a, b, c)]);
+				expect(ids(groupRows([shell(a), drawn(), drawn(), shell(b), drawn(), shell(c)], [], false))).toEqual([keys(a), keys(b), keys(c)]);
+			});
 
 			it.each([
 				["session", { sessionId: "s2" }],
@@ -953,18 +952,12 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const c = run();
 				expect(ids(groupRows([shell(a), shell(b), shell(c)], [], false))).toEqual([keys(a), keys(b), keys(c)]);
 			});
-
-			it("hidden thinking's visible label and derived notices are barriers", () => {
-				const [a, b, c] = abc();
-				const rows = [shell(a), content("thinking"), shell(b), content("usage"), shell(c)];
-				expect(ids(groupRows(rows, [], false))).toEqual([keys(a), keys(b), keys(c)]);
-			});
 		});
 
 		describe("Delivered input", () => {
 			it("each delivered user row splits, repeated text included", () => {
 				const [a, b, c] = abc();
-				const rows = [shell(a), content("user"), shell(b), content("user"), shell(c)];
+				const rows = [shell(a), drawn(), shell(b), drawn(), shell(c)];
 				expect(ids(groupRows(rows, [], false))).toEqual([keys(a), keys(b), keys(c)]);
 			});
 
@@ -972,8 +965,8 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const [a, b, c] = abc();
 				const live = groupRows([shell(a)], [], false);
 				const grown = groupRows([shell(a), shell(b)], live, false);
-				const delivered = groupRows([shell(a), shell(b), content("user"), shell(c)], grown, false);
-				const replay = groupRows([shell(a), shell(b), content("user"), shell(c)], [], false);
+				const delivered = groupRows([shell(a), shell(b), drawn(), shell(c)], grown, false);
+				const replay = groupRows([shell(a), shell(b), drawn(), shell(c)], [], false);
 				expect(ids(delivered)).toEqual([keys(a, b), keys(c)]);
 				expect(replay).toEqual(delivered);
 			});
@@ -1016,11 +1009,11 @@ describe("extensions/rbf-shell-command-groups", () => {
 		describe("Open and closed membership", () => {
 			it("the last group stays open until something visible follows it", () => {
 				const [a, b, c] = abc();
-				const open = groupRows([shell(a), content("text"), shell(b), content("text", false)], [], false);
+				const open = groupRows([shell(a), drawn(), shell(b), silent()], [], false);
 				expect(open.map((group) => group.open)).toEqual([false, true]);
-				const closed = groupRows([shell(a), content("text"), shell(b), content("user")], open, false);
+				const closed = groupRows([shell(a), drawn(), shell(b), drawn()], open, false);
 				expect(closed.map((group) => group.open)).toEqual([false, false]);
-				const next = groupRows([shell(a), content("text"), shell(b), content("user"), shell(c)], closed, false);
+				const next = groupRows([shell(a), drawn(), shell(b), drawn(), shell(c)], closed, false);
 				expect(ids(next)).toEqual([keys(a), keys(b), keys(c)]);
 				expect(next.map((group) => group.open)).toEqual([false, false, true]);
 			});
@@ -1028,7 +1021,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 			it("a closed group still takes its members' status updates", () => {
 				const a = member("running");
 				const b = member("running");
-				const view = viewOf([shell(a), content("user"), shell(b)]);
+				const view = viewOf([shell(a), drawn(), shell(b)]);
 				expect(view.groups[0]!.open).toBe(false);
 				expect(tell(view, a, exit(7))).toBe(true);
 				expect(header(view.groups[0]!.memberIds.map((id) => view.members.get(id)!))).toBe("▸ ran 1 shell command · 1 failed");
@@ -1038,7 +1031,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 			it("a background member's late completion updates its own group and never joins the latest one", () => {
 				const a = member("background");
 				const b = member("running");
-				const view = viewOf([shell(a), content("text"), shell(b)]);
+				const view = viewOf([shell(a), drawn(), shell(b)]);
 				tell(view, a, exit(0));
 				expect(ids(view.groups)).toEqual([keys(a), keys(b)]);
 				expect(view.groups.map((group) => group.updates)).toEqual([1, 0]);
@@ -1048,8 +1041,8 @@ describe("extensions/rbf-shell-command-groups", () => {
 		describe("Disclosure through splits and merges", () => {
 			it("a new group follows the global setting", () => {
 				const [a, b] = abc();
-				expect(groupRows([shell(a), content("text"), shell(b)], [], false).map((group) => group.expanded)).toEqual([false, false]);
-				expect(groupRows([shell(a), content("text"), shell(b)], [], true).map((group) => group.expanded)).toEqual([true, true]);
+				expect(groupRows([shell(a), drawn(), shell(b)], [], false).map((group) => group.expanded)).toEqual([false, false]);
+				expect(groupRows([shell(a), drawn(), shell(b)], [], true).map((group) => group.expanded)).toEqual([true, true]);
 			});
 
 			it("an appended member inherits its group's disclosure, whatever the global setting", () => {
@@ -1065,37 +1058,37 @@ describe("extensions/rbf-shell-command-groups", () => {
 			it("late text that splits an expanded group leaves both halves expanded, and a collapsed one collapsed", () => {
 				const [a, b, c] = abc();
 				const [d, e] = abc();
-				const before = groupRows([shell(a), content("text", false), shell(b), shell(c), content("user"), shell(d), content("text", false), shell(e)], [], false);
+				const before = groupRows([shell(a), silent(), shell(b), shell(c), drawn(), shell(d), silent(), shell(e)], [], false);
 				expect(ids(before)).toEqual([keys(a, b, c), keys(d, e)]);
 				before[0]!.expanded = true;
-				const after = groupRows([shell(a), content("text"), shell(b), shell(c), content("user"), shell(d), content("text"), shell(e)], before, true);
+				const after = groupRows([shell(a), drawn(), shell(b), shell(c), drawn(), shell(d), drawn(), shell(e)], before, true);
 				expect(ids(after)).toEqual([keys(a), keys(b, c), keys(d), keys(e)]);
 				expect(after.map((group) => group.expanded)).toEqual([true, true, false, false]);
 			});
 
 			it("a merge keeps inspected details open when either group was expanded", () => {
 				const [a, b, c] = abc();
-				const split = groupRows([shell(a), content("thinking"), shell(b), content("thinking"), shell(c)], [], false);
+				const split = groupRows([shell(a), drawn(), shell(b), drawn(), shell(c)], [], false);
 				split[1]!.expanded = true;
-				const merged = groupRows([shell(a), content("thinking", false), shell(b), content("thinking"), shell(c)], split, false);
+				const merged = groupRows([shell(a), silent(), shell(b), drawn(), shell(c)], split, false);
 				expect(ids(merged)).toEqual([keys(a, b), keys(c)]);
 				expect(merged.map((group) => group.expanded)).toEqual([true, false]);
 			});
 
 			it("a merge of two collapsed groups stays collapsed under an expanded global setting", () => {
 				const [a, b] = abc();
-				const split = groupRows([shell(a), content("thinking"), shell(b)], [], false);
-				const merged = groupRows([shell(a), content("thinking", false), shell(b)], split, true);
+				const split = groupRows([shell(a), drawn(), shell(b)], [], false);
+				const merged = groupRows([shell(a), silent(), shell(b)], split, true);
 				expect(merged.map((group) => group.expanded)).toEqual([false]);
 			});
 
 			it("a hidden-thinking toggle splits and merges without losing disclosure", () => {
 				const [a, b] = abc();
-				let groups = groupRows([shell(a), content("thinking", false), shell(b)], [], false);
+				let groups = groupRows([shell(a), silent(), shell(b)], [], false);
 				groups[0]!.expanded = true;
-				groups = groupRows([shell(a), content("thinking"), shell(b)], groups, false);
+				groups = groupRows([shell(a), drawn(), shell(b)], groups, false);
 				expect(groups.map((group) => group.expanded)).toEqual([true, true]);
-				groups = groupRows([shell(a), content("thinking", false), shell(b)], groups, false);
+				groups = groupRows([shell(a), silent(), shell(b)], groups, false);
 				expect(ids(groups)).toEqual([keys(a, b)]);
 				expect(groups.map((group) => group.expanded)).toEqual([true]);
 			});
@@ -1106,7 +1099,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const rows: TranscriptRow[] = [];
 				const members: ShellMember[] = [];
 				for (let i = 0; i < 1000; i++) {
-					if (i > 0 && i % 100 === 0) rows.push(content("text"));
+					if (i > 0 && i % 100 === 0) rows.push(drawn());
 					const m = member("running", { nativeRow: { output: "x".repeat(64) } });
 					members.push(m);
 					rows.push(shell(m));
@@ -1119,7 +1112,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 
 				for (let i = 0; i < 100; i++) {
 					expect(updateMember(view, memberId(target))).toBe(true);
-					expect(tell(view, target, { kind: "host", event: "output" })).toBe(false);
+					expect(tell(view, target, START)).toBe(false);
 				}
 
 				expect(view.reconciliations).toBe(1);
@@ -1132,7 +1125,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 			it("an evidence update touches only its member's group", () => {
 				const a = member("running");
 				const b = member("running");
-				const view = viewOf([shell(a), content("text"), shell(b)]);
+				const view = viewOf([shell(a), drawn(), shell(b)]);
 				tell(view, b, exit(7));
 				expect(view.reconciliations).toBe(1);
 				expect(view.groups.map((group) => group.updates)).toEqual([0, 1]);
@@ -1229,14 +1222,14 @@ describe("extensions/rbf-shell-command-groups", () => {
 		}
 
 		/** A host, a view over it, and the Pi owner's own channel code speaking for a real bash tool definition. */
-		function stage(opts: { announce?: boolean; start?: boolean; events?: Bus } = {}) {
+		function stage(opts: { announce?: boolean; start?: boolean; events?: Bus; mode?: string } = {}) {
 			const events = opts.events ?? createEventBus();
 			const bash: any = createBashToolDefinition("/work");
 			const definitions = new Map<string, unknown>([["bash", bash]]);
 			const { host, queue, requestRender } = makeHost(definitions);
 			const chat: any = host.chatContainer;
 			const notify = vi.fn();
-			const ctx: any = { mode: "tui", hasUI: true, ui: { notify }, sessionManager: { getSessionId: () => SESSION } };
+			const ctx: any = { mode: opts.mode ?? "tui", hasUI: true, ui: { notify }, sessionManager: { getSessionId: () => SESSION } };
 			const view = createShellGroupsView({ events } as any);
 			if (opts.start !== false) view.start(ctx);
 			const owner = createShellDisplayOwner<ShellDisplayFact>(events, "pi-bash", (fact) => fact.kind === "close" || fact.kind === "not-run")!;
@@ -1624,6 +1617,62 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(s.headers()).toEqual([" ▸ 1 shell command · status unknown"]);
 			});
 
+			it("a second row carrying a member's call id is not grouped twice: one header, and the second row is Pi's own", async () => {
+				const s = stage();
+				await s.run("c1");
+				// A row Pi built for the same call id, with its own result.
+				const twin: any = new ToolExecutionComponent("bash", "c1", { command: "pwd" }, {}, s.host.getRegisteredToolDefinition("bash"), s.host.ui, "/work");
+				twin.updateResult({ content: [{ type: "text", text: "from the twin\n" }], isError: false });
+				s.chat.addChild(twin);
+				const own = (twin.render(80) as string[]).map(clean);
+				expect(own.some((line) => line.includes("from the twin"))).toBe(true);
+				expect(s.draw()).toEqual(["", " ▸ ran 1 shell command", ...own]);
+				expect(s.view.state.members.size).toBe(1);
+				// Open, the member is drawn once, by the first row, and the twin stays where Pi put it.
+				s.click(s.headerRow());
+				const [first] = s.rows();
+				expect(s.draw()).toEqual(["", " ▾ ran 1 shell command", ...(first.render(80) as string[]).map(clean), ...(twin.render(80) as string[]).map(clean)]);
+			});
+
+			it("an announcement under a new generation with no withdrawal before it leaves what was still running unknown", async () => {
+				const s = stage();
+				await s.begin("c1");
+				s.tell("c1", { kind: "start" });
+				await s.run("c2");
+				expect(s.headers()).toEqual([" ▸ 2 shell commands · 1 running"]);
+				// The old owner died without a word; the new one simply announces itself.
+				s.events.emit(SHELL_DISPLAY_CHANNEL, { kind: "announce", sessionId: SESSION, source: "pi-bash", toolName: "bash", ownerGeneration: "pi-bash:replacement", execute: s.bash.execute, renderCall: s.bash.renderCall, renderResult: s.bash.renderResult });
+				// What the old owner proved stays proved; what it was still watching is unknown.
+				expect(s.headers()).toEqual([" ▸ 2 shell commands · 1 unknown"]);
+				// And nothing more from the old generation is taken.
+				s.tell("c1", ...RAN.slice(1));
+				expect(s.headers()).toEqual([" ▸ 2 shell commands · 1 unknown"]);
+			});
+
+			it("a fact of a kind the view doesn't know, or one that is no fact at all, changes nothing and the view stays", async () => {
+				const s = stage();
+				await s.begin("c1");
+				s.tell("c1", { kind: "start" });
+				expect(s.headers()).toEqual([" ▸ running 1 shell command"]);
+				const generation = s.view.state.owners.get("pi-bash");
+				const send = (revision: unknown, fact: unknown, over: Record<string, unknown> = {}) =>
+					s.events.emit(SHELL_DISPLAY_CHANNEL, { kind: "fact", sessionId: SESSION, source: "pi-bash", ownerGeneration: generation, toolCallId: "c1", revision, fact, ...over });
+				send(2, { kind: "paused", until: 3 });
+				send(3, undefined);
+				send(4, "close");
+				send(5, { kind: "background" });
+				send(6, { kind: "close" });
+				send("7", { kind: "close", code: 0, signal: null });
+				send(8, { kind: "close", code: 0, signal: null }, { toolCallId: 7 });
+				expect(s.headers()).toEqual([" ▸ running 1 shell command"]);
+				expect(s.view.fault).toBeUndefined();
+				await tick();
+				expect(s.notify).not.toHaveBeenCalled();
+				// A fact it does know, after all of those, still lands.
+				send(9, { kind: "close", code: 0, signal: null });
+				expect(s.headers()).toEqual([" ▸ ran 1 shell command"]);
+			});
+
 			it("an announcement for another session makes nothing eligible", async () => {
 				const s = stage({ announce: false });
 				s.owner.start("another-session", s.bash);
@@ -1813,6 +1862,42 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(s.rows()[0].expanded).toBe(true);
 			});
 
+			it("Pi's own assistant row between two calls: nothing while it holds only tool calls, a barrier once text arrives, and a barrier as thinking, shown or hidden behind its label", async () => {
+				const s = stage();
+				await s.run("c1");
+				// A tool-only turn: Pi adds the assistant row, and it draws no line.
+				const message: any = { role: "assistant", content: [toolCall("c2", "pwd")], stopReason: "toolUse" };
+				s.host.addMessageToChat(message);
+				const row = s.chat.children.at(-1);
+				expect(row.constructor.name).toBe("AssistantMessageComponent");
+				expect(row.render(80)).toEqual([]);
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				// Text streams into that row late: the group splits around it, the prose stays where Pi drew it, and both halves stay open.
+				message.content = [{ type: "text", text: "A thought, late." }, toolCall("c2", "pwd")];
+				row.updateContent(message);
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command", " ▾ ran 1 shell command"]);
+				const lines = s.draw();
+				expect(lines.indexOf(" A thought, late.")).toBeGreaterThan(lines.indexOf(" ▾ ran 1 shell command"));
+				expect(lines.indexOf(" A thought, late.")).toBeLessThan(lines.lastIndexOf(" ▾ ran 1 shell command"));
+				// Thinking in place of the text: still a barrier while shown.
+				message.content = [{ type: "thinking", thinking: "Considering." }, toolCall("c2", "pwd")];
+				row.updateContent(message);
+				expect(s.draw().some((line) => line.includes("Considering."))).toBe(true);
+				expect(s.headers()).toHaveLength(2);
+				// Hidden thinking leaves its label on screen, through Pi's own toggle: the label is a barrier too.
+				s.host.hideThinkingBlock = true;
+				s.host.updateThinkingBlockVisibility();
+				expect(s.draw().some((line) => line.includes("Considering."))).toBe(false);
+				expect(s.draw().some((line) => line.includes("Thinking..."))).toBe(true);
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command", " ▾ ran 1 shell command"]);
+				// The row empties again: the halves merge, open.
+				message.content = [toolCall("c2", "pwd")];
+				row.updateContent(message);
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+			});
+
 			it("late text that splits an open group leaves both halves open, and taking it away merges them open", async () => {
 				const s = stage();
 				await s.run("c1");
@@ -1856,7 +1941,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
 			});
 
-			it("a double click is two clicks and toggles twice", async () => {
+			it("two separate clicks on the header toggle it twice", async () => {
 				const s = stage();
 				await s.run("c1");
 				const y = s.headerRow();
@@ -2050,7 +2135,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const frame = (s.chat.render(80) as string[]).map(clean);
 				expect(frame).toEqual(s.native(80));
 				expect(frame.some((line) => line.startsWith(" ▸"))).toBe(false);
-				expect(s.view.attached).toBe(false);
+				expect(s.view.fault).toMatchObject({ where: "render", error: expect.objectContaining({ message: "projection fault" }) });
 				expect(s.requestRender).toHaveBeenCalled();
 				expect(s.notify).not.toHaveBeenCalled(); // one tick later, after Pi's own draw
 				await tick();
@@ -2084,7 +2169,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(result.capture).toBeUndefined();
 				expect(s.rows().map((row) => row.expanded)).toEqual([false, false]);
 				expect(s.requestRender).toHaveBeenCalled();
-				expect(s.view.attached).toBe(false);
+				expect(s.view.fault).toMatchObject({ where: "mouse", error: expect.objectContaining({ message: "projection fault" }) });
 				// The click that follows the dropped press lands on Pi's own geometry, not on the frame the user saw.
 				expect(s.draw()).toEqual(s.native());
 				await tick();
@@ -2104,7 +2189,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 					thrown = error;
 				}
 				expect(thrown).toBe(broken);
-				expect(s.view.attached).toBe(true);
+				expect(s.view.fault).toBeUndefined();
 				s.chat.removeChild(bad);
 				expect(s.headers()).toEqual([" ▸ ran 1 shell command"]);
 				// The same for a member's own render, and for a member's own mouse handler.
@@ -2116,7 +2201,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const y = s.draw().indexOf(" $ pwd");
 				vi.spyOn(row, "handleMouse").mockImplementation(() => { throw broken; });
 				expect(() => s.mouse("press", y)).toThrow(broken);
-				expect(s.view.attached).toBe(true);
+				expect(s.view.fault).toBeUndefined();
 				await tick();
 				expect(s.notify).not.toHaveBeenCalled();
 			});
@@ -2133,7 +2218,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const status = vi.spyOn(s.host, "showStatus").mockImplementation(() => { throw failure; });
 				expect(() => s.host.setToolsExpanded(true)).toThrow(failure);
 				status.mockRestore();
-				expect(s.view.attached).toBe(true);
+				expect(s.view.fault).toBeUndefined();
 				// Pi set its flag and its rows before it failed; the group was not told to follow a call that failed.
 				expect(s.view.state.groups[0]!.expanded).toBe(true);
 				s.host.toolOutputExpanded = false;
@@ -2153,10 +2238,20 @@ describe("extensions/rbf-shell-command-groups", () => {
 				host.pendingTools = undefined;
 				host.pendingTools = { get: () => undefined };
 				host.setToolsExpanded(false);
-				expect(s.view.attached).toBe(false);
+				expect(s.view.fault).toMatchObject({ where: "capture" });
 				for (const name of CONTAINER_METHODS) expect(Object.prototype.hasOwnProperty.call(host.chatContainer, name)).toBe(false);
 				await tick();
 				expect(s.notify.mock.calls).toEqual([[UNAVAILABLE_WARNING, "warning"]]);
+			});
+
+			it("outside the TUI the fault is kept and nothing is said: there is no transcript to say it in", async () => {
+				const s = stage({ announce: false, mode: "print" });
+				const { host } = makeHost(new Map());
+				host.pendingTools = [];
+				host.setToolsExpanded(false);
+				await tick();
+				expect(s.view.fault).toMatchObject({ where: "capture" });
+				expect(s.notify).not.toHaveBeenCalled();
 			});
 
 			it("a fault before session_start holds its warning until there is a context to say it through", async () => {
@@ -2197,6 +2292,21 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(first.draw()).toEqual(first.native());
 			});
 
+			it("a second InteractiveMode takes the view with it: the first one's container is unwrapped and draws as Pi draws", async () => {
+				const s = stage();
+				await s.run("c1");
+				expect(s.headers()).toEqual([" ▸ ran 1 shell command"]);
+				const other = makeHost(s.definitions);
+				await other.host.handleEvent({ type: "tool_execution_start", toolCallId: "d1", toolName: "bash", args: { command: "pwd" } });
+				for (const name of CONTAINER_METHODS) {
+					expect(Object.prototype.hasOwnProperty.call(s.chat, name)).toBe(false);
+					expect(Object.prototype.hasOwnProperty.call(other.host.chatContainer, name)).toBe(true);
+				}
+				expect(s.draw()).toEqual(s.native());
+				expect((other.host.chatContainer.render(80) as string[]).map(clean)).toEqual(["", " ▸ waiting for 1 shell command"]);
+				expect(s.view.fault).toBeUndefined();
+			});
+
 			it("stopping twice changes nothing more, and the view keeps no row of the session it left", async () => {
 				const s = stage();
 				await s.run("c1");
@@ -2206,7 +2316,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				s.view.stop();
 				expect(s.view.state.members.size).toBe(0);
 				expect(s.view.state.groups).toEqual([]);
-				expect(s.view.attached).toBe(false);
+				expect(s.view.fault).toBeUndefined(); // an ordinary stop is not a fault
 				expect(s.draw()).toEqual(s.native());
 			});
 
@@ -2297,6 +2407,47 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(lines.slice(lines.indexOf("    Status unknown"))).toEqual(["    Status unknown", "    No recorded result"]);
 			});
 
+			it("a transcript rebuilt while a call is still open leaves that call open: no result line under it, and its owner's facts still land", async () => {
+				const s = stage();
+				await s.run("c0");
+				await s.begin("c1");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ 2 shell commands · 1 waiting"]);
+				// Pi rebuilds the transcript from its entries, as after a compaction or a tree move; the second call has no result yet.
+				s.chat.clear();
+				s.host.renderSessionItems([{ role: "assistant", content: [toolCall("c0", "pwd"), toolCall("c1", "pwd")], stopReason: "toolUse" }, toolResult("c0", "/work\n")]);
+				expect(s.host.pendingTools.has("c1")).toBe(true);
+				expect(s.headers()).toEqual([" ▸ 2 shell commands · 1 waiting"]);
+				s.click(s.headerRow());
+				expect(s.draw()).not.toContain("    No recorded result");
+				expect(s.draw()).not.toContain("    Status unknown");
+				s.tell("c1", { kind: "start" });
+				expect(s.headers()).toEqual([" ▾ 2 shell commands · 1 running"]);
+				s.tell("c1", { kind: "close", code: 0, signal: null });
+				await s.end("c1", "/work\n");
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				// A row of history with no result is a different thing: a rebuild cannot make it open.
+				const old = stage();
+				old.host.renderSessionItems([{ role: "assistant", content: [toolCall("h1", "pwd")], stopReason: "toolUse" }]);
+				expect(old.headers()).toEqual([" ▸ 1 shell command · status unknown"]);
+				old.chat.clear();
+				old.host.renderSessionItems([{ role: "assistant", content: [toolCall("h1", "pwd")], stopReason: "toolUse" }]);
+				expect(old.headers()).toEqual([" ▸ 1 shell command · status unknown"]);
+				old.click(old.headerRow());
+				expect(old.draw()).toContain("    No recorded result");
+			});
+
+			it("a streamed call whose message ends in an error is closed by that message, not left waiting for the turn to end", async () => {
+				const s = stage();
+				const streamed = (stopReason?: string) => ({ role: "assistant", content: [toolCall("c1", "pwd")], ...(stopReason ? { stopReason, errorMessage: "overloaded" } : {}) });
+				await s.host.handleEvent({ type: "message_start", message: { role: "assistant", content: [] } });
+				await s.host.handleEvent({ type: "message_update", message: streamed() });
+				expect(s.headers()).toEqual([" ▸ waiting for 1 shell command"]);
+				await s.host.handleEvent({ type: "message_end", message: streamed("error") });
+				// Pi gave the row the message's error and dropped it from its pending tools; no owner ever saw the call.
+				expect(s.headers()).toEqual([" ▸ 1 shell command · error · status unknown"]);
+			});
+
 			it("an output chunk changes no fact and touches no group", async () => {
 				const s = stage();
 				await s.begin("c1");
@@ -2346,6 +2497,69 @@ describe("extensions/rbf-shell-command-groups", () => {
 				s.host.runtimeHost.session.sessionManager.getCwd = () => "/elsewhere";
 				await s.run("c2");
 				expect(s.headers()).toEqual([" ▸ ran 1 shell command", " ▸ ran 1 shell command"]);
+			});
+		});
+
+		describe("boundaries and order: Pi's own rows", () => {
+			const thinking = { role: "assistant", content: [{ type: "thinking", thinking: "Hm." }], stopReason: "toolUse" };
+			const ROWS: [string, (s: ReturnType<typeof stage>) => unknown][] = [
+				["assistant text", (s) => s.host.addMessageToChat(assistant("Words."))],
+				["thinking, shown", (s) => s.host.addMessageToChat(thinking)],
+				["thinking, hidden behind its label", (s) => ((s.host.hideThinkingBlock = true), s.host.addMessageToChat(thinking))],
+				["a delivered user message", (s) => s.host.addMessageToChat({ role: "user", content: "again", timestamp: 1 })],
+				["a user ! command", (s) => s.host.addMessageToChat({ role: "bashExecution", command: "echo mine", output: "mine\n", exitCode: 0, cancelled: false, truncated: false })],
+				[
+					"another tool's row",
+					(s) => {
+						s.definitions.set("read", { name: "read", execute: async () => ({ content: [] }), renderCall: () => new Text("read a.ts", 0, 0), renderResult: () => new Text("", 0, 0) });
+						return s.host.handleEvent({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "a.ts" } });
+					},
+				],
+				["a status notice", (s) => s.host.showStatus("Thinking blocks: hidden")],
+				["a warning", (s) => s.host.showWarning("Careful.")],
+				["an error", (s) => s.host.showError("Failed.")],
+				["a compaction summary", (s) => s.host.addMessageToChat({ role: "compactionSummary", summary: "Earlier work.", tokensBefore: 1000, timestamp: 1 })],
+				["a branch summary", (s) => s.host.addMessageToChat({ role: "branchSummary", summary: "The other branch.", fromId: "x", timestamp: 1 })],
+			];
+			it.each(ROWS)("%s between two calls, built by Pi's own code, ends the group before it", async (_name, add) => {
+				const s = stage();
+				await s.run("c1");
+				const before = s.chat.children.length;
+				await add(s);
+				expect(s.chat.children.length).toBeGreaterThan(before);
+				await s.run("c2");
+				await s.run("c3");
+				expect(s.headers()).toEqual([" ▸ ran 1 shell command", " ▸ ran 2 shell commands"]);
+				// And what stands between them is drawn where Pi put it, between the two headers.
+				const lines = s.draw();
+				const [first, second] = lines.flatMap((line, y) => (line.startsWith(" ▸") ? [y] : []));
+				expect(lines.slice(first! + 1, second).some((line) => line.trim() !== "")).toBe(true);
+			});
+
+			it("a tool-only assistant row draws nothing and ends nothing", async () => {
+				const s = stage();
+				await s.run("c1");
+				s.host.addMessageToChat({ role: "assistant", content: [toolCall("c2", "pwd")], stopReason: "toolUse" });
+				await s.run("c2");
+				expect(s.headers()).toEqual([" ▸ ran 2 shell commands"]);
+			});
+		});
+
+		describe("counts and states: real commands", () => {
+			it("a heredoc, a pipeline and a compound command are one invocation each, and the same text twice is two", async () => {
+				const s = stage();
+				await s.run("c1", "python3 - <<'PY'\nimport os\nprint(os.getcwd())\nPY", "/work\n");
+				expect(s.headers()).toEqual([" ▸ ran 1 shell command"]);
+				await s.run("c2", "ls | wc -l", "3\n");
+				await s.run("c3", "printf a; printf b", "ab");
+				expect(s.headers()).toEqual([" ▸ ran 3 shell commands"]);
+				await s.run("c4", "printf a; printf b", "ab");
+				expect(s.headers()).toEqual([" ▸ ran 4 shell commands"]);
+				// Results that arrive in pieces, and again whole, add nothing.
+				await s.begin("c5", "pwd");
+				for (let i = 0; i < 3; i++) await s.host.handleEvent({ type: "tool_execution_update", toolCallId: "c5", toolName: "bash", partialResult: { content: [{ type: "text", text: "/wo" }] } });
+				await s.begin("c5", "pwd");
+				expect(s.headers()).toEqual([" ▸ 5 shell commands · 1 waiting"]);
 			});
 		});
 

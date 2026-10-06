@@ -171,6 +171,8 @@ def main() -> int:
                 pump(time.monotonic() + 0.15)
             elif "resize" in step:
                 size = step["resize"]
+                # Where in the stream the size changed, for a replay of the screen.
+                snapshots[f"resize:{sum(1 for name in snapshots if name.startswith('resize:')) + 1}"] = len(raw)
                 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", int(size["rows"]), int(size["cols"]), 0, 0))
                 pump(time.monotonic() + 0.4)
             elif "sleep" in step:
