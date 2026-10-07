@@ -639,6 +639,7 @@ Local Pi extension registering `/cd <path>`, which moves the running conversatio
 - Not included: a directory picker, path completion, `/cd -`, moving running background tasks, and changing directory from print, JSON or RPC mode
 
 ## 🟠⋯ Setup & Verification
+- `/cd` is refused while a `monitor` watch runs (`rbf-monitor`, v0.28.0). `/monitors stop all` clears it
 - Needs two files: `rbf-cd.ts` and this checkout's `rbf-background-tasks.ts`. An older installed copy of `rbf-background-tasks.ts` can't answer `/cd`'s question, and `/cd` then refuses every move
 - Local dogfood without installing, against a throwaway profile so the installed extensions don't load beside the checkout's: `PI_CODING_AGENT_DIR=<throwaway dir> pi --no-extensions -e ./extensions/rbf-cd.ts -e ./extensions/rbf-background-tasks.ts`, then `/cd`, `/cd <path>`, and ask for `pwd`. A throwaway profile has no login, so pick a model it can reach or copy `auth.json` into it
 - Automated: `bun run test -- extensions/rbf-cd.test.ts` covers the path resolver, every refusal, the same-ID and copy-state rules and the exit hook
@@ -698,3 +699,41 @@ To roll back the display only, run `rm -f ~/.pi/agent/extensions/rbf-shell-comma
 To try it without installing, and without touching your own Pi settings, run `PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions -e extensions/rbf-shell-command-groups.ts -e extensions/rbf-background-tasks.ts -e extensions/rbf-codex.ts -e extensions/rbf-tool-parts-indent.ts --tui-mode fullscreen` from the checkout. That profile has no model signed in; pick a `[codex-harness]` model if the Codex CLI is logged in.
 
 Verified on Pi 0.85.1 and 1.0.3. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, and light or monochrome themes.
+
+# 🔵⋯ rbf-monitor
+
+Introduced in pi-rbf v0.28.0 (pi-44.1). The agent arms a shell command with `monitor`. Each line the command prints to stdout reaches the agent as an event. An event starts a turn when Pi is idle, and arrives mid-turn when Pi is working, so an agent waiting on something can end its turn and still hear about it:
+```
+ monitor event · gate watcher
+ └  build finished
+```
+
+- Two tools, Pi's versions of Claude Code's `Monitor` and `TaskStop`:
+  - `monitor`: `command` (the shell command), `description` (the label on every event and row), `timeout_ms` (the deadline: 300000 by default, raised to 1000 below it, capped at 3600000)
+  - `task_stop`: `task_id`, the id `monitor` returned, such as `mon-fb2e`
+- Lines that arrive within 200 ms of each other go to the agent as one event. An event carries 20 lines at most and says how many it left out
+- A watch stops when its command exits, at its deadline, when `task_stop` or `/monitors stop` stops it, after more than 10 events in 60 seconds, and when Pi reloads, starts a new session, resumes another, or quits. The agent is told each time. Nothing re-arms a watch: the agent does that
+- Five watches at most. A sixth is refused and the refusal names the five
+- `/monitors` lists running watches with their id, description, event count and time left. `/monitors stop <id>` stops one, `/monitors stop all` stops every one. With nothing running it answers `No watches running.`
+- The footer shows `1 watch`, or the count, while any runs. It joins the left half of the stats row, so in a narrow pane the model text on the right is cut first
+- A row Pi has already drawn keeps the time it showed then. `/monitors` shows the time left now
+- An event Pi cleared before showing it (Esc during a turn) arrives first with the watch's next event or with your next prompt. Esc starts no turn. Events wait while Pi compacts, and while a prompt you typed is on its way to its turn
+- A failed command's notice carries its last stderr lines and the path of its log
+- Watched text is cleaned of terminal escape sequences and control characters before the agent or the terminal sees it. The log keeps the raw bytes, at `/tmp/pi-monitors/session-<session id>/<task id>-<armed at>.log`
+- `/cd` is refused while a watch runs. `/monitors stop all` first
+- Not available to a `codex-harness` model, which can't call Pi tools. Use a Pi-loop provider such as `openai-codex`
+- Not checked in a `--sandbox` session: that needs `rbf-sandbox` (pi-23), which isn't released
+- cmux isn't told about a turn a watch started: the pane doesn't show as running, and no notification is raised when that turn ends
+- On Pi 1.0.3 an event can arrive twice after an abort. Read in Pi's source, not run
+
+Install both files together, then restart Pi or type `/reload`. `rbf-cd.ts` goes with it: with an older copy, `/cd` doesn't refuse for a watch.
+```sh
+command cp -f ./extensions/rbf-monitor.ts ./extensions/rbf-cd.ts ~/.pi/agent/extensions/
+```
+To check it, type `/monitors` (`No watches running.`), then ask the agent: `Call monitor with command "sleep 2; echo ready" and description "smoke test", then end your turn.` The footer shows `1 watch`. Two seconds later a ` monitor ended · smoke test` row appears with `ready` under it, and the agent replies without a prompt.
+
+To roll back, run `rm -f ~/.pi/agent/extensions/rbf-monitor.ts`, then `/reload` or restart Pi. Running watches stop at that reload. The changed `rbf-cd.ts` can stay.
+
+To try it without installing, run `pi -e ./extensions/rbf-monitor.ts`.
+
+Automated: `bun run test -- extensions/rbf-monitor.test.ts` and `extensions/rbf-monitor-real.test.ts`; the second drives a real Pi with a local no-model provider, and takes `RBF_PI_BIN` to pick the Pi. Verified on Pi 0.85.1 and 1.0.4. By hand on 1.0.4 with `openai-codex`: a Pi agent in an `agent-group-chat` room armed a watch unasked and answered a Claude reviewer's verdict 10 seconds after it was posted, with nothing typed.

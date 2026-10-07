@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.28.0 (2026-10-07)
+## 🟠⋯ Added for End Users
+- 2026-10-07 - feat | have my Pi agent pick up a message or event meant for it after its turn has ended, without me prompting it: the agent arms a shell command with `monitor`, and each line it prints starts a turn or arrives mid-turn; `task_stop` stops it; `/monitors` lists and stops watches, and the footer shows how many run, as `1 watch`. Watches stop at their deadline, on a flood, and when Pi reloads, and the agent is told each time. `/cd` is refused while a watch runs. Not in a `--sandbox` session, and not for a `codex-harness` model (#pi-44.1)
+
+---
+
 # 🔵⋯ v0.27.0 (2026-10-06)
 ## 🟠⋯ Added for End Users
 - 2026-10-06 - feat | scan agent shell activity as a command count and expand to inspect commands: shell commands an agent runs one after another now show as one line, such as `▸ ran 3 shell commands · 1 failed`, instead of a row per command. Click the line in fullscreen, or press Ctrl+O in either mode, to see the same command rows and results as before. The line names what needs attention while closed: `running`, `background` with its Task ID, `failed`, `cancelled`, `not run`. Covers Pi's own bash and Codex commands run through Pi. After you quit and reopen a session the groups read `status unknown`, because Pi no longer holds proof of how each command ended. A click on a command inside an open group does nothing, so links and text selection work as before. Needs three files installed together and a Pi restart. Unchanged: sandbox sessions, `!` and `!!` commands, nested calls, what runs and what is saved. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, light and monochrome themes, and telling a sub-agent's count from its parent's (#pi-42)
