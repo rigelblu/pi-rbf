@@ -4,6 +4,16 @@ import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Editor, getCapabilities, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 const OWNER = Symbol.for("rbf.pathLabels.owner");
+const TOKEN_RENDERERS = Symbol.for("rbf.pathLabels.tokenRenderers");
+type TokenRendererRegistry = typeof globalThis & { [TOKEN_RENDERERS]?: WeakMap<Function, object> };
+
+// Copying may recognize only actual path-label wrappers over an inherited
+// native token renderer. A pre-existing custom delegate is not such a seam.
+export function isPathLabelTokenRenderer(render: Function, native: Function): boolean {
+	const prototype = (globalThis as TokenRendererRegistry)[TOKEN_RENDERERS]?.get(render) as Native | undefined;
+	return !!prototype && Object.getOwnPropertyDescriptor(prototype, "renderToken")?.value === native;
+}
+
 const PI_THEME = Symbol.for("@earendil-works/pi-coding-agent:theme");
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const unsafe = /[\x00-\x1f\x7f-\x9f]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
@@ -200,6 +210,10 @@ export function installPathLabels(notify: Notify = () => {}): () => void {
 		};
 		const wrapped = wrapper(original);
 		target[key] = wrapped;
+		if (key === "renderToken" && !hadOwn) {
+			const registry = globalThis as TokenRendererRegistry;
+			(registry[TOKEN_RENDERERS] ??= new WeakMap()).set(wrapped, Object.getPrototypeOf(target));
+		}
 		// Streaming replaces components; the session owner must not retain their old text.
 		cleanups.push(methodCleanup(new WeakRef(target), key, new WeakRef(wrapped), hadOwn ? new WeakRef(captured) : undefined));
 		return true;

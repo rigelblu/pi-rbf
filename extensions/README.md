@@ -767,3 +767,49 @@ Local Pi extension aliasing `/effort` and `/effort <level>` in prompt submission
 - Rollback: remove `~/.pi/agent/extensions/rbf-effort.ts`, then restart Pi or `/reload`; for explicit activation, remove the `-e` argument. Native `/thinking` remains available.
 - Tested versions: factual final pinned proof across 37 actual profiles on both hosts (Pi 0.85.1 and daily Pi 1.0.4); Tom passed alias-only human verification. Installed daily source matches the accepted hash; daily Pi 1.0.4 native menu, arguments and reload pass in standard editor mode with installed Vim/rewind in both orders. Later editor ownership remains the documented fallback limit.
 - Automated tests: run local tests with `bun run test extensions/rbf-effort-pty.test.ts`. To exercise both host versions across all widths, provide the daily root explicitly: `PI_DAILY_ROOT='<dailyroot>' bun run test extensions/rbf-effort-pty.test.ts` (where `<dailyroot>` is the discovered host root containing `dist/bundle/cli.js`).
+
+---
+
+# 🔵⋯ rbf-copy-wrapped-text
+
+## 🟠⋯ Overview
+Local Pi extension that restores exact logical lines when selecting and copying visually wrapped transcript text in fullscreen mode, eliminating spurious newlines and continuation indentation while preserving intentional line breaks, blank lines, and native formatting.
+
+## 🟠⋯ Copy behavior and boundaries
+- Fullscreen `Text`, fenced code and ordinary assistant paragraphs project selected visible wraps back to logical lines. Genuine hard/blank lines and selected source spaces remain intact
+- Keep native gestures, highlight and clipboard callbacks. Keep selected pi-45 tool decoration and pi-39 visible path labels. `/copy` stored-source recovery remains separate
+- Call native rendering on every render. Cache only dependent provenance keyed to native output identity; refresh forwarded provenance from current child generations even when physical rows are unchanged. Capture actual native token/inline output without a second parser or native cache invalidation; an uncaptured cache receives a plain-source projection only for an unchanged native instance with a single plain paragraph and no custom token/inline/style/transform hooks; other uncaptured caches use native copying
+- Keep provenance in weak maps keyed by exact native return arrays. Capture actual child return arrays through native Container/tool rendering and temporary hooks for native Box/MouseRegion/ScrollView and exact pi-45 forwarding implementations; generated tags never enter rendered strings or caches
+- No production byte scrubbing: marker-shaped source remains native source and cannot mint provenance. Keep native component caches and completed screen/layout strings unmarked. Weak component/frame ownership avoids retaining discarded components; retired or copied arrays delegate to native selection. Join only the same native render generation
+- Preflight all required native methods and every patch descriptor, including both Main methods and final-frame selection/reset hooks. Restore only exact owned descriptors and preserve later extension/terminal owners
+- Regular-mode, structured tables/images and nested unsupported projections use native copying. An unavailable private seam declines installation; an unwritable terminal uses native rendering and copying
+
+## 🟠⋯ Verification status
+- Direct repair candidate, uninstalled. Current native diagnostics cover supplied examples, ordinary Assistant/path-label paragraphs, hard-line/partial-code/source-space controls and native fallback/ownership
+- Complete both-host proof and independent review remain prerequisites for human staging. Physical system clipboard and human H1/H2 are not machine test results
+- Native modules and the extension loader are trusted at initialization. Later function replacements require exact identity; owned wrappers expose their actual captured delegates through weak registries, independently of mutable prototype metadata. Reconstructing native methods with different lexical dependencies before the first trusted import is outside this compatibility boundary
+- No claim of compatibility with every future native version, custom renderer or structured composition
+
+## 🟠⋯ Setup & Verification
+- Keep the matching `rbf-path-labels.ts`, `rbf-clean-markdown-code.ts` and `rbf-tool-parts-indent.ts` beside this extension. The path-label renderer exposes actual wrapper identity without changing its display. Unsupported custom token renderers preserve native hard rows. Its exported renderer identities recognize pi-45 instances across reloads; importing it does not activate its default hooks
+- Isolated trial: launch Pi in fullscreen mode with an isolated temporary agent directory:
+  ```sh
+  PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions --tui-mode fullscreen -e ./extensions/rbf-copy-wrapped-text.ts
+  ```
+- Local verification commands:
+  ```sh
+  ./node_modules/.bin/vitest run extensions/rbf-copy-wrapped-text.test.ts
+  ./node_modules/.bin/tsc --noEmit
+  ```
+- Global installation (after authorized delivery):
+  ```sh
+  cp ./extensions/rbf-clean-markdown-code.ts ~/.pi/agent/extensions/rbf-clean-markdown-code.ts
+  cp ./extensions/rbf-tool-parts-indent.ts ~/.pi/agent/extensions/rbf-tool-parts-indent.ts
+  cp ./extensions/rbf-path-labels.ts ~/.pi/agent/extensions/rbf-path-labels.ts
+  cp ./extensions/rbf-copy-wrapped-text.ts ~/.pi/agent/extensions/rbf-copy-wrapped-text.ts
+  ```
+- Removal & rollback: delete the extension file and restart Pi:
+  ```sh
+  rm -f ~/.pi/agent/extensions/rbf-copy-wrapped-text.ts
+  ```
+  A full restart of Pi restores default native selection and copying.

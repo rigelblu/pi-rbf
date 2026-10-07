@@ -7,6 +7,13 @@ export const ORIGINAL_RENDER_TOKEN_KEY = Symbol.for("rbf.cleanMarkdownCode.origi
 export const TOOL_EXECUTION_READ_PATCHED_KEY = Symbol.for("rbf.cleanMarkdownCode.toolExecutionPatched");
 export const ORIGINAL_UPDATE_DISPLAY_KEY = Symbol.for("rbf.cleanMarkdownCode.originalUpdateDisplay");
 
+// Keep the actual closed-over delegate separate from mutable prototype metadata.
+const tokenDelegatesKey = Symbol.for("rbf.cleanMarkdownCode.tokenDelegates");
+const tokenDelegates: WeakMap<Function, Function> = (globalThis as any)[tokenDelegatesKey] ??= new WeakMap();
+export function getCleanTokenDelegate(renderer: Function): Function | undefined {
+	return tokenDelegates.get(renderer);
+}
+
 const PI_THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme");
 const EXTENDED_FOREGROUND_COLOR_PATTERN = /\x1b\[38;(?:2;\d+;\d+;\d+|5;\d+)m/g;
 
@@ -178,6 +185,7 @@ export function patchMarkdownRenderToken(): boolean {
 		return originalRenderToken.call(this, token, width, nextTokenType, styleContext);
 	};
 
+	tokenDelegates.set(proto.renderToken, originalRenderToken);
 	proto[MARKDOWN_CLEAN_CODE_PATCHED_KEY] = true;
 	return true;
 }

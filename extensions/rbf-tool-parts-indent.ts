@@ -523,6 +523,28 @@ export const ORIG_BASH_RENDER_KEY = Symbol.for("rbf.toolPartsIndent.origBashRend
 export const TOOL_RENDER_WRAPPED_KEY = Symbol.for("rbf.toolPartsIndent.toolWrapped");
 export const BASH_RENDER_WRAPPED_KEY = Symbol.for("rbf.toolPartsIndent.bashWrapped");
 
+// Exact function identities survive extension reloads without retaining rows.
+const copyOwnersKey = Symbol.for("rbf.toolPartsIndent.copyOwners");
+const copyOwners: { parts: WeakMap<Function, string[]>; tools: WeakMap<Function, { own?: Render; prototype: any }> } =
+	(globalThis as any)[copyOwnersKey] ??= { parts: new WeakMap(), tools: new WeakMap() };
+copyOwners.parts.set(IndentedParts.prototype.render, ["children"]);
+copyOwners.parts.set(SplitText.prototype.render, ["header", "content", "indentedParts", "textComponent"]);
+export function getPartForwarderKeys(renderer: Function): string[] | undefined {
+	return copyOwners.parts.get(renderer);
+}
+export function getToolRenderDelegate(renderer: Function): Function | undefined {
+	const owner = copyOwners.tools.get(renderer);
+	if (!owner) return undefined;
+	if (owner.own) return owner.own;
+	// This is the actual inherited lookup used by the closed-over delegate.
+	let prototype = Object.getPrototypeOf(owner.prototype);
+	while (prototype) {
+		const descriptor = Object.getOwnPropertyDescriptor(prototype, "render");
+		if (descriptor) return "value" in descriptor ? descriptor.value : undefined;
+		prototype = Object.getPrototypeOf(prototype);
+	}
+}
+
 const hasOwn = (target: any, key: PropertyKey) => Object.prototype.hasOwnProperty.call(target, key);
 
 /** What a wrapper runs while the extension is loaded: record the pane on the row, regroup it, draw the render it replaced. */
@@ -556,6 +578,7 @@ function installWrapper(proto: any, wrappedKey: symbol, origKey: symbol, implKey
 		const impl = (globalThis as any)[implKey];
 		return typeof impl === "function" ? impl.call(this, width, original) : original.call(this, width);
 	};
+	copyOwners.tools.set(wrapper, { own, prototype: proto });
 	proto.render = wrapper;
 	proto[wrappedKey] = wrapper;
 	proto[origKey] = own;
