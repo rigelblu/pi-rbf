@@ -651,8 +651,29 @@ class NativeFault {
 /** What the last drawn frame put where: one entry per run of lines, in the shape Pi's own container routes a mouse event through. */
 type Segment = { component: { handleMouse?: (event: any) => any }; height: number };
 type Layout = { width: number; segments: Segment[] };
-/** A left press on a header, waiting for its click. Anything that moved the header since cancels it. */
-type Armed = { first: string; start: number; width: number; reconciliations: number };
+/** A left press on a header or member, waiting for its click. Anything that moved the target since cancels it. */
+type Armed =
+	| {
+			kind: "header";
+			first: string;
+			start: number;
+			width: number;
+			reconciliations: number;
+			disclosureGeneration: number;
+			sessionId: string | undefined;
+	  }
+	| {
+			kind: "member";
+			first: string;
+			memberId: string;
+			row: any;
+			start: number;
+			height: number;
+			width: number;
+			reconciliations: number;
+			disclosureGeneration: number;
+			sessionId: string | undefined;
+	  };
 
 const NO_ACTION = {};
 
@@ -683,6 +704,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	let signature: unknown[] = [];
 	let layout: Layout | undefined;
 	let armed: Armed | undefined;
+	let disclosureGeneration = 0;
 
 	// ── failing open ──
 
@@ -718,6 +740,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		container = undefined;
 		layout = undefined;
 		armed = undefined;
+		disclosureGeneration = 0;
 		view = createShellView();
 		rowOf = new Map();
 		idOf = new Map();
@@ -976,6 +999,8 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		for (const group of view.groups) syncExpansion(group);
 	}
 
+	let armedTargetSeen = false;
+
 	function drawGroup(group: ShellGroup, start: number, width: number, out: string[], segments: Segment[]): void {
 		const members = group.memberIds.map((id) => view.members.get(id)!);
 		const wrapped = (fields: readonly Field[], column: number) => wrapFields(fields, width - 1, column, visibleWidth).map(paint);
@@ -985,6 +1010,9 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		const header = wrapped(formatHeader(members, group.expanded), HEADER_COLUMN);
 		out.push(...header);
 		const headerStart = start + 1;
+		if (armed?.kind === "header" && armed.first === group.memberIds[0]) {
+			if (armed.width === width && armed.start === headerStart) armedTargetSeen = true;
+		}
 		segments.push({ component: { handleMouse: (event) => headerMouse(group, headerStart, event) }, height: header.length });
 		const identity = identityLines(members).flatMap((fields) => wrapped(fields, BODY_COLUMN));
 		if (identity.length > 0) {
@@ -998,9 +1026,13 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 			// The row's own render, so every wrapper on its prototype runs, pi-45's indent included.
 			const lines: string[] = native(() => row.render(width));
 			out.push(...lines);
-			// A plain click on a grouped member does nothing: only the header toggles. Every other event is the row's.
+			const memberStart = out.length - lines.length;
+			const memberHeight = lines.length;
+			if (armed?.kind === "member" && armed.memberId === memberId(member)) {
+				if (armed.width === width && armed.start === memberStart && armed.height === memberHeight) armedTargetSeen = true;
+			}
 			segments.push({
-				component: { handleMouse: (event) => (event.type === "click" && (event.button === "left" || event.button === "none") ? undefined : row.handleMouse?.(event)) },
+				component: { handleMouse: (event) => memberMouse(group, member, memberStart, memberHeight, event) },
 				height: lines.length,
 			});
 			const own = notes[i]!.flatMap((note) => wrapped([[{ text: note, role: "muted" }]], BODY_COLUMN));
@@ -1013,6 +1045,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 
 	/** One frame: each child in the order Pi holds it, a group standing where its first member is. Nothing in the container changes. */
 	function project(width: number): string[] {
+		armedTargetSeen = false;
 		const entries: Entry[] = [];
 		const seen: unknown[] = [];
 		const ids = new Set<string>();
@@ -1050,6 +1083,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 			const group = id === undefined ? undefined : view.groupOf.get(id);
 			if (group && group.memberIds[0] === id) drawGroup(group, out.length, width, out, segments);
 		}
+		if (armed && !armedTargetSeen) armed = undefined;
 		layout = { width, segments };
 		return out;
 	}
@@ -1066,25 +1100,46 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 
 	// ── the mouse ──
 
-	/** The header's lines are the one place a click changes disclosure. The click must follow a plain left press on the same header, still where it was. */
+	/** The header's lines toggle group disclosure. The click must follow a plain left press on the same header, still where it was. */
 	function headerMouse(group: ShellGroup, start: number, event: any): { handled: true } | undefined {
 		try {
 			const plain = !event.shift && !event.alt && !event.ctrl;
 			if (event.type === "press") {
-				armed = event.button === "left" && plain ? { first: group.memberIds[0]!, start, width: layout!.width, reconciliations: view.reconciliations } : undefined;
+				armed =
+					event.button === "left" && plain
+						? {
+								kind: "header",
+								first: group.memberIds[0]!,
+								start,
+								width: layout!.width,
+								reconciliations: view.reconciliations,
+								disclosureGeneration,
+								sessionId,
+						  }
+						: undefined;
 				return undefined;
 			}
 			if (event.type !== "click") {
-				if (event.type === "drag") armed = undefined;
+				if (event.type === "drag" || event.type === "wheel") armed = undefined;
 				return undefined;
 			}
 			const press = armed;
 			armed = undefined;
 			// Pi reports the synthesized click's button as `left` or `none`, by terminal.
-			if (!press || !plain || (event.button !== "left" && event.button !== "none")) return undefined;
-			if (press.first !== group.memberIds[0] || press.start !== start || press.width !== layout!.width || press.reconciliations !== view.reconciliations) return undefined;
+			if (!press || press.kind !== "header" || !plain || (event.button !== "left" && event.button !== "none")) return undefined;
+			if (
+				press.first !== group.memberIds[0] ||
+				press.start !== start ||
+				press.width !== layout!.width ||
+				press.reconciliations !== view.reconciliations ||
+				press.disclosureGeneration !== disclosureGeneration ||
+				press.sessionId !== sessionId
+			)
+				return undefined;
 			group.expanded = !group.expanded;
+			disclosureGeneration++;
 			syncExpansion(group);
+			requestRender();
 			return { handled: true };
 		} catch (error) {
 			if (error instanceof NativeFault) throw error.error;
@@ -1094,12 +1149,84 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		}
 	}
 
+	/** In fullscreen, clicking an expanded command or its output immediately collapses the whole group to its count header. */
+	function memberMouse(group: ShellGroup, member: ShellMember, start: number, height: number, event: any): any {
+		const row = member.nativeRow as any;
+		try {
+			const plain = !event.shift && !event.alt && !event.ctrl;
+			if (event.type === "press") {
+				if (event.button === "left" && plain) {
+					armed = {
+						kind: "member",
+						first: group.memberIds[0]!,
+						memberId: memberId(member),
+						row,
+						start,
+						height,
+						width: layout!.width,
+						reconciliations: view.reconciliations,
+						disclosureGeneration,
+						sessionId,
+					};
+				} else {
+					armed = undefined;
+				}
+				return native(() => row.handleMouse?.(event));
+			}
+			if (event.type === "drag" || event.type === "wheel") {
+				armed = undefined;
+				return native(() => row.handleMouse?.(event));
+			}
+			if (event.type === "click") {
+				const press = armed;
+				armed = undefined;
+				const isLeftOrNone = event.button === "left" || event.button === "none";
+				if (press && press.kind === "member" && isLeftOrNone && plain) {
+					const valid =
+						press.first === group.memberIds[0] &&
+						press.memberId === memberId(member) &&
+						press.row === row &&
+						press.start === start &&
+						press.height === height &&
+						press.width === layout!.width &&
+						press.reconciliations === view.reconciliations &&
+						press.disclosureGeneration === disclosureGeneration &&
+						press.sessionId === sessionId &&
+						group.expanded;
+					if (valid) {
+						group.expanded = false;
+						disclosureGeneration++;
+						syncExpansion(group);
+						requestRender();
+						return { handled: true };
+					}
+				}
+				// Modified left/none clicks or clicks without a valid member press must not fold the individual native row
+				if (isLeftOrNone) return undefined;
+				return native(() => row.handleMouse?.(event));
+			}
+			return native(() => row.handleMouse?.(event));
+		} catch (error) {
+			if (error instanceof NativeFault) throw error.error;
+			fail("mouse", error);
+			return { handled: true };
+		}
+	}
+
 	function mouse(self: any, original: Method, event: any): any {
 		const drawn = layout;
 		// Nothing of ours is on screen yet: the event belongs to Pi's own geometry.
-		if (!drawn) return original.call(self, event);
+		if (!drawn) {
+			if (event?.type === "press" || event?.type === "drag" || event?.type === "wheel") armed = undefined;
+			return original.call(self, event);
+		}
 		// Drawn at another width: the rows under the pointer are not the rows this layout knows.
-		if (drawn.width !== event?.width) return undefined;
+		if (drawn.width !== event?.width) {
+			armed = undefined;
+			return undefined;
+		}
+		// Any competing press, drag, or wheel on any row (outside row, inert row, or group row) clears any prior armed gesture before routing
+		if (event?.type === "press" || event?.type === "drag" || event?.type === "wheel") armed = undefined;
 		// Pi's own routing, over the lines the view drew instead of the lines the container would have drawn.
 		return original.call({ mouseLayout: { width: drawn.width, children: drawn.segments } }, event);
 	}
@@ -1134,6 +1261,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	}
 
 	function mirrorExpansion(expanded: boolean): void {
+		disclosureGeneration++;
 		for (const group of view.groups) {
 			group.expanded = expanded;
 			syncExpansion(group);

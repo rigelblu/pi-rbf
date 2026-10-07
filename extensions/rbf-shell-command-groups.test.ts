@@ -11,7 +11,7 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) =>
 );
 
 import { createBashToolDefinition, createEventBus, initTheme, InteractiveMode, ToolExecutionComponent, VERSION } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text, stripTerminalSequences } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, getOsc8LinkAtColumn, hyperlink, stripTerminalSequences, TuiAltScreen } from "@earendil-works/pi-tui";
 import rbfShellCommandGroups, {
 	CONTAINER_METHODS,
 	createShellGroupsView,
@@ -27,6 +27,7 @@ import { createShellDisplayOwner, rbfBackgroundTasks, setActiveTaskManager, unpa
 import type { ShellDisplayFact } from "./rbf-background-tasks.ts";
 import { applyToolPartsIndent, restoreToolPartsIndent } from "./rbf-tool-parts-indent.ts";
 import { applyToolExecutionBlended, restoreToolExecutionBlended } from "./rbf-tool-execution-blended.ts";
+import rbfShellDisplayProbe from "./test-support/rbf-shell-display-probe.ts";
 import {
 	applyEvidence,
 	BODY_COLUMN,
@@ -2030,30 +2031,494 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(s.draw(40)[1]).toBe(" ▸ 5 shell commands · 1 running");
 			});
 
-			it("a plain click anywhere on a grouped member is unhandled and leaves the group and the member open", async () => {
+			it("a plain click on any cell of an expanded member collapses the whole group immediately, and reopening reveals every member in order", async () => {
 				const s = stage();
 				await s.run("c1", ALPHA, "alpha\nbeta\n");
+				await s.run("c2", LONG, `before\n${WORDS}\nafter\n`);
 				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
 				const lines = s.draw(100);
-				const command = lines.indexOf(" $ printf 'alpha\\nbeta\\n'");
-				const output = lines.indexOf("    beta");
-				const reached = vi.spyOn(s.rows()[0], "handleMouse");
-				for (const y of [command, command + 1, output, command - 1, output + 1]) {
-					for (const x of [0, 1, 2, 3, 4, 20]) {
-						for (const button of ["left", "none"]) {
-							s.mouse("press", y, { x });
-							s.mouse("release", y, { x });
-							expect(s.mouse("click", y, { x, button })).toBeUndefined();
+				const c1Command = lines.findIndex((l) => l.startsWith(" $ printf 'alpha"));
+				const c1Output = lines.indexOf("    beta");
+				const c1Took = lines.findIndex((l, i) => i > c1Command && l.includes("Took "));
+				const c1TrailPad = c1Took + 1;
+				const c2Command = lines.findIndex((l) => l.startsWith(" $ echo before"));
+				const c2Wrap = c2Command + 1;
+				const c2Output = lines.findIndex((l, i) => i > c2Command && l.includes("    after"));
+				const c2Took = lines.findIndex((l, i) => i > c2Command && l.includes("Took "));
+				const c2TrailPad = c2Took + 1;
+
+				expect(c1Command, "c1Command locate").toBeGreaterThanOrEqual(0);
+				expect(c1Output, "c1Output locate").toBeGreaterThanOrEqual(0);
+				expect(c1Took, "c1Took locate").toBeGreaterThanOrEqual(0);
+				expect(c1TrailPad, "c1TrailPad locate").toBeGreaterThanOrEqual(0);
+				expect(c2Command, "c2Command locate").toBeGreaterThanOrEqual(0);
+				expect(c2Wrap, "c2Wrap locate").toBeGreaterThanOrEqual(0);
+				expect(c2Output, "c2Output locate").toBeGreaterThanOrEqual(0);
+				expect(c2Took, "c2Took locate").toBeGreaterThanOrEqual(0);
+				expect(c2TrailPad, "c2TrailPad locate").toBeGreaterThanOrEqual(0);
+
+				// Wrapped target line actually is a continuation line, not a new command header
+				expect(lines[c2Wrap].startsWith(" $ "), "c2Wrap is continuation, not command header").toBe(false);
+				expect(lines[c2Wrap].trim().length, "c2Wrap has content").toBeGreaterThan(0);
+
+				const reached1 = vi.spyOn(s.rows()[0], "handleMouse");
+				const reached2 = vi.spyOn(s.rows()[1], "handleMouse");
+
+				const targets = [
+					{ desc: "first member command", y: c1Command, x: 6 },
+					{ desc: "first member indent column", y: c1Output, x: 2 },
+					{ desc: "first member output", y: c1Output, x: 8 },
+					{ desc: "first member leading padding", y: c1Command - 1, x: 6 },
+					{ desc: "first member metadata", y: c1Took, x: 6 },
+					{ desc: "first member trailing padding", y: c1TrailPad, x: 6 },
+					{ desc: "later member command", y: c2Command, x: 6 },
+					{ desc: "later member wrapped command line", y: c2Wrap, x: 6 },
+					{ desc: "later member output", y: c2Output, x: 8 },
+					{ desc: "later member metadata", y: c2Took, x: 6 },
+					{ desc: "later member trailing padding", y: c2TrailPad, x: 6 },
+				];
+
+				for (const { desc, y, x } of targets) {
+					expect(y, `${desc} y position`).toBeGreaterThanOrEqual(0);
+
+					// Plain press alone changes nothing
+					expect(s.mouse("press", y, { x }), `${desc} press changes nothing`).toBeUndefined();
+					expect(s.headers(), `${desc} headers after press`).toEqual([" ▾ ran 2 shell commands"]);
+					expect(s.draw(100).some((l) => l.startsWith(" $ printf 'alpha")), `${desc} member 1 still drawn after press`).toBe(true);
+					expect(s.draw(100).some((l) => l.startsWith(" $ echo before")), `${desc} member 2 still drawn after press`).toBe(true);
+
+					// Release and click (both button: left and button: none supported)
+					for (const button of ["left", "none"] as const) {
+						s.mouse("release", y, { x, button });
+						const result = s.mouse("click", y, { x, button });
+						expect(result, `${desc} click handled with button ${button}`).toMatchObject({ handled: true });
+						expect(result.focus, `${desc} click focus with button ${button}`).toBeUndefined();
+						expect(result.capture, `${desc} click capture with button ${button}`).toBeUndefined();
+
+						// Whole group collapses immediately
+						expect(s.headers(), `${desc} group header collapsed with button ${button}`).toEqual([" ▸ ran 2 shell commands"]);
+						const collapsedLines = s.draw(100);
+						expect(collapsedLines.some((l) => l.startsWith(" $ ")), `${desc} no member commands shown after collapse`).toBe(false);
+
+						// Reopening reveals every member again in order
+						s.click(s.headerRow());
+						expect(s.headers(), `${desc} group header reopened`).toEqual([" ▾ ran 2 shell commands"]);
+						const reopened = s.draw(100);
+						expect(reopened.findIndex((l) => l.startsWith(" $ printf 'alpha"))).toBeLessThan(reopened.findIndex((l) => l.startsWith(" $ echo before")));
+
+						// Re-arm for next button iteration
+						s.mouse("press", y, { x });
+					}
+					// cancel pending press from loop
+					s.mouse("release", y, { x });
+				}
+
+				// The consumed click never reached either member's own toggle handler
+				expect(reached1.mock.calls.filter(([event]) => (event as any).type === "click")).toEqual([]);
+				expect(reached2.mock.calls.filter(([event]) => (event as any).type === "click")).toEqual([]);
+			});
+
+			it("clicking an expanded member in one group collapses only that group, leaving other groups unchanged", async () => {
+				const s = stage();
+				await s.run("c1");
+				s.prose("Between groups.");
+				await s.run("c2");
+				s.click(s.headerRow(0));
+				s.click(s.headerRow(1));
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command", " ▾ ran 1 shell command"]);
+				const lines = s.draw(80);
+				const secondCommand = lines.lastIndexOf(" $ pwd");
+				const result = s.click(secondCommand);
+				expect(result, "second group member click handled").toMatchObject({ handled: true });
+				expect(s.headers(), "only second group collapsed").toEqual([" ▾ ran 1 shell command", " ▸ ran 1 shell command"]);
+			});
+
+			it("drag, non-left, modified clicks and wheel scroll bypass whole-group collapse", async () => {
+				const s = stage();
+				s.prose("Before.");
+				await s.run("c1", ALPHA, "alpha\nbeta\n");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
+				const lines = s.draw(100);
+				const y = lines.indexOf("    beta");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				// Drag bypass: press, drag, release, click
+				s.mouse("press", y);
+				s.mouse("drag", y, { x: 9 });
+				s.mouse("release", y);
+				expect(s.mouse("click", y)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
+
+				// Non-left and modified clicks
+				expect(s.click(y, { button: "right" })).toBeUndefined();
+				expect(s.click(y, { button: "middle" })).toBeUndefined();
+				expect(s.click(y, { shift: true })).toBeUndefined();
+				expect(s.click(y, { ctrl: true })).toBeUndefined();
+				expect(s.click(y, { alt: true })).toBeUndefined();
+				expect(s.mouse("wheel", y, { button: "none", wheelDelta: 1 })).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
+			});
+
+			// Fixture note: stock bash warnings are plain text on installed hosts; this test-only fixture
+			// verifies that when a tool result emits an OSC 8 hyperlink, TuiAltScreen link activation bypasses group collapse.
+			it("test fixture: real native OSC 8 hyperlink in member output activates TuiAltScreen link handler and leaves group expanded", async () => {
+				const openUrl = vi.fn();
+				let terminalInput: (data: string) => void = () => {};
+				const terminal: any = {
+					columns: 100, rows: 40, kittyProtocolActive: false,
+					start: (onInput: (data: string) => void) => { terminalInput = onInput; },
+					stop() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {},
+					clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+				};
+				const ui = new TuiAltScreen(terminal, false, "/tmp", { openUrl });
+
+				try {
+					const s = stage({ announce: false });
+					const fullOutputPath = "/tmp/rbf-test-full-output.log";
+					const linkText = `Full output: ${fullOutputPath}`;
+					const link = hyperlink(linkText, `file://${fullOutputPath}`);
+					const origRender = s.bash.renderResult;
+					s.bash.renderResult = (result: any, options: any, theme: any, context: any) => {
+						const comp = origRender.call(s.bash, result, options, theme, context);
+						comp.addChild(new Text(`    Output truncated. ${link}`, 0, 0));
+						return comp;
+					};
+					s.owner.start(SESSION, s.bash);
+
+					await s.run("c1", "cat file", "alpha\n");
+					await s.run("c2", "echo beta", "beta\n");
+					s.click(s.headerRow());
+					expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+
+					ui.setLayoutRoot(s.chat);
+					ui.start();
+					ui.renderNow(true);
+
+					const screenLines = (ui as any).previousScreen as string[];
+					const prevLinkRow = screenLines.findIndex((l: string) => l.includes("Full output"));
+					expect(prevLinkRow, "line with Full output in previousScreen").toBeGreaterThanOrEqual(0);
+					const lineText = screenLines[prevLinkRow] ?? "";
+					let linkVisibleCol = -1;
+					for (let c = 0; c < 80; c++) {
+						if (getOsc8LinkAtColumn(lineText, c) === `file://${fullOutputPath}`) {
+							linkVisibleCol = c;
+							break;
 						}
 					}
+					expect(linkVisibleCol, "visible column with OSC8 link").toBeGreaterThanOrEqual(0);
+					terminalInput(`\x1b[<0;${linkVisibleCol + 1};${prevLinkRow + 1}M`);
+					terminalInput(`\x1b[<0;${linkVisibleCol + 1};${prevLinkRow + 1}m`);
+					ui.renderNow(true);
+
+					// Observable opener evidence: TuiAltScreen opened the URL
+					expect(openUrl).toHaveBeenCalledWith(`file://${fullOutputPath}`);
+					// Group remains expanded: native link activation bypassed collapse
+					expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				} finally {
+					ui.stop();
 				}
-				expect(reached.mock.calls.filter(([event]) => (event as any).type === "click")).toEqual([]);
+			});
+
+			it("inert group-owned identity, status and separator rows do not collapse the group on click", async () => {
+				const s = stage();
+				for (const [i, state] of ["ran", "background:task-123", "failed", "unknown", "running"].entries()) await member(s, `c${i}`, state);
+				s.click(s.headerRow());
+				expect(s.headers()[0]).toContain("▾ 5 shell commands");
+				const lines = s.draw(80);
+				const blankAbove = s.headerRow() - 1;
+				const taskId = lines.indexOf("    Task ID: task-123");
+				const statusUnknown = lines.indexOf("    Status unknown");
+				expect(taskId).toBeGreaterThan(-1);
+				expect(statusUnknown).toBeGreaterThan(-1);
+
+				expect(s.click(blankAbove)).toBeUndefined();
+				expect(s.headers()[0]).toContain("▾ 5 shell commands");
+
+				expect(s.click(taskId)).toBeUndefined();
+				expect(s.headers()[0]).toContain("▾ 5 shell commands");
+
+				expect(s.click(statusUnknown)).toBeUndefined();
+				expect(s.headers()[0]).toContain("▾ 5 shell commands");
+			});
+
+			it("width change during press rejects member click and keeps group expanded", async () => {
+				const s = stage();
+				await s.run("c1");
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				const y = s.draw().indexOf(" $ pwd");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", y);
+				s.chat.render(60);
+				expect(s.mouse("click", y, { width: 60 })).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+			});
+
+			it("output height change during press rejects member click and keeps group expanded", async () => {
+				const s = stage();
+				await s.begin("c1", "cat");
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()[0]).toContain("▾");
+				const y = s.draw().indexOf(" $ cat");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", y);
+				await s.host.handleEvent({ type: "tool_execution_update", toolCallId: "c1", toolName: "bash", partialResult: { content: [{ type: "text", text: "extra\noutput\nlines\n" }] } });
+				s.draw();
+				expect(s.mouse("click", y)).toBeUndefined();
+				expect(s.headers()[0]).toContain("▾");
+			});
+
+			it("same-geometry output refresh during press permits member click and collapses group", async () => {
+				const s = stage();
+				await s.begin("c1", "cat");
+				await s.host.handleEvent({ type: "tool_execution_update", toolCallId: "c1", toolName: "bash", partialResult: { content: [{ type: "text", text: "line 1\n" }] } });
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()[0]).toContain("▾");
+				const y = s.draw().indexOf(" $ cat");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", y);
+				await s.host.handleEvent({ type: "tool_execution_update", toolCallId: "c1", toolName: "bash", partialResult: { content: [{ type: "text", text: "line 2\n" }] } });
+				s.draw();
+				const result = s.mouse("click", y);
+				expect(result, "same-geometry click handled").toMatchObject({ handled: true });
+				expect(s.headers()[0], "same-geometry click collapsed group").toContain("▸");
+			});
+
+			it("true membership change during press (row joined/split) rejects member click", async () => {
+				const s = stage();
+				await s.run("c1");
+				const late = new Text("", 1, 0);
+				s.chat.addChild(late);
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				const y = s.draw().indexOf(" $ pwd");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				// Press while it's a 2-member single group
+				s.mouse("press", y);
+				// Text arrives and splits group into two 1-member groups
+				late.setText("A thought, late.");
+				s.draw();
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command", " ▾ ran 1 shell command"]);
+				// Click on stale geometry/membership rejected
+				expect(s.mouse("click", y)).toBeUndefined();
+			});
+
+			it("global close and reopen cycle during press rejects member click even at same final geometry", async () => {
+				const s = stage();
+				await s.run("c1");
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				const y = s.draw().indexOf(" $ pwd");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", y);
+				s.host.setToolsExpanded(false);
+				s.host.setToolsExpanded(true);
+				s.draw();
+				expect(s.mouse("click", y)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+			});
+
+			it("session switch and view replacement reject stale member clicks across sessions even at same geometry", async () => {
+				const s = stage();
+				await s.run("c1");
+				s.click(s.headerRow());
 				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
-				expect(s.rows()[0].expanded).toBe(true);
-				// The same click after the row rebuilt its result region, as a streaming update does.
-				s.rows()[0].updateDisplay();
-				expect(s.click(s.draw(100).indexOf("    beta"))).toBeUndefined();
-				expect(s.rows()[0].expanded).toBe(true);
+				const y = s.draw().indexOf(" $ pwd");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", y);
+				// Session switch: owner starts new session on same host and runs new command at same position
+				const sess2 = "session-2";
+				s.owner.start(sess2, s.bash);
+				s.host.toolOutputExpanded = true;
+				s.view.start({ ...s.ctx, sessionManager: { getSessionId: () => sess2 } });
+				s.chat.children = [];
+				await s.run("c2_1");
+				s.draw();
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
+
+				// Stale press from session 1 cannot close session 2's group
+				s.mouse("release", y);
+				expect(s.mouse("click", y)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
+			});
+
+			it("fault projection drops member clicks without throwing and keeps fallback display", async () => {
+				const s = stage();
+				await s.run("c1");
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				const y = s.draw().indexOf(" $ pwd");
+				expect(y).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", y);
+				// Inject an actual projection failure into member mouse handling
+				Object.defineProperty(s.view.state.groups[0]!, "memberIds", {
+					get() {
+						throw new Error("injected member mouse projection fault");
+					},
+				});
+				expect(() => s.mouse("click", y)).not.toThrow();
+				expect(s.view.fault).toMatchObject({ where: "mouse", error: expect.objectContaining({ message: "injected member mouse projection fault" }) });
+				// Fallback display is Pi's native display
+				expect(s.draw()).toEqual(s.native());
+			});
+
+			it("competing press on inert row or outside tool row cancels prior member press", async () => {
+				const s = stage();
+				await s.run("c1");
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+				const lines = s.draw(80);
+				const memberY = lines.indexOf(" $ pwd");
+				const blankAbove = s.headerRow() - 1;
+				expect(memberY).toBeGreaterThanOrEqual(0);
+				expect(blankAbove).toBeGreaterThanOrEqual(0);
+
+				// Press on member row, then competing press on inert blank row cancels gesture
+				s.mouse("press", memberY);
+				s.mouse("press", blankAbove);
+				s.mouse("release", memberY);
+				expect(s.mouse("click", memberY)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+
+				// Press on member row, then competing press on outside tool row cancels gesture
+				s.definitions.set("read", { name: "read", execute: async () => ({ content: [] }), renderCall: () => new Text("read a.ts", 0, 0), renderResult: () => new Text("", 0, 0) });
+				await s.host.handleEvent({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "a.ts" } });
+				s.draw();
+				const readY = s.draw().findIndex((l) => l.includes("read a.ts"));
+				expect(readY).toBeGreaterThanOrEqual(0);
+
+				s.mouse("press", memberY);
+				s.mouse("press", readY);
+				s.mouse("release", memberY);
+				expect(s.mouse("click", memberY)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+
+				// Drag across inert blank row cancels prior member press
+				s.mouse("press", memberY);
+				s.mouse("drag", blankAbove);
+				s.mouse("release", memberY);
+				expect(s.mouse("click", memberY)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+
+				// Drag across outside tool row cancels prior member press
+				s.mouse("press", memberY);
+				s.mouse("drag", readY);
+				s.mouse("release", memberY);
+				expect(s.mouse("click", memberY)).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ ran 2 shell commands"]);
+			});
+
+			it("temporary resize or height change then restored geometry rejects stale member click", async () => {
+				const s = stage();
+				await s.begin("c1", "cat");
+				await s.host.handleEvent({
+					type: "tool_execution_update",
+					toolCallId: "c1",
+					toolName: "bash",
+					partialResult: { content: [{ type: "text", text: "initial\n" }] },
+				});
+				await s.run("c2");
+				s.click(s.headerRow());
+				expect(s.headers()).toEqual([" ▾ 2 shell commands · 1 waiting"]);
+				const y80 = s.draw(80).indexOf(" $ cat");
+				expect(y80).toBeGreaterThanOrEqual(0);
+
+				// 1. Temporary resize from 80 to 120 and back to 80
+				s.mouse("press", y80, { width: 80 });
+				s.draw(120);
+				s.draw(80);
+				s.mouse("release", y80, { width: 80 });
+				expect(s.mouse("click", y80, { width: 80 })).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ 2 shell commands · 1 waiting"]);
+
+				// 2. Temporary height change: output updates to taller frame then back to exact initial height
+				s.mouse("press", y80, { width: 80 });
+				await s.host.handleEvent({
+					type: "tool_execution_update",
+					toolCallId: "c1",
+					toolName: "bash",
+					partialResult: { content: [{ type: "text", text: "line 1\nline 2\nline 3\n" }] },
+				});
+				s.draw(80); // taller frame rendered during press
+				await s.host.handleEvent({
+					type: "tool_execution_update",
+					toolCallId: "c1",
+					toolName: "bash",
+					partialResult: { content: [{ type: "text", text: "initial\n" }] },
+				});
+				s.draw(80); // original height restored before click
+				s.mouse("release", y80, { width: 80 });
+				expect(s.mouse("click", y80, { width: 80 })).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ 2 shell commands · 1 waiting"]);
+
+				// 3. Wrong-width non-press event followed by valid-width click proves clearing branch
+				s.mouse("press", y80, { width: 80 });
+				s.mouse("wheel", y80, { width: 120, button: "none" });
+				s.mouse("release", y80, { width: 80 });
+				expect(s.mouse("click", y80, { width: 80 })).toBeUndefined();
+				expect(s.headers()).toEqual([" ▾ 2 shell commands · 1 waiting"]);
+			});
+
+			it("closing active or restored groups (running, background, waiting, failed, unknown) collapses disclosure and reopening preserves exact full output, owner facts and pendingTools", async () => {
+				for (const state of ["running", "background:task-42", "waiting", "failed", "unknown"]) {
+					const s = stage();
+					await member(s, "c1", state);
+					await s.run("c2", "echo second", "second output\n");
+					s.click(s.headerRow());
+					expect(s.headers()[0]).toContain("▾");
+
+					// Capture exact before-close state: full rendered output, tool args, results, pendingTools
+					const beforeLines = s.rows().map((r) => r.render(100));
+					const beforeFacts = s.rows().map((r) => ({ args: r.args, result: r.result, toolCallId: r.toolCallId }));
+					const beforePending = s.host.pendingTools.has("c1");
+
+					// Click member row to collapse whole group
+					const memberRow = s.draw().indexOf(" $ pwd");
+					const result = s.click(memberRow);
+					expect(result, `member click in state ${state}`).toMatchObject({ handled: true });
+					expect(s.headers()[0], `header collapsed in state ${state}`).toContain("▸");
+
+					// Header truthful status preserved while collapsed
+					if (state === "running") {
+						expect(s.headers()[0]).toContain("running");
+						expect(s.host.pendingTools.has("c1")).toBe(true);
+					} else if (state.startsWith("background")) {
+						expect(s.headers()[0]).toContain("background");
+					} else if (state === "waiting") {
+						expect(s.headers()[0]).toContain("waiting");
+					} else if (state === "failed") {
+						expect(s.headers()[0]).toContain("failed");
+					} else if (state === "unknown") {
+						expect(s.headers()[0]).toContain("unknown");
+					}
+
+					// Click header to reopen group
+					s.click(s.headerRow());
+					expect(s.headers()[0], `header reopened in state ${state}`).toContain("▾");
+
+					// Exact full-output, args, results, tool IDs and pendingTools preserved across close/reopen
+					const afterLines = s.rows().map((r) => r.render(100));
+					const afterFacts = s.rows().map((r) => ({ args: r.args, result: r.result, toolCallId: r.toolCallId }));
+					expect(afterLines, `exact rendered output in state ${state}`).toEqual(beforeLines);
+					expect(afterFacts, `exact facts in state ${state}`).toEqual(beforeFacts);
+					expect(s.host.pendingTools.has("c1"), `pendingTools preserved in state ${state}`).toBe(beforePending);
+				}
 			});
 
 			it("the same click on a tool row outside any group is Pi's: the row toggles", async () => {
@@ -2201,9 +2666,15 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const y = s.draw().indexOf(" $ pwd");
 				vi.spyOn(row, "handleMouse").mockImplementation(() => { throw broken; });
 				expect(() => s.mouse("press", y)).toThrow(broken);
+				expect(() => s.mouse("drag", y)).toThrow(broken);
+				expect(() => s.mouse("release", y)).toThrow(broken);
+				expect(() => s.mouse("wheel", y, { button: "none" })).toThrow(broken);
+				expect(() => s.mouse("click", y, { button: "right" })).toThrow(broken);
 				expect(s.view.fault).toBeUndefined();
 				await tick();
 				expect(s.notify).not.toHaveBeenCalled();
+				// View remains attached
+				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
 			});
 
 			it("Pi's own methods keep their results and errors: a thrown event, a rejected event, a failed expansion that mirrors nothing", async () => {
@@ -2649,6 +3120,232 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(heard.filter((m) => m.kind === "snapshot-request")).toEqual([{ kind: "snapshot-request", sessionId: SESSION }]);
 				expect(heard.filter((m) => m.kind === "fact")).toHaveLength(1002);
 			}, 60_000);
+		});
+
+		describe("test support display probe lifecycle and ownership", () => {
+			it("inactive receipt capture delegates to saved originals when wrapped by later owner after shutdown", async () => {
+				const linkLog = `/tmp/test-probe-link-${Date.now()}.log`;
+				const copyLog = `/tmp/test-probe-copy-${Date.now()}.log`;
+				process.env.RBF_PROBE_LINK_LOG = linkLog;
+				process.env.RBF_PROBE_COPY_LOG = copyLog;
+
+				const proto = InteractiveMode.prototype as any;
+				const savedProtoHandleEvent = proto.handleEvent;
+				proto.handleEvent = function () {};
+
+				let shutdownHandler: any;
+				rbfShellDisplayProbe({
+					events: createEventBus(),
+					on(name: string, fn: any) {
+						if (name === "session_shutdown") shutdownHandler = fn;
+					},
+					registerCommand() {},
+				} as any);
+
+				let opens = 0;
+				let copies = 0;
+				let receivedUrl = "";
+				let receivedText = "";
+				const r1: any = {
+					openUrl(url: string) {
+						opens++;
+						receivedUrl = url;
+					},
+					async copySelection(text: string) {
+						copies++;
+						receivedText = text;
+						return true;
+					},
+					copyOnSelect: false,
+				};
+
+				proto.handleEvent.call({ renderer: r1 });
+
+				const innerOpen = r1.openUrl;
+				const innerCopy = r1.copySelection;
+				const laterOpen = function (this: any, url: string) {
+					return innerOpen.call(this, url);
+				};
+				const laterCopy = function (this: any, text: string) {
+					return innerCopy.call(this, text);
+				};
+				r1.openUrl = laterOpen;
+				r1.copySelection = laterCopy;
+
+				shutdownHandler();
+
+				r1.openUrl("file:///test-url");
+				await r1.copySelection("test-copy");
+
+				expect(r1.openUrl).toBe(laterOpen);
+				expect(r1.copySelection).toBe(laterCopy);
+				expect(opens).toBe(1);
+				expect(receivedUrl).toBe("file:///test-url");
+				expect(copies).toBe(1);
+				expect(receivedText).toBe("test-copy");
+
+				proto.handleEvent = savedProtoHandleEvent;
+				delete process.env.RBF_PROBE_LINK_LOG;
+				delete process.env.RBF_PROBE_COPY_LOG;
+			});
+
+			it("preserves later owner copy configuration and policy across events and shutdown", async () => {
+				const linkLog = `/tmp/test-probe-link-${Date.now()}.log`;
+				const copyLog = `/tmp/test-probe-copy-${Date.now()}.log`;
+				process.env.RBF_PROBE_LINK_LOG = linkLog;
+				process.env.RBF_PROBE_COPY_LOG = copyLog;
+
+				const proto = InteractiveMode.prototype as any;
+				const savedProtoHandleEvent = proto.handleEvent;
+				proto.handleEvent = function () {};
+
+				let shutdownHandler: any;
+				rbfShellDisplayProbe({
+					events: createEventBus(),
+					on(name: string, fn: any) {
+						if (name === "session_shutdown") shutdownHandler = fn;
+					},
+					registerCommand() {},
+				} as any);
+
+				const r2: any = {
+					openUrl() {},
+					async copySelection() {
+						return true;
+					},
+					copyOnSelect: false,
+				};
+
+				proto.handleEvent.call({ renderer: r2 });
+				expect(r2.copyOnSelect).toBe(true);
+
+				const otherCopy = async () => false;
+				r2.copySelection = otherCopy;
+				r2.copyOnSelect = true;
+
+				proto.handleEvent.call({ renderer: r2 });
+				expect(r2.copySelection).toBe(otherCopy);
+				expect(r2.copyOnSelect).toBe(true);
+
+				shutdownHandler();
+				expect(r2.copySelection).toBe(otherCopy);
+				expect(r2.copyOnSelect).toBe(true);
+
+				proto.handleEvent = savedProtoHandleEvent;
+				delete process.env.RBF_PROBE_LINK_LOG;
+				delete process.env.RBF_PROBE_COPY_LOG;
+			});
+
+			it("restores original own and inherited property shapes when probe owns configuration", async () => {
+				const linkLog = `/tmp/test-probe-link-${Date.now()}.log`;
+				const copyLog = `/tmp/test-probe-copy-${Date.now()}.log`;
+				process.env.RBF_PROBE_LINK_LOG = linkLog;
+				process.env.RBF_PROBE_COPY_LOG = copyLog;
+
+				const proto = InteractiveMode.prototype as any;
+				const savedProtoHandleEvent = proto.handleEvent;
+				proto.handleEvent = function () {};
+
+				let shutdownHandler: any;
+				rbfShellDisplayProbe({
+					events: createEventBus(),
+					on(name: string, fn: any) {
+						if (name === "session_shutdown") shutdownHandler = fn;
+					},
+					registerCommand() {},
+				} as any);
+
+				const origOpen = () => {};
+				const origCopy = async () => true;
+				const r3: any = { openUrl: origOpen, copySelection: origCopy, copyOnSelect: false };
+				const parent = { copyOnSelect: false };
+				const r4: any = Object.create(parent);
+				r4.openUrl = origOpen;
+				r4.copySelection = origCopy;
+
+				proto.handleEvent.call({ renderer: r3 });
+				proto.handleEvent.call({ renderer: r4 });
+
+				expect(r3.copyOnSelect).toBe(true);
+				expect(r4.copyOnSelect).toBe(true);
+				expect(Object.prototype.hasOwnProperty.call(r4, "copyOnSelect")).toBe(true);
+
+				shutdownHandler();
+
+				expect(r3.openUrl).toBe(origOpen);
+				expect(r3.copySelection).toBe(origCopy);
+				expect(r3.copyOnSelect).toBe(false);
+				expect(Object.prototype.hasOwnProperty.call(r3, "copyOnSelect")).toBe(true);
+
+				expect(r4.openUrl).toBe(origOpen);
+				expect(r4.copySelection).toBe(origCopy);
+				expect(r4.copyOnSelect).toBe(false);
+				expect(Object.prototype.hasOwnProperty.call(r4, "copyOnSelect")).toBe(false);
+
+				proto.handleEvent = savedProtoHandleEvent;
+				delete process.env.RBF_PROBE_LINK_LOG;
+				delete process.env.RBF_PROBE_COPY_LOG;
+			});
+
+			it("delegates to inherited original callbacks under later wrappers after shutdown preserving context, arguments and return values", async () => {
+				const linkLog = `/tmp/test-probe-link-${Date.now()}.log`;
+				const copyLog = `/tmp/test-probe-copy-${Date.now()}.log`;
+				process.env.RBF_PROBE_LINK_LOG = linkLog;
+				process.env.RBF_PROBE_COPY_LOG = copyLog;
+
+				const proto = InteractiveMode.prototype as any;
+				const savedProtoHandleEvent = proto.handleEvent;
+				proto.handleEvent = function () {};
+
+				let shutdownHandler: any;
+				rbfShellDisplayProbe({
+					events: createEventBus(),
+					on(name: string, fn: any) {
+						if (name === "session_shutdown") shutdownHandler = fn;
+					},
+					registerCommand() {},
+				} as any);
+
+				let opens = 0;
+				let copies = 0;
+				const parent = {
+					openUrl(this: any, ...args: any[]) {
+						opens++;
+						return `${this.tag}:${args.join(",")}`;
+					},
+					copySelection(this: any, ...args: any[]) {
+						copies++;
+						return Promise.resolve(this.tag === "native" && args.join(",") === "a,b" ? "inherited-ok" : "mismatch");
+					},
+					copyOnSelect: false,
+				};
+				const renderer: any = Object.assign(Object.create(parent), { tag: "native" });
+
+				proto.handleEvent.call({ renderer });
+
+				const innerOpen = renderer.openUrl;
+				const innerCopy = renderer.copySelection;
+				renderer.openUrl = function (this: any, ...args: any[]) {
+					return innerOpen.apply(this, args);
+				};
+				renderer.copySelection = function (this: any, ...args: any[]) {
+					return innerCopy.apply(this, args);
+				};
+
+				shutdownHandler();
+
+				const openRes = renderer.openUrl("a", "b");
+				const copyRes = await renderer.copySelection("a", "b");
+
+				expect(opens).toBe(1);
+				expect(openRes).toBe("native:a,b");
+				expect(copies).toBe(1);
+				expect(copyRes).toBe("inherited-ok");
+
+				proto.handleEvent = savedProtoHandleEvent;
+				delete process.env.RBF_PROBE_LINK_LOG;
+				delete process.env.RBF_PROBE_COPY_LOG;
+			});
 		});
 	});
 });

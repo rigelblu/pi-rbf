@@ -185,6 +185,7 @@ function editorLine(lines: string[]): string {
 }
 /** `Took` reads the clock: two runs of one command differ by a tenth of a second and by nothing else. */
 const took = (lines: string[]) => lines.map((line) => line.replace(/Took \d+\.\ds/, "Took N.Ns"));
+const settle = took;
 const style = (cell: Cell) => `${cell.fg || "default"}${cell.bold ? " bold" : ""}${cell.dim ? " dim" : ""}`;
 /** The facts an owner told, each once: the log also holds the copies it replays when the view asks for a snapshot. */
 const factsOf = (facts: Fact[], toolCallId?: string) => {
@@ -340,12 +341,77 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 			},
 			PTY,
 		);
+
+		it(
+			"C3: in fullscreen active Pi, clicking an expanded member during streaming collapses group without cancelling execution, header completes truthfully closed, and reopening reveals finished output",
+			async () => {
+				const run = await drive({
+					scenario,
+					host,
+					name: "active-streaming-collapse",
+					extensions: PROFILE,
+					script: [
+						bash("echo b3V0X2ZpcnN0Cg== | base64 -d"),
+						bash("echo b3V0X2FscGhhCg== | base64 -d; sleep 3; echo b3V0X2JldGEK | base64 -d"),
+						text("STREAM_DONE"),
+					],
+					steps: [
+						...START,
+						...GO,
+						{ wait: "2 shell commands · 1 running" },
+						...click("header_open", "2 shell commands · 1 running"),
+						{ wait: "out_alpha" },
+						...mark("streaming_expanded"),
+						// Locate command 2 row to prove click mark is below command row
+						{ locate: { name: "cmd2", text: "b3V0X2FscGhhCg==" } },
+						// Plain click on streaming member output during stable sleep interval
+						{ locate: { name: "stream_out_click", text: "out_alpha" } },
+						{ bytes: "\x1b[<0;6;{stream_out_click}M" },
+						{ bytes: "\x1b[<0;6;{stream_out_click}m" },
+						...mark("streaming_collapsed"),
+						// Verify command continues running without cancellation and finishes truthfully closed
+						{ wait: "STREAM_DONE" },
+						...mark("streaming_finished"),
+						// Click header to reopen and verify complete finished output
+						...click("header_reopen", "ran 2 shell commands"),
+						...mark("streaming_reopened"),
+					],
+				});
+				expect(headers(transcript(run.lines("streaming_expanded")))[0]).toContain("▾ 2 shell commands · 1 running");
+				expect(headers(transcript(run.lines("streaming_collapsed")))[0]).toContain("▸ 2 shell commands · 1 running");
+				// Verify click mark was on output row strictly below command row
+				expect(run.marks["row:stream_out_click"]).toBeGreaterThan(run.marks["row:cmd2"]);
+				// Crucial: not cancelled!
+				expect(headers(transcript(run.lines("streaming_finished")))).toEqual([" ▸ ran 2 shell commands"]);
+				expect(transcript(run.lines("streaming_finished")).join("\n")).not.toContain("cancelled");
+				// Reopening shows distinct output rows and exact successful stored results
+				const reopened = transcript(run.lines("streaming_reopened"));
+				expect(reopened.filter((line) => line.startsWith(" $ "))).toEqual([
+					" $ echo b3V0X2ZpcnN0Cg== | base64 -d",
+					" $ echo b3V0X2FscGhhCg== | base64 -d; sleep 3; echo b3V0X2JldGEK | base64 -d",
+				]);
+				const cmd1Idx = reopened.indexOf(" $ echo b3V0X2ZpcnN0Cg== | base64 -d");
+				const cmd2Idx = reopened.indexOf(" $ echo b3V0X2FscGhhCg== | base64 -d; sleep 3; echo b3V0X2JldGEK | base64 -d");
+				const out1 = reopened.slice(cmd1Idx + 1, cmd2Idx);
+				const out2 = reopened.slice(cmd2Idx + 1);
+
+				expect(out1.map((l) => l.replace(/^[^a-zA-Z0-9]*/, "")).filter(Boolean)).toContain("out_first");
+				expect(out2.map((l) => l.replace(/^[^a-zA-Z0-9]*/, "")).filter(Boolean)).toContain("out_alpha");
+				expect(out2.map((l) => l.replace(/^[^a-zA-Z0-9]*/, "")).filter(Boolean)).toContain("out_beta");
+
+				const results = toolResults(run.session());
+				expect(results.map((r) => r.isError)).toEqual([false, false]);
+				expect(resultText(results[0]).trim()).toBe("out_first");
+				expect(resultText(results[1]).trim()).toBe("out_alpha\nout_beta");
+			},
+			PTY * 2,
+		);
 	});
 
 	describe.each(HOSTS)("codex completion and interrupt on $name", (host) => {
 		const scenario = "S4-codex";
-		const codexRun = (name: string, codex: FakeScenario, steps: Step[]) =>
-			drive({ scenario, host, name, extensions: [VIEW, CODEX, INDENT, BLENDED], model: "codex-harness/codex", codex, steps: [...START, ...GO, ...steps] });
+		const codexRun = (name: string, codex: FakeScenario, steps: Step[], cols = 80) =>
+			drive({ scenario, host, name, extensions: [VIEW, CODEX, INDENT, BLENDED], model: "codex-harness/codex", codex, cols, steps: [...START, ...GO, ...steps] });
 
 		it(
 			"a command that succeeds counts once and exit 7 stays visibly failed",
@@ -367,6 +433,100 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				const calls = run.session().filter((entry) => entry.type === "message" && entry.message?.role === "assistant").flatMap((entry) => entry.message.content.filter((part: any) => part.type === "toolCall"));
 				expect(calls.map((call: any) => call.arguments.command)).toEqual(["/bin/zsh -lc 'pwd'", "/bin/zsh -lc 'exit 7'"]);
 				expect(calls.map((call: any) => call.arguments.threadId)).toEqual(["", ""]); // the root's display args name no thread
+			},
+			PTY,
+		);
+
+		it.each([80, 120])(
+			"C2: at %i columns, in deterministic Codex-through-Pi, clicking an expanded command collapses the whole group immediately, and header reopens it",
+			async (cols) => {
+				const run = await codexRun(
+					`codex-cmd-collapse-${cols}`,
+					{ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo first'", output: ["CODEX_OUT_FIRST\n"] }, { kind: "command", id: "c2", command: "/bin/zsh -lc 'echo second'", output: ["CODEX_OUT_SECOND\n"] }, { kind: "answer", id: "m1", text: "CODEX_DONE" }, { kind: "complete" }] },
+					[
+						{ wait: "CODEX_DONE" },
+						...click("header", "ran 2 shell commands"),
+						...mark("opened"),
+						...click("cmd_click", "echo first"),
+						...mark("cmd_collapsed"),
+						...click("reopen", "ran 2 shell commands"),
+						...mark("reopened"),
+					],
+					cols,
+				);
+				const hdrs = (name: string) => headers(transcript(run.lines(name)));
+				expect(hdrs("opened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(hdrs("cmd_collapsed")).toEqual([" ▸ ran 2 shell commands"]);
+				expect(transcript(run.lines("cmd_collapsed")).filter((line) => line.startsWith(" $ "))).toEqual([]);
+				expect(hdrs("reopened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(settle(transcript(run.lines("reopened")))).toEqual(settle(transcript(run.lines("opened"))));
+			},
+			PTY,
+		);
+
+		it.each([80, 120])(
+			"C2: at %i columns, in deterministic Codex-through-Pi, clicking an expanded output collapses the whole group immediately, and header reopens it",
+			async (cols) => {
+				const run = await codexRun(
+					`codex-out-collapse-${cols}`,
+					{ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo first'", output: ["CODEX_OUT_FIRST\n"] }, { kind: "command", id: "c2", command: "/bin/zsh -lc 'echo second'", output: ["CODEX_OUT_SECOND\n"] }, { kind: "answer", id: "m1", text: "CODEX_DONE" }, { kind: "complete" }] },
+					[
+						{ wait: "CODEX_DONE" },
+						...click("header", "ran 2 shell commands"),
+						...mark("opened"),
+						{ locate: { name: "cmd", text: "echo second" } },
+						...click("out_click", "CODEX_OUT_SECOND"),
+						...mark("out_collapsed"),
+						...click("reopen", "ran 2 shell commands"),
+						...mark("reopened"),
+					],
+					cols,
+				);
+				expect(run.marks["row:out_click"]).toBeGreaterThan(run.marks["row:cmd"]);
+				const hdrs = (name: string) => headers(transcript(run.lines(name)));
+				expect(hdrs("opened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(hdrs("out_collapsed")).toEqual([" ▸ ran 2 shell commands"]);
+				expect(transcript(run.lines("out_collapsed")).filter((line) => line.startsWith(" $ "))).toEqual([]);
+				expect(hdrs("reopened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(settle(transcript(run.lines("reopened")))).toEqual(settle(transcript(run.lines("opened"))));
+			},
+			PTY,
+		);
+
+		it(
+			"C3: in deterministic Codex-through-Pi, stale member press after resize rejects collapse and keeps group expanded",
+			async () => {
+				const run = await codexRun(
+					"codex-stale-press-resize",
+					{ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo first'", output: ["first\n"] }, { kind: "command", id: "c2", command: "/bin/zsh -lc 'echo second'", output: ["second\n"] }, { kind: "answer", id: "m1", text: "CODEX_DONE" }, { kind: "complete" }] },
+					[
+						{ wait: "CODEX_DONE" },
+						...click("header", "ran 2 shell commands"),
+						...mark("expanded"),
+						// 1. Press on member row at cols=80
+						{ locate: { name: "cmd", text: "echo first" } },
+						{ bytes: "\x1b[<0;6;{cmd}M" },
+						// 2. Terminal resize to 120 and back to 80
+						{ resize: { cols: 120, rows: 40 } },
+						{ sleep: 0.3 },
+						{ resize: { cols: 80, rows: 40 } },
+						{ sleep: 0.3 },
+						// 3. Release and click at the original coordinates
+						{ bytes: "\x1b[<0;6;{cmd}m" },
+						{ sleep: 0.3 },
+						...mark("after_stale"),
+						// 4. Fresh member click collapses group
+						...click("fresh_member", "echo first"),
+						...mark("collapsed"),
+						// 5. Header click reopens group
+						...click("reopen", "ran 2 shell commands"),
+						...mark("reopened"),
+					],
+				);
+				expect(headers(transcript(run.lines("after_stale")))).toEqual([" ▾ ran 2 shell commands"]);
+				expect(headers(transcript(run.lines("collapsed")))).toEqual([" ▸ ran 2 shell commands"]);
+				expect(headers(transcript(run.lines("reopened")))).toEqual([" ▾ ran 2 shell commands"]);
+				expect(settle(transcript(run.lines("reopened")))).toEqual(settle(transcript(run.lines("expanded"))));
 			},
 			PTY,
 		);
@@ -558,7 +718,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 		);
 
 		it(
-			"the header toggles once per click, a plain click on a member changes nothing, and the keyboard reaches the same details",
+			"the header toggles once per click, a plain click on an expanded member collapses the whole group, and the keyboard reaches the same details",
 			async () => {
 				const run = await drive({
 					scenario,
@@ -574,28 +734,29 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 						{ wait: "GATE_DONE" },
 						...click("h1", "ran 3 shell commands"),
 						...mark("opened"),
-						// Plain clicks on a member: its output, its command line, an indent column.
+						// Plain click on a member: its output collapses the whole group immediately.
 						...click("out", "alpha", { x: 8 }),
-						...click("cmd", "printf 'alpha", { x: 4 }),
-						...click("indent", "beta", { x: 2 }),
-						...mark("member-clicks"),
+						...mark("member-collapsed"),
+						// Reopening from header reveals all 3 commands again.
+						...click("h2", "ran 3 shell commands"),
+						...mark("reopened"),
 						// Right click, wheel and a shift click on the header.
-						...click("h2", "ran 3 shell commands", { button: 2 }),
-						...click("h3", "ran 3 shell commands", { button: 4 }),
-						{ bytes: "\x1b[<64;6;{h3}M" },
-						{ bytes: "\x1b[<65;6;{h3}M" },
+						...click("h3", "ran 3 shell commands", { button: 2 }),
+						...click("h4", "ran 3 shell commands", { button: 4 }),
+						{ bytes: "\x1b[<64;6;{h4}M" },
+						{ bytes: "\x1b[<65;6;{h4}M" },
 						...mark("other-buttons"),
 						// A press that becomes a drag along the header, released elsewhere on it.
-						{ locate: { name: "h4", text: "ran 3 shell commands" } },
-						{ bytes: "\x1b[<0;6;{h4}M" },
-						{ bytes: "\x1b[<32;12;{h4}M" },
-						{ bytes: "\x1b[<0;12;{h4}m" },
+						{ locate: { name: "h5", text: "ran 3 shell commands" } },
+						{ bytes: "\x1b[<0;6;{h5}M" },
+						{ bytes: "\x1b[<32;12;{h5}M" },
+						{ bytes: "\x1b[<0;12;{h5}m" },
 						...mark("dragged"),
 						// Two separate clicks, one after the other.
-						...click("h5", "ran 3 shell commands"),
 						...click("h6", "ran 3 shell commands"),
-						...mark("two-clicks"),
 						...click("h7", "ran 3 shell commands"),
+						...mark("two-clicks"),
+						...click("h8", "ran 3 shell commands"),
 						...mark("closed"),
 						{ paste: "typed" },
 						...mark("typed"),
@@ -603,7 +764,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 						{ key: "ctrl-o" },
 						{ wait: "Tool output: expanded" },
 						...mark("global-open"),
-						...click("h8", "ran 3 shell commands"),
+						...click("h9", "ran 3 shell commands"),
 						...mark("local-close"),
 						{ key: "ctrl-o" },
 						{ wait: "Tool output: collapsed" },
@@ -612,9 +773,11 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				});
 				const mark3 = (name: string) => headers(transcript(run.lines(name)));
 				expect(mark3("opened")).toEqual([" ▾ ran 3 shell commands"]);
-				expect(mark3("member-clicks")).toEqual([" ▾ ran 3 shell commands"]);
-				expect(transcript(run.lines("member-clicks")).filter((line) => line.startsWith(" $ "))).toHaveLength(3);
-				expect(took(transcript(run.lines("member-clicks")))).toEqual(took(transcript(run.lines("opened"))));
+				expect(mark3("member-collapsed")).toEqual([" ▸ ran 3 shell commands"]);
+				expect(transcript(run.lines("member-collapsed")).filter((line) => line.startsWith(" $ "))).toEqual([]);
+				expect(mark3("reopened")).toEqual([" ▾ ran 3 shell commands"]);
+				expect(transcript(run.lines("reopened")).filter((line) => line.startsWith(" $ "))).toHaveLength(3);
+				expect(took(transcript(run.lines("reopened")))).toEqual(took(transcript(run.lines("opened"))));
 				expect(mark3("other-buttons")).toEqual([" ▾ ran 3 shell commands"]);
 				expect(mark3("dragged")).toEqual([" ▾ ran 3 shell commands"]);
 				expect(mark3("two-clicks")).toEqual([" ▾ ran 3 shell commands"]); // closed by the first click, opened again by the second
@@ -628,6 +791,231 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				expect(run.lines("global-close").join("\n")).not.toContain("unavailable");
 			},
 			PTY,
+		);
+
+		it.each([80, 120])(
+			"C2: at %i columns, clicking an expanded command collapses the group, drag selection leaves it open, and header reopens it",
+			async (cols) => {
+				const run = await drive({
+					scenario: "C2-member-cmd-click-cols",
+					host,
+					name: `member-cmd-click-${cols}`,
+					extensions: PROFILE,
+					script: [bash("echo alpha"), bash("echo beta"), text("GATE_DONE")],
+					cols,
+					rows: 40,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						...click("h1", "ran 2 shell commands"),
+						...mark("opened"),
+						// Drag over member text: selection highlight present and leaves group open
+						{ locate: { name: "cmd", text: "echo beta" } },
+						{ bytes: "\x1b[<0;6;{cmd}M" },
+						{ bytes: "\x1b[<32;18;{cmd}M" },
+						...mark("dragging"),
+						{ bytes: "\x1b[<0;18;{cmd}m" },
+						...mark("dragged"),
+						// Plain click on member command: collapses whole group
+						...click("cmd_click", "echo beta"),
+						...mark("cmd_collapsed"),
+						// Header click: reopens group
+						...click("h_reopen", "ran 2 shell commands"),
+						...mark("cmd_reopened"),
+					],
+				});
+				const hdrs = (name: string) => headers(transcript(run.lines(name)));
+				expect(hdrs("opened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(hdrs("dragging")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(run.screen("dragging").cells.some((r) => r.some((c) => c.inverse)), "drag selection highlight active").toBe(true);
+				expect(hdrs("dragged")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(hdrs("cmd_collapsed")).toEqual([" ▸ ran 2 shell commands"]);
+				expect(transcript(run.lines("cmd_collapsed")).filter((line) => line.startsWith(" $ "))).toEqual([]);
+				expect(hdrs("cmd_reopened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(settle(transcript(run.lines("cmd_reopened")))).toEqual(settle(transcript(run.lines("opened"))));
+			},
+			PTY * 2,
+		);
+
+		it.each([80, 120])(
+			"C2: at %i columns, clicking an expanded output collapses the group, and header reopens it",
+			async (cols) => {
+				const run = await drive({
+					scenario: "C2-member-out-click-cols",
+					host,
+					name: `member-out-click-${cols}`,
+					extensions: PROFILE,
+					script: [
+						bash("echo T1VUX1NFTlRJTkVMX0FMUEhBCg== | base64 -d"),
+						bash("echo T1VUX1NFTlRJTkVMX0JFVEEK | base64 -d"),
+						text("GATE_DONE"),
+					],
+					cols,
+					rows: 40,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						...click("h1", "ran 2 shell commands"),
+						...mark("opened"),
+						{ locate: { name: "cmd", text: "T1VUX1NFTlRJTkVMX0FMUEhB" } },
+						// Plain click on member output: collapses whole group
+						...click("out_click", "OUT_SENTINEL_ALPHA"),
+						...mark("out_collapsed"),
+						// Header click: reopens group
+						...click("h_reopen", "ran 2 shell commands"),
+						...mark("out_reopened"),
+					],
+				});
+				expect(run.marks["row:out_click"]).toBeGreaterThan(run.marks["row:cmd"]);
+				const hdrs = (name: string) => headers(transcript(run.lines(name)));
+				expect(hdrs("opened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(hdrs("out_collapsed")).toEqual([" ▸ ran 2 shell commands"]);
+				expect(transcript(run.lines("out_collapsed")).filter((line) => line.startsWith(" $ "))).toEqual([]);
+				expect(hdrs("out_reopened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(settle(transcript(run.lines("out_reopened")))).toEqual(settle(transcript(run.lines("opened"))));
+			},
+			PTY * 2,
+		);
+
+		it.each([80, 120])(
+			"C2: at %i columns, native OSC 8 hyperlink click opens URL receipt and keeps group open, drag copy records exact text, and ungrouped reference matches",
+			async (cols) => {
+				const linkLog = join(ARTIFACTS, "C2-link-receipt", host.name, `link-${cols}.log`);
+				const copyLog = join(ARTIFACTS, "C2-link-receipt", host.name, `copy-${cols}.log`);
+				rmSync(linkLog, { force: true });
+				rmSync(copyLog, { force: true });
+				const run = await drive({
+					scenario: "C2-link-receipt",
+					host,
+					name: `grouped-link-${cols}`,
+					extensions: PROFILE,
+					script: [bash("echo link-fixture"), bash("echo second-cmd"), text("GATE_DONE")],
+					cols,
+					rows: 40,
+					env: {
+						PI_HYPERLINKS: "1",
+						RBF_PROBE_LINK_COMMAND: "link-fixture",
+						RBF_PROBE_LINK_LOG: linkLog,
+						RBF_PROBE_COPY_LOG: copyLog,
+					},
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						...click("header", "ran 2 shell commands"),
+						...mark("opened"),
+						// Click on the native hyperlink text row: opens URL via openUrl and keeps group open
+						...click("link_click", "Full Output", { x: 10 }),
+						...mark("link_clicked"),
+						// Drag over second command output to copy exact text
+						{ locate: { name: "out2", text: "second-cmd" } },
+						{ bytes: "\x1b[<0;4;{out2}M" },
+						{ bytes: "\x1b[<32;20;{out2}M" },
+						...mark("drag_active"),
+						{ bytes: "\x1b[<0;20;{out2}m" },
+						...mark("drag_copied"),
+						// Plain click on second command collapses group
+						...click("cmd_collapse", "second-cmd"),
+						...mark("collapsed"),
+					],
+				});
+				expect(headers(transcript(run.lines("opened")))).toEqual([" ▾ ran 2 shell commands"]);
+				expect(headers(transcript(run.lines("link_clicked"))), "link click keeps group expanded").toEqual([" ▾ ran 2 shell commands"]);
+				expect(existsSync(linkLog), "link receipt log created").toBe(true);
+				expect(readFileSync(linkLog, "utf8")).toBe("file:///tmp/rbf-test-full-output.log\n");
+				expect(headers(transcript(run.lines("drag_copied"))), "drag copy keeps group expanded").toEqual([" ▾ ran 2 shell commands"]);
+				expect(existsSync(copyLog), "copy receipt log created").toBe(true);
+				expect(readFileSync(copyLog, "utf8")).toBe(" second-cmd\n");
+				expect(headers(transcript(run.lines("collapsed"))), "plain member click collapses group").toEqual([" ▸ ran 2 shell commands"]);
+
+				// Ungrouped reference matches receipt behavior
+				const nativeLinkLog = join(ARTIFACTS, "C2-link-receipt", host.name, `native-link-${cols}.log`);
+				const nativeCopyLog = join(ARTIFACTS, "C2-link-receipt", host.name, `native-copy-${cols}.log`);
+				rmSync(nativeLinkLog, { force: true });
+				rmSync(nativeCopyLog, { force: true });
+				await drive({
+					scenario: "C2-link-receipt",
+					host,
+					name: `native-link-${cols}`,
+					extensions: [OWNER, INDENT, BLENDED],
+					script: [bash("echo link-fixture"), bash("echo second-cmd"), text("GATE_DONE")],
+					cols,
+					rows: 40,
+					env: {
+						PI_HYPERLINKS: "1",
+						RBF_PROBE_LINK_COMMAND: "link-fixture",
+						RBF_PROBE_LINK_LOG: nativeLinkLog,
+						RBF_PROBE_COPY_LOG: nativeCopyLog,
+					},
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						{ key: "ctrl-o" },
+						{ wait: "Tool output: expanded" },
+						...click("native_link_click", "Full Output", { x: 10 }),
+						{ locate: { name: "out2", text: "second-cmd" } },
+						{ bytes: "\x1b[<0;4;{out2}M" },
+						{ bytes: "\x1b[<32;20;{out2}M" },
+						{ bytes: "\x1b[<0;20;{out2}m" },
+						...mark("native_done"),
+					],
+				});
+				expect(existsSync(nativeLinkLog)).toBe(true);
+				expect(readFileSync(nativeLinkLog, "utf8")).toBe("file:///tmp/rbf-test-full-output.log\n");
+				expect(readFileSync(nativeLinkLog, "utf8")).toBe(readFileSync(linkLog, "utf8"));
+				expect(existsSync(nativeCopyLog)).toBe(true);
+				expect(readFileSync(nativeCopyLog, "utf8")).toBe(" second-cmd\n");
+				expect(readFileSync(nativeCopyLog, "utf8")).toBe(readFileSync(copyLog, "utf8"));
+			},
+			PTY * 3,
+		);
+
+		it.each([80, 120])(
+			"C3: at %i columns (indent loaded: false), clicking expanded member collapses group, wheel on member leaves it open, and prompt click does not collapse",
+			async (cols) => {
+				const run = await drive({
+					scenario: "C3-no-indent-and-padding",
+					host,
+					name: `no-indent-cols-${cols}`,
+					extensions: [VIEW, OWNER, BLENDED],
+					script: [bash("echo alpha"), bash("echo beta"), text("GATE_DONE")],
+					cols,
+					rows: 40,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						...click("header", "ran 2 shell commands"),
+						...mark("opened"),
+						// Wheel on expanded member output leaves group open
+						{ locate: { name: "out", text: "alpha" } },
+						{ bytes: "\x1b[<64;8;{out}M" },
+						{ bytes: "\x1b[<65;8;{out}M" },
+						...mark("wheeled"),
+						// Click on prompt line does not collapse group
+						{ locate: { name: "prompt", text: "──" } },
+						{ bytes: "\x1b[<0;10;{prompt+1}M" },
+						{ bytes: "\x1b[<0;10;{prompt+1}m" },
+						...mark("prompt_clicked"),
+						// Plain click on expanded member collapses whole group
+						...click("member_collapse", "alpha"),
+						...mark("collapsed"),
+						// Header reopens
+						...click("reopen", "ran 2 shell commands"),
+						...mark("reopened"),
+					],
+				});
+				const cleanHdr = (name: string) => headers(transcript(run.lines(name))).map((l) => l.replace(/\s*┃.*$/, "").trimEnd());
+				expect(cleanHdr("opened")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(cleanHdr("wheeled")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(cleanHdr("prompt_clicked")).toEqual([" ▾ ran 2 shell commands"]);
+				expect(cleanHdr("collapsed")).toEqual([" ▸ ran 2 shell commands"]);
+				expect(cleanHdr("reopened")).toEqual([" ▾ ran 2 shell commands"]);
+			},
+			PTY * 2,
 		);
 
 		it(
@@ -745,6 +1133,44 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				// Showing it wrote nothing to the session.
 				expect(run.marks.after).toEqual(run.marks.before);
 				expect(run.lines("closed").join("\n")).not.toContain("unavailable");
+			},
+			PTY,
+		);
+
+		it(
+			"C3: after reload, clicking an expanded member row collapses the restored group immediately, and header reopens it",
+			async () => {
+				const run = await drive({
+					scenario,
+					host,
+					name: "reload-member-click",
+					extensions: PROFILE,
+					script: [bash("echo one"), bash("echo two"), text("GATE_DONE")],
+					cols: 80,
+					rows: 60,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						{ paste: "/reload" },
+						{ key: "enter" },
+						{ wait: "Reloaded" },
+						{ sleep: 1 },
+						...click("h_open", "2 shell commands"),
+						...mark("reloaded_opened"),
+						// Plain click on expanded member row collapses restored group
+						...click("member_collapse", "echo two"),
+						...mark("reloaded_collapsed"),
+						// Reopen via header
+						...click("h_reopen", "2 shell commands"),
+						...mark("reloaded_reopened"),
+					],
+				});
+				expect(headers(run.lines("reloaded_opened"))).toEqual([" ▾ 2 shell commands · status unknown"]);
+				expect(headers(run.lines("reloaded_collapsed"))).toEqual([" ▸ 2 shell commands · status unknown"]);
+				expect(headers(run.lines("reloaded_reopened"))).toEqual([" ▾ 2 shell commands · status unknown"]);
+				const rep = run.lines("reloaded_reopened");
+				expect(rep.filter((line) => line.startsWith(" $ "))).toEqual([" $ echo one", " $ echo two"]);
 			},
 			PTY,
 		);
@@ -1011,6 +1437,95 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				expect(clicked.length).toBeGreaterThan(rowsOf(dropped).length);
 				expect(clicked.slice(clicked.indexOf(" $ echo two"))).toEqual(rowsOf(dropped).slice(rowsOf(dropped).indexOf(" $ echo two")));
 				expect(run.lines("native-click").filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+			},
+			PTY * 2,
+		);
+
+		it(
+			"C3: projection fault from expanded member gesture drops failed input, detaches to native rows, and allows later native input",
+			async () => {
+				const faultScript = [
+					bash("for i in $(seq 1 7); do echo item_$i; done"),
+					bash("echo second"),
+					text("GATE_DONE"),
+				];
+				const native = await drive({
+					scenario,
+					host,
+					name: "member-fault-reference",
+					extensions: [OWNER, INDENT, BLENDED],
+					script: faultScript,
+					rows: 60,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						...click("n1", "earlier lines"),
+						...click("n2", "echo second"),
+						...mark("native_expanded"),
+					],
+				});
+				const run = await drive({
+					scenario,
+					host,
+					name: "member-mouse-fault",
+					extensions: PROFILE,
+					script: faultScript,
+					rows: 60,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						...click("header", "ran 2 shell commands"),
+						...mark("expanded"),
+						{ paste: "/rbf-groups-fault mouse" },
+						{ key: "enter" },
+						{ sleep: 0.5 },
+						// Click on expanded member row with fault active
+						...click("member_click", "item_1"),
+						{ wait: "Shell command groups unavailable" },
+						...mark("member_fault_dropped"),
+						// Next click on native result row operates natively to collapse output
+						...click("row_native", "item_7"),
+						...mark("native_clicked"),
+					],
+				});
+				expect(headers(run.lines("expanded"))).toEqual([" ▾ ran 2 shell commands"]);
+				const dropped = run.lines("member_fault_dropped");
+				expect(headers(dropped)).toEqual([]);
+				expect(dropped.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				const nativeClicked = run.lines("native_clicked");
+				expect(nativeClicked.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+
+				const rowsOf = (lines: string[]) => {
+					const all = took(transcript(lines));
+					const start = all.findIndex((l) => l.includes("for i in $(seq 1 7)"));
+					const end = all.indexOf(" GATE_DONE");
+					return all.slice(start, end);
+				};
+				const droppedRows = rowsOf(dropped);
+				const clickedRows = rowsOf(nativeClicked);
+				const refRows = rowsOf(native.lines("native_expanded"));
+
+				// Failed gesture preserves both native rows, matching ungrouped native reference
+				expect(droppedRows).toEqual(refRows);
+
+				// Subsequent native click on result row toggles disclosure of clicked row only
+				expect(clickedRows).not.toEqual(droppedRows);
+				const secondIdxDropped = droppedRows.findIndex((l) => l.includes("echo second"));
+				const secondIdxClicked = clickedRows.findIndex((l) => l.includes("echo second"));
+				expect(secondIdxDropped).toBeGreaterThan(-1);
+				expect(secondIdxClicked).toBeGreaterThan(-1);
+
+				const droppedOut = droppedRows.slice(1, secondIdxDropped);
+				const clickedOut = clickedRows.slice(1, secondIdxClicked);
+				expect(droppedOut.some((l) => l.includes("item_1"))).toBe(true);
+				expect(clickedOut.some((l) => l.includes("item_1"))).toBe(false);
+				expect(clickedOut.some((l) => l.includes("earlier lines"))).toBe(true);
+				expect(droppedOut.some((l) => l.includes("earlier lines"))).toBe(false);
+
+				// Keep exact second-row equality
+				expect(clickedRows.slice(secondIdxClicked)).toEqual(droppedRows.slice(secondIdxDropped));
 			},
 			PTY * 2,
 		);
