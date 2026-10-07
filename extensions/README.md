@@ -406,19 +406,22 @@ Local Pi extension providing an inline, non-modal selector at the prompt line fo
 # 🔵⋯ rbf-rewind
 
 ## 🟠⋯ Overview
-Local Pi extension registering `/rewind` as a first-class alias for Pi's session tree navigator `/tree`. Allows users accustomed to Claude Code muscle memory to navigate checkpoints and switch session branches cleanly by typing `/rewind`.
+Local Pi extension registering `/rewind` to navigate the session tree with user messages first, while preserving native filter switching and `/tree` behavior. Allows users accustomed to Claude Code muscle memory to navigate checkpoints and switch session branches cleanly by typing `/rewind`.
 
 ## 🟠⋯ Capabilities & Behavior
-- First-Class Alias: Typing `/rewind` in Pi's prompt editor immediately launches Pi's native session tree selector modal (`showTreeSelector()`) and clears the prompt editor.
+- User Messages First: Typing `/rewind` in Pi's prompt editor opens the native session tree selector modal with the initial filter set to user-only (`[user]`), showing only user messages immediately.
+- Native Filter Switching: Native filter shortcuts remain fully functional; pressing `Ctrl+U` toggles between user-only and default filter views, and `Ctrl+O` cycles through all available native filters.
+- Native `/tree` Isolation: Typing `/tree` directly continues to open the session tree with its configured filter (e.g. `default` or `all`); `/rewind` never alters saved filter preferences or `settings.json`.
+- Summary Cancel & Reopen: If branch summarization is cancelled or aborted with Escape, subsequent selector reopens follow native Pi behavior and read the configured native filter.
 - Argument Tolerance: Ignores trailing whitespace and arguments (e.g. `/rewind 2`, `/rewind now`, `  /rewind  `), matching native `/tree` behavior.
-- Autocomplete: Registered in Pi's command list with description `"Navigate session tree (switch branches) (alias for /tree)"`, making it discoverable when typing `/re`.
+- Autocomplete: Registered in Pi's command list with description `"Navigate session tree (user messages first)"`, making it discoverable when typing `/re`.
 - Standout Syntax Highlighting: Supported by `rbf-standout-commands`, highlighting `/rewind` as a valid keyword in the prompt.
 - Non-Interactive / RPC Fallback: If executed in headless or non-interactive environments where interactive UI is unavailable, outputs an informational notification explaining that tree navigation requires interactive mode.
+- Legacy Activation & Fresh Process: If upgrading from a previous version in an already running Pi session, a fresh Pi process restart is required to enable user-only navigation; if the legacy wrapper is detected, a warning prompts to restart Pi.
+- Runtime Support Seam: Actual runtime support on a given host remains pending until caller proof; if the host's private integration seam is unavailable or cannot be shadowed, a visible warning advises using `/tree` to navigate and refuses unsupported opening.
 
 ## 🟠⋯ Setup & Verification
-- Local verification: launch `pi -e ./extensions/rbf-rewind.ts`, type `/re` to inspect autocomplete, press Enter on `/rewind` to verify tree navigation modal opens.
-- Global installation: `cp ./extensions/rbf-rewind.ts ~/.pi/agent/extensions/rbf-rewind.ts`
-- Removal: `rm -f ~/.pi/agent/extensions/rbf-rewind.ts`
+- Local verification: launch `pi -e ./extensions/rbf-rewind.ts`, type `/re` to inspect autocomplete, press Enter on `/rewind` to verify tree navigation modal opens with user messages first (`[user]`).
 
 ---
 
