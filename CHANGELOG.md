@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.30.2 (2026-10-08)
+## 🟠⋯ Fixed for End Users
+- 2026-10-08 - fix (ux) | select visually wrapped transcript text and copy its original logical lines, without extra newlines or continuation indentation. Genuine line breaks, blank lines and selected source spaces remain. Supported fullscreen text, code and ordinary paragraphs use source-backed copying; unsupported renderers keep native copying. Install the copy extension with its matching path-label, clean-code and tool-indent files, then fully restart Pi. Verified on Pi 0.85.1 and 1.0.4; both physical clipboard checks passed, with leading spaces on the first multiline-control line explicitly accepted by Tom (#pi-50)
+
+---
+
 # 🔵⋯ v0.30.1 (2026-10-08)
 ## 🟠⋯ Improved for End Users
 - 2026-10-08 - improve (ux) | collapse the whole shell group where you are reading: in fullscreen, one plain click on any expanded command or output immediately closes every member back to the count header. Header toggling and Ctrl+O remain available; drag selection and copy remain usable. Double/triple-click word/line selection inside a group is deliberately unavailable. Update only `rbf-shell-command-groups.ts` when the v0.27.0 execution owners are already installed, then restart Pi. Commands, results, task controls and saved history are unchanged. Verified on Pi 0.85.1 and 1.0.4; ordinary collapse and drag/copy passed human use. Remaining human checks were waived by Tomek; a test-only link fixture failed and does not establish native-link preservation in normal bash output (#pi-42.2)

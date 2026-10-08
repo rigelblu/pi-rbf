@@ -6,6 +6,8 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 # 🔵⋯ Extensions
 
+- [`rbf-copy-wrapped-text`](extensions/rbf-copy-wrapped-text.ts) (v0.30.2) — Copy visually wrapped fullscreen text with its original logical lines. Genuine line breaks and selected source spaces remain. [Install the four matching files and roll back](extensions/README.md#-rbf-copy-wrapped-text)
+
 - [`rbf-effort`](extensions/rbf-effort.ts) (v0.30.0) — Use `/effort` and `/effort <level>` as aliases for native `/thinking`. [Install, limits and roll back](extensions/README.md#-rbf-effort)
 - [`rbf-monitor`](extensions/rbf-monitor.ts) (v0.28.0) — The agent arms a shell command with `monitor`, and each line it prints reaches the agent after its turn has ended, with no prompt from you. `task_stop` and `/monitors` stop a watch; the footer shows `1 watch`. [Install, limits and roll back](extensions/README.md#-rbf-monitor)
 - [`rbf-shell-command-groups`](extensions/rbf-shell-command-groups.ts) (introduced v0.27.0; close where reading v0.30.1) — Scan an agent's shell commands as one count line, such as `▸ ran 3 shell commands · 1 failed`, and open it to see each command and result. Click any expanded command/output to close the whole group immediately; drag/copy stays available, while grouped double/triple-click selection does not. Pi's own bash and Codex through Pi; sandbox sessions, `!` commands and nested calls keep their rows. [Install and roll back](extensions/README.md#-rbf-shell-command-groups)

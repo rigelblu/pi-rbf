@@ -785,8 +785,8 @@ Local Pi extension that restores exact logical lines when selecting and copying 
 - Regular-mode, structured tables/images and nested unsupported projections use native copying. An unavailable private seam declines installation; an unwritable terminal uses native rendering and copying
 
 ## 🟠⋯ Verification status
-- Direct repair candidate, uninstalled. Current native diagnostics cover supplied examples, ordinary Assistant/path-label paragraphs, hard-line/partial-code/source-space controls and native fallback/ownership
-- Complete both-host proof and independent review remain prerequisites for human staging. Physical system clipboard and human H1/H2 are not machine test results
+- Local release v0.30.2. Native diagnostics cover supplied examples, ordinary Assistant/path-label paragraphs, hard-line/partial-code/source-space controls and native fallback/ownership
+- Both-host proof and independent review passed. Tom passed physical H1/H2 and explicitly accepted leading first-line spaces in H2; physical acceptance is separate from machine callback proof
 - Native modules and the extension loader are trusted at initialization. Later function replacements require exact identity; owned wrappers expose their actual captured delegates through weak registries, independently of mutable prototype metadata. Reconstructing native methods with different lexical dependencies before the first trusted import is outside this compatibility boundary
 - No claim of compatibility with every future native version, custom renderer or structured composition
 
@@ -801,15 +801,11 @@ Local Pi extension that restores exact logical lines when selecting and copying 
   ./node_modules/.bin/vitest run extensions/rbf-copy-wrapped-text.test.ts
   ./node_modules/.bin/tsc --noEmit
   ```
-- Global installation (after authorized delivery):
+- Global installation: back up the three existing adjacent files first; install all four matching runtime files together, then fully restart Pi:
   ```sh
   cp ./extensions/rbf-clean-markdown-code.ts ~/.pi/agent/extensions/rbf-clean-markdown-code.ts
   cp ./extensions/rbf-tool-parts-indent.ts ~/.pi/agent/extensions/rbf-tool-parts-indent.ts
   cp ./extensions/rbf-path-labels.ts ~/.pi/agent/extensions/rbf-path-labels.ts
   cp ./extensions/rbf-copy-wrapped-text.ts ~/.pi/agent/extensions/rbf-copy-wrapped-text.ts
   ```
-- Removal & rollback: delete the extension file and restart Pi:
-  ```sh
-  rm -f ~/.pi/agent/extensions/rbf-copy-wrapped-text.ts
-  ```
-  A full restart of Pi restores default native selection and copying.
+- Removal & rollback: restore the backed-up `rbf-clean-markdown-code.ts`, `rbf-tool-parts-indent.ts` and `rbf-path-labels.ts`; delete `rbf-copy-wrapped-text.ts` if it was absent before installation. Then fully restart Pi. Restore the whole four-file installation together; no settings or stored sessions migrate.
