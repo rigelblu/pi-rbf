@@ -556,12 +556,15 @@ describe("rbfEffort extension unit tests", () => {
 	});
 
 	describe("Integration and coexistence with rbf-rewind and synthetic editor factories", () => {
-		it("works seamlessly when rbf-rewind is loaded before rbf-effort", () => {
+		it("works seamlessly when rbf-rewind is loaded before rbf-effort", async () => {
 			const mockRewind = createMockExtensionAPI();
 			rbfRewind(mockRewind.api);
 
 			const mockEffort = createMockExtensionAPI();
 			rbfEffort(mockEffort.api);
+
+			// Current rewind activates its submit seam only after TUI session startup.
+			await mockRewind.triggerEvent("session_start", {}, { mode: "tui" } as ExtensionContext);
 
 			class TestEditor extends Editor {}
 			const editor = new TestEditor({} as any, {} as any);
@@ -595,12 +598,15 @@ describe("rbfEffort extension unit tests", () => {
 			expect(nativeSubmit).toHaveBeenCalledWith("just chatting");
 		});
 
-		it("works seamlessly when rbf-effort is loaded before rbf-rewind", () => {
+		it("works seamlessly when rbf-effort is loaded before rbf-rewind", async () => {
 			const mockEffort = createMockExtensionAPI();
 			rbfEffort(mockEffort.api);
 
 			const mockRewind = createMockExtensionAPI();
 			rbfRewind(mockRewind.api);
+
+			// Current rewind activates its submit seam only after TUI session startup.
+			await mockRewind.triggerEvent("session_start", {}, { mode: "tui" } as ExtensionContext);
 
 			class TestEditor extends Editor {}
 			const editor = new TestEditor({} as any, {} as any);
