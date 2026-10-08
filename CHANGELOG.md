@@ -6,6 +6,14 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.29.0 (2026-10-07)
+Versions v0.21.8 through v0.28.0 were cut locally on separate feature lines; this PR publishes only #pi-47 and retains its local v0.29.0 version. Those earlier local features are not included in this delivery.
+## 🟠⋯ Improved for End Users
+- 2026-10-07 - feat (ux) | see only user messages with `/rewind`: the native session tree opens with user messages first, so earlier prompts are visible without changing filters. Ctrl+U toggles the native user filter and Ctrl+O cycles filters; `/tree` keeps its configured filter. Native navigation and summary prompts remain available, and opening or cancelling saves no filter preference. Restart Pi after installation to replace the older rewind wrapper. Verified on Pi 0.85.1 and 1.0.4 (#pi-47)
+
+
+---
+
 # 🔵⋯ v0.21.7 (2026-09-26)
 ## 🟠⋯ 🔒 Security Fixes for End Users
 - 2026-09-26 - fix | pasted terminal control characters no longer reach the terminal through the question form before submission; normal text, internal blank lines, and the submitted answer remain intact (#pi-19.4) [@pi]
