@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.30.0 (2026-10-08)
+## 🟠⋯ Added for End Users
+- 2026-10-08 - feat | use `/effort` as an alias for `/thinking`: bare `/effort` opens Pi's native thinking selector, and `/effort <level>` uses its native validation and session settings. Install `rbf-effort.ts`, then restart Pi or use `/reload`. A later custom editor replacement can disable the alias; use `/thinking` when its fallback notice appears. Verified on Pi 0.85.1 and 1.0.4, with human verification passed (#pi-51)
+
+---
+
 # 🔵⋯ v0.29.0 (2026-10-07)
 ## 🟠⋯ Improved for End Users
 - 2026-10-07 - feat (ux) | see only user messages with `/rewind`: the native session tree opens with user messages first, so earlier prompts are visible without changing filters. Ctrl+U toggles the native user filter and Ctrl+O cycles filters; `/tree` keeps its configured filter. Native navigation and summary prompts remain available, and opening or cancelling saves no filter preference. Restart Pi after installation to replace the older rewind wrapper. Verified on Pi 0.85.1 and 1.0.4 (#pi-47)

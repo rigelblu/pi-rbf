@@ -6,6 +6,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 # 🔵⋯ Extensions
 
+- [`rbf-effort`](extensions/rbf-effort.ts) (v0.30.0) — Use `/effort` and `/effort <level>` as aliases for native `/thinking`. [Install, limits and roll back](extensions/README.md#-rbf-effort)
 - [`rbf-monitor`](extensions/rbf-monitor.ts) (v0.28.0) — The agent arms a shell command with `monitor`, and each line it prints reaches the agent after its turn has ended, with no prompt from you. `task_stop` and `/monitors` stop a watch; the footer shows `1 watch`. [Install, limits and roll back](extensions/README.md#-rbf-monitor)
 - [`rbf-shell-command-groups`](extensions/rbf-shell-command-groups.ts) (v0.27.0) — Scan an agent's shell commands as one count line, such as `▸ ran 3 shell commands · 1 failed`, and open it to see each command and result. Pi's own bash and Codex through Pi; sandbox sessions, `!` commands and nested calls keep their rows. [Install and roll back](extensions/README.md#-rbf-shell-command-groups)
 - [`rbf-tool-parts-indent`](extensions/rbf-tool-parts-indent.ts) (v0.25.0) — Lines under a tool call's or a `!` command's header hang 3 columns in, under a branch. [Install and roll back](extensions/README.md#-rbf-tool-parts-indent)

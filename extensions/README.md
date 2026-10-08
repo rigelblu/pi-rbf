@@ -761,6 +761,7 @@ Local Pi extension aliasing `/effort` and `/effort <level>` in prompt submission
 
 ## 🟠⋯ Setup & Verification
 - Explicit activation: launch Pi with `-e ./extensions/rbf-effort.ts` (e.g. `pi -e ./extensions/rbf-effort.ts`).
-- Rollback: remove the `-e ./extensions/rbf-effort.ts` argument when starting Pi.
-- Tested versions: factual final pinned proof across 37 actual profiles on both hosts (Pi 0.85.1 and daily Pi 1.0.4); human checks pending; candidate not installed or released globally.
+- Daily installation: `command cp -f ./extensions/rbf-effort.ts ~/.pi/agent/extensions/`, then restart Pi or type `/reload`. Introduced in pi-rbf v0.30.0 (pi-51).
+- Rollback: remove `~/.pi/agent/extensions/rbf-effort.ts`, then restart Pi or `/reload`; for explicit activation, remove the `-e` argument. Native `/thinking` remains available.
+- Tested versions: factual final pinned proof across 37 actual profiles on both hosts (Pi 0.85.1 and daily Pi 1.0.4); Tom passed alias-only human verification. Installed daily source matches the accepted hash; daily Pi 1.0.4 native menu, arguments and reload pass in standard editor mode with installed Vim/rewind in both orders. Later editor ownership remains the documented fallback limit.
 - Automated tests: run local tests with `bun run test extensions/rbf-effort-pty.test.ts`. To exercise both host versions across all widths, provide the daily root explicitly: `PI_DAILY_ROOT='<dailyroot>' bun run test extensions/rbf-effort-pty.test.ts` (where `<dailyroot>` is the discovered host root containing `dist/bundle/cli.js`).
