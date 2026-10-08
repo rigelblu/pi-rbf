@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.29.0 (2026-10-07)
+## 🟠⋯ Improved for End Users
+- 2026-10-07 - feat (ux) | see only user messages with `/rewind`: the native session tree opens with user messages first, so earlier prompts are visible without changing filters. Ctrl+U toggles the native user filter and Ctrl+O cycles filters; `/tree` keeps its configured filter. Native navigation and summary prompts remain available, and opening or cancelling saves no filter preference. Restart Pi after installation to replace the older rewind wrapper. Verified on Pi 0.85.1 and 1.0.4 (#pi-47)
+
+---
+
 # 🔵⋯ v0.28.0 (2026-10-07)
 ## 🟠⋯ Added for End Users
 - 2026-10-07 - feat | have my Pi agent pick up a message or event meant for it after its turn has ended, without me prompting it: the agent arms a shell command with `monitor`, and each line it prints starts a turn or arrives mid-turn; `task_stop` stops it; `/monitors` lists and stops watches, and the footer shows how many run, as `1 watch`. Watches stop at their deadline, on a flood, and when Pi reloads, and the agent is told each time. `/cd` is refused while a watch runs. Not in a `--sandbox` session, and not for a `codex-harness` model (#pi-44.1)

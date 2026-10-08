@@ -1,8 +1,10 @@
-# pi-rbf
+---
+title: pi-rbf
+---
 
 Rigelblu flavor of Pi coding agent extensions and capabilities.
 
-## Extensions
+# 🔵⋯ Extensions
 
 - [`rbf-monitor`](extensions/rbf-monitor.ts) (v0.28.0) — The agent arms a shell command with `monitor`, and each line it prints reaches the agent after its turn has ended, with no prompt from you. `task_stop` and `/monitors` stop a watch; the footer shows `1 watch`. [Install, limits and roll back](extensions/README.md#-rbf-monitor)
 - [`rbf-shell-command-groups`](extensions/rbf-shell-command-groups.ts) (v0.27.0) — Scan an agent's shell commands as one count line, such as `▸ ran 3 shell commands · 1 failed`, and open it to see each command and result. Pi's own bash and Codex through Pi; sandbox sessions, `!` commands and nested calls keep their rows. [Install and roll back](extensions/README.md#-rbf-shell-command-groups)
@@ -10,7 +12,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 - [`rbf-cd`](extensions/rbf-cd.ts) (v0.24.0) — Use `/cd <path>` to move the running conversation to another directory and reopen it there; ordinary Pi sessions, not yet Codex conversations. [Activation and limits](extensions/README.md#-rbf-cd).
 - [`rbf-path-labels`](extensions/rbf-path-labels.ts) (v0.22.0) — Fit assistant file references and native full-path labels within their pane; keep original targets, source text and completion values. [Activation and recovery](extensions/README.md#-rbf-path-labels).
 - [`rbf-rename`](extensions/rbf-rename.ts) (v0.17.0) — Use `/rename` to name or rename the current Pi session while preserving native `/name`.
-- [`rbf-rewind`](extensions/rbf-rewind.ts) (v0.16.0) — Use `/rewind` to navigate session branches with user messages first while retaining native `/tree` and filter switching.
+- [`rbf-rewind`](extensions/rbf-rewind.ts) (introduced v0.16.0; user messages first v0.29.0) — Use `/rewind` to navigate session branches with user messages first while retaining native `/tree` and filter switching.
 - [`rbf-question-form`](extensions/rbf-question-form.ts) (introduced v0.15.0; answer editing v0.21.10; mouse selection v0.23.0) — Select answers to agent questions in an inline quick-pick form. In fullscreen, click numbered choices, C or W; hover highlights without selecting and clears when the mouse moves away. Clicks preserve your text; Enter submits. Press `W` for Write-in; use familiar Pi editor keys in Write-in or notes, `Ctrl+J` for a new line, Up through wrapped rows, Tab for choices, and Enter to submit. Pasted text has terminal controls removed before display and submission.
 - [`rbf-vim`](extensions/rbf-vim.ts) (v0.14.1) — Use vim motions and text objects (ciw, diw, caw, daw, yiw, quotes, brackets) in input box with modal state machine, bottom-border mode badge, /vim toggle, and double-Esc safety.
 - [`rbf-standout-commands`](extensions/rbf-standout-commands.ts) (v0.13.0) — See skills and slash commands standout in prompt as I type with vivid theme link blue highlighting and strict registry validation.

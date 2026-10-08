@@ -418,9 +418,12 @@ Local Pi extension registering `/rewind` to navigate the session tree with user 
 - Standout Syntax Highlighting: Supported by `rbf-standout-commands`, highlighting `/rewind` as a valid keyword in the prompt.
 - Non-Interactive / RPC Fallback: If executed in headless or non-interactive environments where interactive UI is unavailable, outputs an informational notification explaining that tree navigation requires interactive mode.
 - Legacy Activation & Fresh Process: If upgrading from a previous version in an already running Pi session, a fresh Pi process restart is required to enable user-only navigation; if the legacy wrapper is detected, a warning prompts to restart Pi.
-- Runtime Support Seam: Actual runtime support on a given host remains pending until caller proof; if the host's private integration seam is unavailable or cannot be shadowed, a visible warning advises using `/tree` to navigate and refuses unsupported opening.
+- Runtime Support Seam: Verified on project Pi 0.85.1 and daily Pi 1.0.4; if the host's private integration seam is unavailable or cannot be shadowed, a visible warning advises using `/tree` to navigate and refuses unsupported opening.
 
 ## 🟠⋯ Setup & Verification
+- User messages first ships in pi-rbf v0.29.0 (#pi-47); installed in the daily extension directory. Start a fresh Pi process after this upgrade, because `/reload` cannot replace the old boolean-only wrapper safely
+- Install the release file as `~/.pi/agent/extensions/rbf-rewind.ts`, keeping a copy of the previous file outside the extensions directory
+- Roll back by restoring that previous file and restarting Pi. This local release retains its original at `/Volumes/tom-ssd/tmp/pi-47/local-release-v0.29.0/rbf-rewind.before.ts`
 - Local verification: launch `pi -e ./extensions/rbf-rewind.ts`, type `/re` to inspect autocomplete, press Enter on `/rewind` to verify tree navigation modal opens with user messages first (`[user]`).
 
 ---
