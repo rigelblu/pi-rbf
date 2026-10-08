@@ -670,7 +670,7 @@ To check it locally, start Pi with the extension, ask for `seq 1 12`, and type `
 
 # 🔵⋯ rbf-shell-command-groups
 
-Introduced in pi-rbf v0.27.0 (pi-42.1). Shell commands an agent runs one after another show as one line with a count, and the commands themselves are hidden until you open it:
+Introduced in pi-rbf v0.27.0 (pi-42.1); close-at-reading-position added in v0.30.1 (pi-42.2). Shell commands an agent runs one after another show as one line with a count, and the commands themselves are hidden until you open it:
 ```
  ▸ ran 3 shell commands · 1 failed
 ```
@@ -688,14 +688,16 @@ The open view is drawn with `rbf-tool-parts-indent` loaded. Without it the resul
 
 - The count is the number of shell commands the agent started in a row. Text from the agent, or any other tool call, ends a group and the next command starts a new one
 - The closed line names what needs attention: `running 1 shell command`, `1 shell command · background` with a `Task ID:` line under it, `1 failed`, cancelled and not-run commands
-- Open and close a group by clicking its line in fullscreen mode. Ctrl+O opens and closes every group and tool row, in fullscreen and regular mode. A click on a command inside an open group does nothing, so links and text selection work as they do on any row
+- Open and close a group by clicking its line in fullscreen mode. Ctrl+O opens and closes every group and tool row, in fullscreen and regular mode. A plain click on any command/output inside an open group immediately closes the whole group. Drag selection and copy remain available. Double/triple-click word/line selection inside a group is deliberately unavailable. Native link handling is left to Pi; ordinary bash output has no clickable Full Output link
 - Opening a group shows Pi's own command rows and results, unchanged. Nothing about what runs, or what is saved in the session, changes
 - After you quit and reopen a session, groups read `status unknown`, for example `3 shell commands · 1 error (status unknown) · 2 unknown`. Pi no longer holds proof of how those commands ended, so it doesn't claim they ran. A Codex command whose saved record carries a numeric exit code keeps its result
 - Covered: Pi's own bash tool and Codex commands run through `rbf-codex`. Not covered, and drawn as before: a session started with `--sandbox`, commands you type with `!` or `!!`, and shell calls nested inside another tool
 - Ctrl+B still sends Pi's own running bash command to the background. It does not control Codex commands
 - If grouping can't attach to this Pi, rows stay as they were and one warning says `Shell command groups unavailable; showing native tool rows.`
 
-Install the three files together, then quit Pi and start it again. The view needs this checkout's `rbf-background-tasks.ts` and `rbf-codex.ts`, which tell it how each command ended; with older copies of those two, rows stay as they were:
+To upgrade from v0.27.0 to v0.30.1, back up your installed `rbf-shell-command-groups.ts` and replace only that file, then restart Pi. The existing `rbf-background-tasks.ts` and `rbf-codex.ts` are unchanged by this slice. Keep the backup to restore the earlier header-only disclosure behavior; restore that file and restart to undo the upgrade.
+
+For a first installation, install the three files together, then quit Pi and start it again. The view needs this checkout's `rbf-background-tasks.ts` and `rbf-codex.ts`, which tell it how each command ended; with older copies of those two, rows stay as they were:
 ```sh
 mkdir -p /Volumes/tom-ssd/tmp/pi-42/backup && command cp -f ~/.pi/agent/extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-codex.ts /Volumes/tom-ssd/tmp/pi-42/backup/
 command cp -f ./extensions/rbf-shell-command-groups.ts ./extensions/rbf-background-tasks.ts ./extensions/rbf-codex.ts ~/.pi/agent/extensions/
@@ -704,7 +706,7 @@ To roll back the display only, run `rm -f ~/.pi/agent/extensions/rbf-shell-comma
 
 To try it without installing, and without touching your own Pi settings, run `PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions -e extensions/rbf-shell-command-groups.ts -e extensions/rbf-background-tasks.ts -e extensions/rbf-codex.ts -e extensions/rbf-tool-parts-indent.ts --tui-mode fullscreen` from the checkout. That profile has no model signed in; pick a `[codex-harness]` model if the Codex CLI is logged in.
 
-Verified on Pi 0.85.1 and 1.0.3. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, and light or monochrome themes.
+v0.30.1 gesture/routing verification ran on Pi 0.85.1 and 1.0.4. Tomek reported ordinary whole-group collapse and drag/copy working, then waived the remaining human checks. A test-only Full Output link fixture did not activate; it is not a feature supplied by ordinary bash output or human proof of native links. Historical v0.27.0 verification ran on 0.85.1/1.0.3. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, and light or monochrome themes.
 
 # 🔵⋯ rbf-monitor
 
