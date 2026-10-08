@@ -743,3 +743,24 @@ To roll back, run `rm -f ~/.pi/agent/extensions/rbf-monitor.ts`, then `/reload` 
 To try it without installing, run `pi -e ./extensions/rbf-monitor.ts`.
 
 Automated: `bun run test -- extensions/rbf-monitor.test.ts` and `extensions/rbf-monitor-real.test.ts`; the second drives a real Pi with a local no-model provider, and takes `RBF_PI_BIN` to pick the Pi. Verified on Pi 0.85.1 and 1.0.4. By hand on 1.0.4 with `openai-codex`: a Pi agent in an `agent-group-chat` room armed a watch unasked and answered a Claude reviewer's verdict 10 seconds after it was posted, with nothing typed.
+
+# 🔵⋯ rbf-effort
+
+## 🟠⋯ Overview
+Local Pi extension aliasing `/effort` and `/effort <level>` in prompt submissions to native `/thinking` and `/thinking <level>`, allowing muscle memory from other agent environments without modifying built-in thinking level state machines or storage.
+
+## 🟠⋯ Capabilities & Behavior
+- Command translation: prompt input trims surrounding whitespace first. Entering bare `/effort` (including trailing tab or newline whitespace such as `/effort\t` or `/effort\n` that trims to bare `/effort`) or `/effort` followed only by ASCII spaces translates to `/thinking`, opening Pi's native interactive Thinking Level selector menu.
+- Thinking level arguments: entering `/effort <level>` (such as `/effort high`, `/effort medium`, `/effort low`, `/effort off` separated by ASCII space) translates to `/thinking <level>` with arguments preserved.
+- Separator restrictions: an internal tab or newline separating the command token from its arguments (e.g. `/effort\thigh`) is explicitly rejected as an unsupported separator when the TUI adapter is installed, displaying the notice `Use /thinking in interactive Pi; /effort could not reach the native command.` and blocking unparsed submission.
+- Model and level validation: argument validation and model reasoning compatibility are handled entirely by native Pi. For non-reasoning models, `/effort high` surfaces native `Unknown thinking level "high"` without custom error shims. Native and default selector authority remains unchanged.
+- Native selector controls: inside the selector menu, pressing `Ctrl+S` saves the highlighted thinking level to settings as the persistent configuration default (not a session default), while pressing `Enter` sets the thinking level for the active session without updating saved settings.
+- Editor factory compatibility & lifecycle: compatible with earlier custom editor factories via chained delegation (`ctx.ui.getEditorComponent()`). If a later owner replaces the editor factory (including `rbf-vim`), the accessor is not reclaimed; submissions then fall through to Pi's registered native grammar, where the fallback command handler displays `Use /thinking in interactive Pi; /effort could not reach the native command.` while leaving the thinking level unchanged.
+- Passthrough: prose containing `/effort`, similar command names (`/effortful`, `/effortless`, `/effort-mode`), and non-matching text pass through to normal prompt submission completely unchanged.
+- Non-TUI mode fallback: editor submission translation activates only when `ctx.mode === 'tui'`. In non-TUI modes (`rpc`, `print`, `json`) or environments without interactive editor components, the registered native grammar fallback for bare `/effort` or ASCII-space separated arguments displays `Use /thinking in interactive Pi; /effort could not reach the native command.` and performs no provider turns (scoped to bare and ASCII-space input only, not tab/newline lexical strings; the unsupported separator notice is displayed only when the TUI adapter is installed).
+
+## 🟠⋯ Setup & Verification
+- Explicit activation: launch Pi with `-e ./extensions/rbf-effort.ts` (e.g. `pi -e ./extensions/rbf-effort.ts`).
+- Rollback: remove the `-e ./extensions/rbf-effort.ts` argument when starting Pi.
+- Tested versions: factual final pinned proof across 37 actual profiles on both hosts (Pi 0.85.1 and daily Pi 1.0.4); human checks pending; candidate not installed or released globally.
+- Automated tests: run local tests with `bun run test extensions/rbf-effort-pty.test.ts`. To exercise both host versions across all widths, provide the daily root explicitly: `PI_DAILY_ROOT='<dailyroot>' bun run test extensions/rbf-effort-pty.test.ts` (where `<dailyroot>` is the discovered host root containing `dist/bundle/cli.js`).
