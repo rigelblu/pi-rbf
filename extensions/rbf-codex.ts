@@ -20,6 +20,7 @@ import type { AssistantMessage, AssistantMessageEventStream, Context, Model, Mod
 import { Box, Container, Editor, Spacer, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative } from "node:path";
@@ -886,9 +887,154 @@ export function isSandboxLaunch(argv: string[]): boolean {
 	return parseArgs(argv).unknownFlags.has("sandbox");
 }
 
+// ── shell display observer (pi-42) ──
+// Display only. A shell-count view listens on this channel. Nothing sent here starts, stops, approves or settles work,
+// and nothing in this section may throw into the code that does. The view is a separate extension that can be removed,
+// so this owner imports nothing from it and publishes what it saw without saying what it proves.
+// The channel code below is the same as in `rbf-background-tasks.ts`; neither owner imports the other.
+
+export const SHELL_DISPLAY_CHANNEL = "rbf:shell-display:v1";
+/** How many invocations an owner keeps for a view that attaches late. */
+export const SHELL_DISPLAY_SNAPSHOT_LIMIT = 2000;
+/** How many facts it keeps for one invocation: the first, and the newest after it. */
+export const SHELL_DISPLAY_FACTS_PER_INVOCATION = 16;
+
+/**
+ * What this owner saw of one Codex command item, as it saw it.
+ * - `start`: Codex's `item/started` for the command was admitted
+ * - `cut`: the row was cut by an interruption while the item had not completed. Codex doesn't kill the command
+ * - `completion`: Codex's `item/completed`, with `exitCode` and `status` as they arrived
+ * - `not-run`: this owner refused the command's approval before any start was admitted
+ * - `lost`: nobody can vouch for the command any more. The client that admitted it is gone, its turn ended some other way than an interruption
+ *   while it was open, or a completion named its item on another thread
+ */
+export type CodexDisplayFact =
+	| { kind: "start" }
+	| { kind: "cut"; identity: string }
+	| { kind: "completion"; exitCode: unknown; status: unknown }
+	| { kind: "not-run" }
+	| { kind: "lost" };
+
+/** A completed command item as a fact: the two fields as Codex sent them, absent or null included. Never the row's defaulted copy. */
+export function shellCompletionFact(item: Rec): CodexDisplayFact {
+	return { kind: "completion", exitCode: item.exitCode, status: item.status };
+}
+
+/** One command item's display identity: the thread it was admitted on, captured from the owner, and whether its start was admitted. */
+type CodexDisplayCall = { tell: (fact: CodexDisplayFact) => void; threadId: string; started: boolean; lost?: boolean; lastCompletion?: Rec };
+
+type ShellDisplayBus = { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
+type ShellDisplayTool = { name: string; execute: unknown; renderCall?: unknown; renderResult?: unknown };
+
+/** One invocation's identity, captured when its execute began. `tell` publishes a fact about it and never throws. */
+export type ShellDisplayCall<Fact> = { sessionId: string; toolCallId: string; tell: (fact: Fact) => void };
+
+/**
+ * One owner's side of the display channel: it announces itself, publishes facts, keeps the last `limit` invocations for a view
+ * that asks later, and withdraws. `ends` says which facts close an invocation; when the bound is hit the least recently updated
+ * ended invocation goes first, and an open one only when no ended one is left. Undefined on a Pi with no event bus.
+ */
+export function createShellDisplayOwner<Fact extends { kind: string }>(
+	events: ShellDisplayBus | undefined,
+	source: string,
+	ends: (fact: Fact) => boolean,
+	limit = SHELL_DISPLAY_SNAPSHOT_LIMIT,
+) {
+	if (typeof events?.emit !== "function" || typeof events.on !== "function") return undefined;
+	let sessionId = "";
+	let ownerGeneration = "";
+	let tool: ShellDisplayTool | undefined;
+	let stopListening: (() => void) | undefined;
+	/** Retained invocations by call id, least recently updated first. */
+	const retained = new Map<string, { ended: boolean; messages: unknown[] }>();
+
+	// Each message is sent on its own: a subscriber that throws on one must not cut short the withdrawal, the announcement or the facts after it.
+	const send = (message: unknown) => {
+		try {
+			events.emit(SHELL_DISPLAY_CHANNEL, message);
+		} catch {}
+	};
+	const announce = () =>
+		send({ kind: "announce", sessionId, source, toolName: tool?.name, ownerGeneration, execute: tool?.execute, renderCall: tool?.renderCall, renderResult: tool?.renderResult });
+	const answer = (data: unknown) => {
+		try {
+			const request = data as { kind?: unknown; sessionId?: unknown; toolCallIds?: unknown } | undefined;
+			if (!ownerGeneration || request?.kind !== "snapshot-request" || request.sessionId !== sessionId) return;
+			announce();
+			// A request that names calls gets those calls' facts only; one that names none gets everything kept.
+			const wanted = Array.isArray(request.toolCallIds) ? request.toolCallIds.flatMap((id) => retained.get(id) ?? []) : [...retained.values()];
+			for (const invocation of wanted) {
+				for (const message of invocation.messages) send(message);
+			}
+		} catch {}
+	};
+	const withdraw = () => {
+		if (!ownerGeneration) return;
+		send({ kind: "withdraw", sessionId, source, ownerGeneration });
+		ownerGeneration = "";
+		retained.clear();
+	};
+
+	return {
+		/** A session began: withdraw what was announced before, then announce under a fresh generation. */
+		start(session: string | undefined, registered: ShellDisplayTool): void {
+			try {
+				withdraw();
+				if (!session) return;
+				sessionId = session;
+				tool = registered;
+				ownerGeneration = `${source}:${randomUUID()}`;
+				stopListening ??= events.on(SHELL_DISPLAY_CHANNEL, answer);
+				announce();
+			} catch {}
+		},
+		/** The identity of one invocation, captured now. Undefined while nothing is announced. */
+		open(toolCallId: string): ShellDisplayCall<Fact> | undefined {
+			if (!ownerGeneration) return undefined;
+			const identity = { sessionId, source, ownerGeneration, toolCallId };
+			let revision = 0;
+			const tell = (fact: Fact) => {
+				try {
+					// A call from before a withdrawal or a new session says nothing: no old callback speaks for a new owner.
+					if (identity.ownerGeneration !== ownerGeneration) return;
+					const message = { kind: "fact", ...identity, revision: ++revision, fact };
+					const invocation = retained.get(toolCallId) ?? { ended: false, messages: [] };
+					retained.delete(toolCallId);
+					invocation.messages.push(message);
+					if (invocation.messages.length > SHELL_DISPLAY_FACTS_PER_INVOCATION) invocation.messages.splice(1, 1);
+					invocation.ended ||= ends(fact);
+					retained.set(toolCallId, invocation);
+					if (retained.size > limit) {
+						let evict: string | undefined;
+						for (const [id, kept] of retained) {
+							evict ??= id;
+							if (kept.ended) {
+								evict = id;
+								break;
+							}
+						}
+						retained.delete(evict!);
+					}
+					send(message);
+				} catch {}
+			};
+			return { sessionId, toolCallId, tell };
+		},
+		/** The owner is going away: withdraw, forget the snapshot and stop answering. */
+		stop(): void {
+			try {
+				withdraw();
+				stopListening?.();
+				stopListening = undefined;
+			} catch {}
+		},
+	};
+}
+
+
 // ── the Codex side of one turn, across every streamSimple call and tool execution it spans ──
 type UserInputItem = { type: "text"; text: string; text_elements: [] } | { type: "image"; url: string };
-type TurnItem = { kind: RowKind; threadId: string; agentPath: string; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec; server?: string; tool?: string; arguments?: unknown; appName?: string; answered?: Answer; aborted?: boolean };
+type TurnItem = { kind: RowKind; threadId: string; agentPath: string; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec; server?: string; tool?: string; arguments?: unknown; appName?: string; answered?: Answer; aborted?: boolean; display?: CodexDisplayCall };
 /** A sub-agent Codex announced on this turn; `turnId` is known once its `turn/started` arrives (a live parent re-drives an interrupted child with a new turn on the same thread). */
 type ChildThread = { turnId: string | null; agentPath: string };
 type PendingRequest = { id: number | string; method: string; params: Rec; kind: RequestKind; itemId: string };
@@ -939,6 +1085,81 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		const notify = (text: string, type: "info" | "warning" | "error" = "info") => {
 			if (state.ctx?.mode === "tui") state.ctx.ui.notify(text, type);
 		};
+
+		// ── display observer (pi-42): what this owner saw of each command item, for a shell-count view. None of it may throw into a turn. ──
+		const display = createShellDisplayOwner<CodexDisplayFact>(pi.events, "codex-command", (fact) => fact.kind === "completion" || fact.kind === "not-run" || fact.kind === "lost");
+		/** Command items each client admitted and has not seen complete, by item id. Client-local: a completion that arrives after its turn, or after the session moved on, finds the identity captured when the item was first seen. */
+		const openDisplayCalls = new WeakMap<AppServerClient, Map<string, CodexDisplayCall>>();
+		/** The item's display identity, captured on first use: its session from the announced owner, its thread from the turn that holds it (a root row's own `threadId` is empty). */
+		function displayCallFor(client: AppServerClient, itemId: string, it: TurnItem, rootThreadId: string): CodexDisplayCall | undefined {
+			if (it.kind !== "commandExecution") return undefined;
+			if (!it.display) {
+				const call = display?.open(`codex-${itemId}`);
+				if (!call) return undefined;
+				it.display = { tell: call.tell, threadId: it.threadId || rootThreadId, started: false };
+				let open = openDisplayCalls.get(client);
+				if (!open) openDisplayCalls.set(client, (open = new Map()));
+				open.set(itemId, it.display);
+			}
+			return it.display;
+		}
+		/** Nobody can vouch for the command any more. Said once per item, however many ways the owner learns it. */
+		function displayLost(call: CodexDisplayCall | undefined): void {
+			if (!call || call.lost) return;
+			call.lost = true;
+			call.tell({ kind: "lost" });
+		}
+		/** Codex's `item/started` for the command was admitted on `threadId`. An approval that opened the row earlier said nothing. */
+		function displayStarted(client: AppServerClient, itemId: string, it: TurnItem, rootThreadId: string, threadId: unknown): void {
+			try {
+				const call = displayCallFor(client, itemId, it, rootThreadId);
+				if (!call || call.started || threadId !== call.threadId) return;
+				call.started = true;
+				call.tell({ kind: "start" });
+			} catch {}
+		}
+		/** A completion for the item arrived on `client`: through its live turn, which passes the item, or after it. One notification reaches both subscribers and is told once. */
+		function displayCompleted(client: AppServerClient, itemId: string, held: { it: TurnItem; rootThreadId: string } | undefined, threadId: unknown, item: Rec): void {
+			try {
+				const call = held ? displayCallFor(client, itemId, held.it, held.rootThreadId) : openDisplayCalls.get(client)?.get(itemId);
+				if (!call || call.lastCompletion === item) return;
+				call.lastCompletion = item;
+				if (threadId !== call.threadId) {
+					// The same item id on another thread is not provably this command. The association stays for its own completion.
+					displayLost(call);
+					return;
+				}
+				call.tell(shellCompletionFact(item));
+				openDisplayCalls.get(client)?.delete(itemId);
+			} catch {}
+		}
+		/** The row ended while its item had not completed. An interruption leaves the command with Codex (`kept`); a turn that ended any other way leaves nobody watching it. */
+		function displayRowCut(client: AppServerClient, itemId: string, it: TurnItem, rootThreadId: string, kept: boolean): void {
+			try {
+				const call = displayCallFor(client, itemId, it, rootThreadId);
+				if (kept) call?.tell({ kind: "cut", identity: itemId });
+				else displayLost(call);
+			} catch {}
+		}
+		/** This owner refused a command's approval. That proves it never ran only when no start was admitted before the question; after a start, the row ends and nobody watches what Codex does with the command. */
+		function displayRefused(client: AppServerClient, rootThreadId: string, itemId: string, it: TurnItem | undefined, kind: RequestKind, answered: Answer): void {
+			try {
+				if (kind !== "commandExecution" || !it || !(answered.declined || answered.decision === "cancel" || answered.decision === "decline")) return;
+				const call = displayCallFor(client, itemId, it, rootThreadId);
+				if (call?.started) displayLost(call);
+				else call?.tell({ kind: "not-run" });
+			} catch {}
+		}
+		/** The client is gone, and with it the only owner that could say how its open commands ended. */
+		function displayClientLost(client: AppServerClient): void {
+			try {
+				const open = openDisplayCalls.get(client);
+				if (!open) return;
+				for (const call of open.values()) displayLost(call);
+				open.clear();
+			} catch {}
+		}
+		let registeredCommandTool: ShellDisplayTool | undefined;
 
 		class ActiveTurn {
 			readonly events: ProjectedEvent[] = [];
@@ -1120,6 +1341,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 							const it = this.item(id, "commandExecution", p.threadId);
 							it.command = String(item.command ?? "");
 							it.cwd = String(item.cwd ?? "");
+							displayStarted(this.client, id, it, this.threadId, p.threadId);
 							this.openRow(id);
 						} else if (item.type === "fileChange") {
 							const it = this.item(id, "fileChange", p.threadId);
@@ -1156,6 +1378,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 							if (item.type === "fileChange" && !it.changes.length) it.changes = flattenChanges(item.changes);
 							if (item.type === "mcpToolCall") describeToolCall(it, item);
 							it.completed = item;
+							displayCompleted(this.client, id, { it, rootThreadId: this.threadId }, p.threadId, item);
 							this.openRow(id); // a completion without a start still leaves a row
 							if (this.waiter?.itemId === id) {
 								const w = this.waiter;
@@ -1319,6 +1542,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				throw new CodexError("codex-version");
 			}
 			client.onRequest = onServerRequest;
+			client.onExit.add(() => displayClientLost(client));
 			const failedServers = new Set<string>();
 			client.subscribe((m) => {
 				// Runs inside readline's `line` event: nothing thrown here may escape, as the turn's own subscriber guards.
@@ -1341,6 +1565,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					// A command cut by Escape ran on in Codex; say once when it finished, whichever turn (or none) is active by then.
 					const item = p.item && typeof p.item === "object" ? (p.item as Rec) : {};
 					const id = String(item.id ?? "");
+					if (item.type === "commandExecution") displayCompleted(client, id, undefined, p.threadId, item);
 					const command = client.cutCommands.get(id);
 					if (command === undefined) return;
 					client.cutCommands.delete(id);
@@ -1771,6 +1996,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					const next = await turn.waitFor(itemId, signal, onUpdate && ((output) => onUpdate(textResult(output, { itemId, status: "inProgress" }))));
 					if (next.kind === "completed") return settle(kind === "fileChange" ? patchResult(itemId, next.item, it.changes) : kind === "mcpToolCall" ? toolCallResult(itemId, next.item) : commandResult(itemId, next.item, it.output));
 					const answered = await answerRequest(turn, next.req, ctx);
+					displayRefused(turn.client, turn.threadId, next.req.itemId, turn.items.get(next.req.itemId), next.req.kind, answered);
 					if (signal?.aborted) throw new AbortedError(); // Escape closed the dialog: the row is cut, whatever the closed dialog answered
 					if (next.req.itemId !== itemId) {
 						// Any active row answers any pending request (Q25); the outcome belongs to the request's own row, which opens after this one settles.
@@ -1785,6 +2011,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				// A command cut while it ran, by Escape or by its turn ending under it (a refused request on another item, a child's turn ending), is not killed:
 				// Codex keeps it, so its completion is watched for the one notice, on both paths (review 2026-09-14).
 				const cut = kind === "commandExecution" && !it.completed;
+				if (cut && (e instanceof AbortedError || e instanceof TurnEndedError)) displayRowCut(turn.client, itemId, it, turn.threadId, e instanceof AbortedError || e.status === "interrupted");
 				if (e instanceof AbortedError) {
 					// Escape. A plain Error, as Pi's tool contract wants on abort, shaped as Pi's bash shapes its own cut row (`appendStatus`): the output so far, a blank line, then the status.
 					if (cut) turn.client.cutCommands.set(itemId, it.command ?? "");
@@ -1851,7 +2078,12 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		}
 
 		const NO_SNIPPET = "; it cannot be called directly.";
-		pi.registerTool({
+		/** Registers the command tool and keeps the object Pi was given, whose functions the owner announces. */
+		const registerCommandTool: typeof pi.registerTool = (tool) => {
+			pi.registerTool(tool);
+			registeredCommandTool = tool;
+		};
+		registerCommandTool({
 			name: TOOL_COMMAND,
 			label: "Codex command",
 			description: `Records a command the Codex agent is running in this conversation${NO_SNIPPET}`,
@@ -2226,6 +2458,13 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		};
 
 		pi.on("session_start", async (_event, ctx) => {
+			if (registeredCommandTool) {
+				let sessionId: string | undefined;
+				try {
+					sessionId = ctx.sessionManager.getSessionId();
+				} catch {}
+				display?.start(sessionId, registeredCommandTool);
+			}
 			state.ctx = ctx;
 			state.client = null;
 			state.shuttingDown = false;
@@ -2266,7 +2505,13 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				delete (Editor as any)[COMPACT_DISPATCHER_KEY];
 			}
 		};
-		pi.on("session_shutdown", closeChild);
+		pi.on("session_shutdown", async () => {
+			try {
+				await closeChild();
+			} finally {
+				display?.stop();
+			}
+		});
 		pi.on("session_before_switch", async () => {
 			await closeChild();
 			return {};

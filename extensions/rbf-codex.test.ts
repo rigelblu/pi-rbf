@@ -11,6 +11,9 @@ import { writeInterruptionFixture } from "./test-support/rbf-codex-interruption-
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COMPACT_DISPATCHER_KEY, COMPACT_NOTICE, COMPACT_SAFE_REASONS, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, AppServerClient, classifyCompletedTurn, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, isCompactCommand, isSupportedCodexVersion, loneString, mapEffort, parseCodexVersion, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle, verifyBranchHistory, verifyEmptyBranchHistory } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
+import { createShellDisplayOwner, SHELL_DISPLAY_CHANNEL, SHELL_DISPLAY_SNAPSHOT_LIMIT, shellCompletionFact } from "./rbf-codex.ts";
+import { NO_EVIDENCE, reduceEvidence } from "./rbf-shell-command-groups.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
 // Vitest runs on Node, which strips types from .ts on its own (Node 22.6+).
@@ -23,7 +26,7 @@ type Entry = { type: string; customType?: string; data?: unknown; message?: { ro
 type Tool = { name: string; execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: ((p: any) => void) | undefined, ctx: ExtensionContext) => Promise<any>; renderCall: (args: any, theme: any, context: any) => any; renderResult: (result: any, opts: any, theme: any, context: any) => any };
 const fakeTheme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-function makePi(opts?: { getThinkingLevel?: () => string }) {
+function makePi(opts?: { getThinkingLevel?: () => string; events?: unknown }) {
 	const handlers = new Map<string, Handler>();
 	const entries: { customType: string; data: unknown }[] = [];
 	const tools = new Map<string, Tool>();
@@ -36,6 +39,7 @@ function makePi(opts?: { getThinkingLevel?: () => string }) {
 			provider = { name, config };
 		}),
 		getThinkingLevel: vi.fn(opts?.getThinkingLevel ?? (() => "medium")),
+		...(opts?.events ? { events: opts.events } : {}),
 	} as unknown as ExtensionAPI;
 	return {
 		pi,
@@ -186,8 +190,8 @@ describe("rbf-codex", () => {
 	}
 
 	/** Boot an extension instance with `session_start` already fired, ready to stream. */
-	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number; persistAppends?: boolean; thinkingLevel?: string } = {}) {
-		const fx = makePi(opts.thinkingLevel ? { getThinkingLevel: () => opts.thinkingLevel! } : undefined);
+	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number; persistAppends?: boolean; thinkingLevel?: string; events?: unknown } = {}) {
+		const fx = makePi(opts.thinkingLevel || opts.events ? { getThinkingLevel: opts.thinkingLevel ? () => opts.thinkingLevel! : undefined, events: opts.events } : undefined);
 		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [], compactTimeoutMs: opts.compactTimeoutMs })(fx.pi);
 		const c = makeCtx(opts);
 		if (opts.persistAppends) vi.mocked(fx.pi.appendEntry).mockImplementation((customType, data) => {
@@ -2890,5 +2894,434 @@ describe("rbf-codex", () => {
 			expect(starts[1].effort).toBe("high");
 		});
 	});
-});
 
+	describe("shell display observer (pi-42)", () => {
+		type Message = Record<string, any>;
+		type Bus = { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
+		const SAME = "/bin/zsh -lc 'echo same'";
+		const SLEEP = "/bin/zsh -lc '/bin/sleep 30'";
+
+		/** A bus with no safety net, unlike Pi's: a subscriber's throw goes straight back into `emit`. */
+		function rawBus(): Bus {
+			const handlers = new Set<(data: unknown) => void>();
+			return {
+				emit: (_channel, data) => {
+					for (const handler of [...handlers]) handler(data);
+				},
+				on: (_channel, handler) => {
+					handlers.add(handler);
+					return () => handlers.delete(handler);
+				},
+			};
+		}
+
+		/** `boot` on a Pi with an event bus, with every display message recorded from before the owner loads. */
+		async function watched(opts: Parameters<typeof boot>[0] = {}) {
+			const events: Bus = (opts.events as Bus | undefined) ?? createEventBus();
+			const seen: Message[] = [];
+			events.on(SHELL_DISPLAY_CHANNEL, (message) => seen.push(message as Message));
+			const options = { ...opts, events };
+			const b = await boot(options);
+			const facts = (id?: string) => seen.filter((message) => message?.kind === "fact" && (!id || message.toolCallId === id));
+			const told = (id: string) => facts(id).map((message) => message.fact);
+			/** The identity every fact of one command carries: the session and generation announced, never a display argument. */
+			const identity = (toolCallId: string) => ({ kind: "fact", sessionId: "session-A", source: "codex-command", ownerGeneration: seen.find((message) => message.kind === "announce")!.ownerGeneration, toolCallId });
+			/** Pi's loop for one prompt: every row the turn opens is executed, until a call ends without one. */
+			const drive = async (text: string, signal?: AbortSignal) => {
+				let messages: Context["messages"] = [userMessage(text)];
+				const results: any[] = [];
+				for (;;) {
+					const step = await b.turn(messages, model(), { signal });
+					if (!step.toolCall) return { results, last: step };
+					const result = await b.exec(step.toolCall, { signal });
+					results.push(result);
+					messages = [...messages, step.final!, toolResultMessage(step.toolCall, result)];
+				}
+			};
+			return { ...b, events, seen, facts, told, identity, drive, options };
+		}
+
+		/** Start the turn's first row, then cut it with Pi's abort as Escape does. */
+		async function cutFirstRow(b: Awaited<ReturnType<typeof watched>>, text = "wait") {
+			const first = await b.turn(text);
+			const ac = new AbortController();
+			const row = b.exec(first.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			const error = await row.then(() => undefined, (e) => e as Error);
+			await b.turn([userMessage(text), first.final!], model(), { signal: ac.signal });
+			return { first, error };
+		}
+
+		describe("announcement and snapshot", () => {
+			it("announces on session_start with the command tool's own functions", async () => {
+				const b = await watched();
+				const tool = b.tools.get(TOOL_COMMAND)!;
+				expect(SHELL_DISPLAY_CHANNEL).toBe("rbf:shell-display:v1");
+				expect(b.seen).toEqual([{ kind: "announce", sessionId: "session-A", source: "codex-command", toolName: TOOL_COMMAND, ownerGeneration: expect.stringMatching(/^codex-command:.{8,}$/), execute: tool.execute, renderCall: tool.renderCall, renderResult: tool.renderResult }]);
+				expect(b.seen[0]!.execute).toBe(tool.execute);
+				expect(b.seen[0]!.renderCall).toBe(tool.renderCall);
+				expect(b.seen[0]!.renderResult).toBe(tool.renderResult);
+			});
+
+			it("a view that attaches after the owner asks and gets the announce, then every retained fact in order; another session's request gets nothing", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SAME, output: ["same\n"] }, { kind: "command", id: "c2", command: SAME, exitCode: 3 }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+				const events = createEventBus();
+				const b = await boot({ events });
+				let messages: Context["messages"] = [userMessage("go")];
+				for (;;) {
+					const step = await b.turn(messages);
+					if (!step.toolCall) break;
+					messages = [...messages, step.final!, toolResultMessage(step.toolCall, await b.exec(step.toolCall))];
+				}
+				const late: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => late.push(message as Message));
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-B" });
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "something-new" });
+				expect(late.map((m) => m.kind)).toEqual(["snapshot-request", "something-new"]);
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+				const answers = late.slice(2).filter((m) => m.kind !== "snapshot-request");
+				expect(answers.map((m) => [m.kind, m.toolCallId, m.revision, m.fact?.kind])).toEqual([
+					["announce", undefined, undefined, undefined],
+					["fact", "codex-c1", 1, "start"],
+					["fact", "codex-c1", 2, "completion"],
+					["fact", "codex-c2", 1, "start"],
+					["fact", "codex-c2", 2, "completion"],
+				]);
+				expect(answers[0]).toMatchObject({ sessionId: "session-A", source: "codex-command", toolName: TOOL_COMMAND, execute: b.tools.get(TOOL_COMMAND)!.execute });
+				for (const fact of answers.slice(1)) expect(fact).toMatchObject({ sessionId: "session-A", source: "codex-command", ownerGeneration: answers[0]!.ownerGeneration });
+			});
+
+			it("shutdown closes the client, says its open command is lost, withdraws, and answers nothing afterwards", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }] });
+				const b = await watched();
+				await cutFirstRow(b);
+				await b.shutdown();
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }, { kind: "lost" }]);
+				const generation = b.seen[0]!.ownerGeneration;
+				expect(b.seen.at(-1)).toEqual({ kind: "withdraw", sessionId: "session-A", source: "codex-command", ownerGeneration: generation });
+				b.events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+				expect(b.seen.at(-1)).toEqual({ kind: "snapshot-request", sessionId: "session-A" });
+			});
+
+			it("a client closed without a shutdown loses its open commands and withdraws nothing", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }] });
+				const b = await watched();
+				await cutFirstRow(b);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }]);
+				await b.handlers.get("session_before_switch")!({ type: "session_before_switch" }, b.ctx);
+				expect(b.facts("codex-c1")).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "cut", identity: "c1" } },
+					{ ...b.identity("codex-c1"), revision: 3, fact: { kind: "lost" } },
+				]);
+				expect(b.seen.filter((m) => m.kind === "withdraw")).toEqual([]);
+			});
+
+			it("keeps 2,000 invocations and evicts an ended one before an open one", () => {
+				expect(SHELL_DISPLAY_SNAPSHOT_LIMIT).toBe(2000);
+				const events = createEventBus();
+				const display = createShellDisplayOwner<{ kind: "start" | "completion" }>(events, "codex-command", (fact) => fact.kind === "completion", 2)!;
+				display.start("session-A", { name: TOOL_COMMAND, execute: () => {} });
+				const live: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => live.push(message as Message));
+				const snapshot = () => {
+					const from = live.length;
+					events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+					return live.slice(from).filter((m) => m.kind === "fact").map((m) => `${m.toolCallId}#${m.revision}:${m.fact.kind}`);
+				};
+				const [a, b, c, d] = ["a", "b", "c", "d"].map((id) => display.open(id)!);
+				a!.tell({ kind: "start" });
+				b!.tell({ kind: "start" });
+				b!.tell({ kind: "completion" });
+				c!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["a#1:start", "c#1:start"]);
+				d!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["c#1:start", "d#1:start"]);
+			});
+		});
+
+		describe("facts for each path of a command", () => {
+			it("a command that succeeds: the admitted start, then the completion as Codex sent it", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'ls -la'", output: ["a.ts\n"] }, { kind: "answer", id: "m1", text: "one file" }, { kind: "complete" }] });
+				const b = await watched();
+				const r = await b.round([userMessage("list files")]);
+				expect(r.first.toolCall!.arguments).toMatchObject({ itemId: "c1", threadId: "" }); // the display args name no thread for the root
+				expect(r.result).toMatchObject({ details: { itemId: "c1", exitCode: 0, status: "completed" }, isError: false });
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "completion", exitCode: 0, status: "completed" } },
+				]);
+			});
+
+			it("exit 7: the completion is captured with its exit and status though the row throws its details away", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'exit 7'", exitCode: 7, output: ["Status: completed\n"] }, { kind: "answer", id: "m1", text: "failed" }, { kind: "complete" }] });
+				const b = await watched();
+				const r = await b.round([userMessage("run it")]);
+				expect(r.result).toMatchObject({ details: {}, isError: true });
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "completion", exitCode: 7, status: "failed" } },
+				]);
+			});
+
+			it("the completion fact carries the two fields as they arrived, never the row's defaults", () => {
+				expect(shellCompletionFact({ exitCode: 0, status: "completed" })).toEqual({ kind: "completion", exitCode: 0, status: "completed" });
+				expect(shellCompletionFact({ exitCode: null, status: "completed" })).toEqual({ kind: "completion", exitCode: null, status: "completed" });
+				expect(shellCompletionFact({})).toEqual({ kind: "completion", exitCode: undefined, status: undefined });
+				expect(shellCompletionFact({ exitCode: "0", status: "declined", aggregatedOutput: "exit 0" })).toEqual({ kind: "completion", exitCode: "0", status: "declined" });
+			});
+
+			it("an approval that opens the row says nothing; the start comes only with Codex's item/started, after the answer", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo hi'", output: ["hi\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'echo hi'" }] }, { kind: "answer", id: "m1", text: "said hi" }, { kind: "complete" }] });
+				const b = await watched();
+				const atDialog: unknown[][] = [];
+				const select = b.ctx.ui.select;
+				(b.ctx.ui as any).select = async (...args: Parameters<typeof select>) => {
+					atDialog.push(b.told("codex-c1"));
+					await sleep(30);
+					atDialog.push(b.told("codex-c1"));
+					return select(...args);
+				};
+				b.answers.push("Yes");
+				const r = await b.round([userMessage("say hi")]);
+				expect(r.result).toMatchObject({ isError: false });
+				expect(atDialog).toEqual([[], []]);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "completion", exitCode: 0, status: "completed" }]);
+			});
+
+			it("a refused approval before any start is not run, with no start", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'touch /etc/x'", approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+				const b = await watched();
+				b.answers.push("No, tell Codex what to do instead");
+				const r = await b.round([userMessage("go")]);
+				expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+				expect(b.facts()).toEqual([{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "not-run" } }]);
+			});
+
+			it("Escape on an approval that never started: not run, then the cut, which names the item but admits no start", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'touch /etc/x'", approvals: [{ when: "before" }] }, { kind: "hang" }] });
+				const b = await watched();
+				const { error } = await cutFirstRow(b, "go");
+				expect(error?.message).toContain(ROW_STATUS.aborted);
+				// The abort ends the turn, the ended turn closes the dialog, and `answerRequest` answers Codex `decline` for it: the owner itself refused the command.
+				const approvalReplies = sent().filter((m) => m.id !== undefined && !m.method && (m as any).result?.decision !== undefined);
+				expect(approvalReplies.map((m) => (m as any).result)).toEqual([{ decision: "decline" }]);
+				expect(b.dialogs).toHaveLength(1);
+				expect(b.told("codex-c1")).toEqual([{ kind: "not-run" }, { kind: "cut", identity: "c1" }]);
+				// The view reads the pair as not run: the cut adds nothing to a command its owner refused.
+				const folded = b.told("codex-c1").reduce(reduceEvidence, NO_EVIDENCE);
+				expect(folded).toEqual({ executionEvidence: { state: "notRun" }, executionStarted: false });
+			});
+
+			it("a refusal after the command started is not a refusal to run: the start stands and the owner stops vouching", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'curl x'", approvals: [{ when: "after" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+				const b = await watched();
+				b.answers.push("No, tell Codex what to do instead");
+				const r = await b.round([userMessage("go")]);
+				expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "lost" }]);
+			});
+
+			it("a command cut by Escape: start, cut with the item id, and the late completion under the identity captured before the session moved on", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "sleep", ms: 150 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] });
+				const b = await watched();
+				const { error } = await cutFirstRow(b);
+				expect(error?.message).toContain(ROW_STATUS.aborted);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }]);
+				// The session Pi shows changes before Codex reports the command finished.
+				b.options.sessionId = "session-B";
+				expect(b.ctx.sessionManager.getSessionId()).toBe("session-B");
+				await vi.waitFor(() => expect(b.facts("codex-c1")).toHaveLength(3));
+				expect(b.facts("codex-c1")).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "cut", identity: "c1" } },
+					{ ...b.identity("codex-c1"), revision: 3, fact: { kind: "completion", exitCode: 0, status: "completed" } },
+				]);
+				expect(b.identity("codex-c1").sessionId).toBe("session-A");
+				expect(b.notify).toHaveBeenCalledWith(NOTICE.finishedAfterCancel(0, "/bin/sleep 30"), "info");
+			});
+
+			it("a completion Codex repeats after the cut command finished is told once", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] });
+				const b = await watched();
+				await cutFirstRow(b);
+				await vi.waitFor(() => expect(b.facts("codex-c1")).toHaveLength(3));
+				await sleep(120);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }, { kind: "completion", exitCode: 0, status: "completed" }]);
+			});
+
+			it("the client dying under a running command: the owner can no longer vouch, said once", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
+				const b = await watched();
+				const first = await b.turn("go");
+				const result = await b.exec(first.toolCall!);
+				expect(result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "lost" } },
+				]);
+			});
+
+			it("a completion with no start still reports, as a completion alone", async () => {
+				scenario({ turn: [{ kind: "finishCommand", id: "c9", command: "/bin/zsh -lc 'true'", exitCode: 0 }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+				const b = await watched();
+				const r = await b.round([userMessage("go")]);
+				expect(r.first.toolCall!.id).toBe("codex-c9");
+				expect(b.facts()).toEqual([{ ...b.identity("codex-c9"), revision: 1, fact: { kind: "completion", exitCode: 0, status: "completed" } }]);
+			});
+
+			it("two commands with the same text keep their own item ids", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SAME, output: ["same\n"] }, { kind: "command", id: "c2", command: SAME, output: ["same\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+				const b = await watched();
+				const { results } = await b.drive("twice");
+				expect(results).toHaveLength(2);
+				expect(b.facts().map((m) => [m.toolCallId, m.revision, m.fact.kind])).toEqual([
+					["codex-c1", 1, "start"],
+					["codex-c1", 2, "completion"],
+					["codex-c2", 1, "start"],
+					["codex-c2", 2, "completion"],
+				]);
+			});
+
+			it("an announced child's command reports under the owner's session; a thread nobody announced reports nothing", async () => {
+				scenario({
+					turn: [
+						{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+						{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", events: [{ kind: "command", id: "c2", command: "/bin/zsh -lc 'pytest -x'", output: ["1 passed\n"] }, { kind: "complete" }] },
+						{ kind: "childTurn", threadId: "T3", turnId: "T3-turn-1", events: [{ kind: "command", id: "c3", command: "/bin/zsh -lc 'rm -rf x'", output: ["gone\n"] }, { kind: "complete" }] },
+						{ kind: "answer", id: "m1", text: "PARENT DONE" },
+						{ kind: "complete" },
+					],
+				});
+				const b = await watched();
+				const { results, last } = await b.drive("delegate");
+				expect(results).toHaveLength(1);
+				expect(last.text).toBe("PARENT DONE");
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c2"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c2"), revision: 2, fact: { kind: "completion", exitCode: 0, status: "completed" } },
+				]);
+			});
+
+			it("a completion that names the item on another thread is not this command's: the owner stops vouching and tells no completion", async () => {
+				scenario({
+					turn: [
+						{ kind: "command", id: "c1", command: SLEEP, incomplete: true },
+						{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+						{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", events: [{ kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }, { kind: "complete" }] },
+						{ kind: "answer", id: "m1", text: "done" },
+						{ kind: "complete" },
+					],
+				});
+				const b = await watched();
+				const { results } = await b.drive("go");
+				expect(results).toHaveLength(1);
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "lost" } },
+				]);
+			});
+		});
+
+		describe("sandbox launch", () => {
+			it("a sandbox launch loads no owner: nothing is announced, reported or answered", async () => {
+				const events = createEventBus();
+				const seen: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => seen.push(message as Message));
+				const fx = makePi({ events });
+				createRbfCodex({ command: fakeCommand, argv: ["--sandbox"] })(fx.pi);
+				expect(fx.registered).toBe(false);
+				expect(fx.tools.size).toBe(0);
+				expect(fx.handlers.size).toBe(0);
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+				expect(seen).toEqual([{ kind: "snapshot-request", sessionId: "session-A" }]);
+			});
+		});
+
+		describe("isolation from the native turn", () => {
+			const SCRIPTS: { name: string; scenario: FakeScenario; answers?: (string | undefined)[]; cut?: boolean }[] = [
+				{ name: "success", scenario: { turn: [{ kind: "command", id: "c1", command: SAME, output: ["same\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] } },
+				{ name: "exit 7", scenario: { turn: [{ kind: "command", id: "c1", command: SAME, exitCode: 7, output: ["boom\n"] }, { kind: "answer", id: "m1", text: "failed" }, { kind: "complete" }] } },
+				{ name: "refused", scenario: { turn: [{ kind: "command", id: "c1", command: SAME, approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] }, answers: ["No, tell Codex what to do instead"] },
+				{ name: "cut then late completion", scenario: { turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "sleep", ms: 60 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] }, cut: true },
+				{ name: "client death", scenario: { turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "die" }] } },
+			];
+
+			/** Every script on a fresh owner over `events` (none when undefined), reduced to what the native path returned, said and sent. */
+			async function nativeOutcome(events: Bus | undefined) {
+				const out: Record<string, unknown> = {};
+				for (const script of SCRIPTS) {
+					scenario(script.scenario);
+					const from = sent().length;
+					const b = await boot({ events });
+					b.answers.push(...(script.answers ?? []));
+					const record: Record<string, unknown> = {};
+					if (script.cut) {
+						const first = await b.turn("go");
+						const ac = new AbortController();
+						const row = b.exec(first.toolCall!, { signal: ac.signal });
+						await sleep(50);
+						ac.abort();
+						record.row = await row.then((r) => ({ resolved: r }), (e) => ({ rejected: String(e.message) }));
+						record.recall = (await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal })).final?.stopReason;
+						await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(NOTICE.finishedAfterCancel(0, "/bin/sleep 30"), "info"));
+					} else {
+						const r = await b.round([userMessage("go")]);
+						record.call = r.first.toolCall;
+						record.row = r.result;
+						record.next = [r.next?.final?.stopReason, r.next?.text, r.next?.final?.errorMessage];
+					}
+					record.notices = b.notify.mock.calls;
+					record.entries = b.entries;
+					record.dialogs = b.dialogs.map((d) => [d.kind, d.title]);
+					await b.shutdown();
+					record.methods = sent().slice(from).map((m) => m.method ?? "reply");
+					out[script.name] = JSON.parse(JSON.stringify(record));
+				}
+				return out;
+			}
+
+			it("a throwing subscriber, a throwing bus and no bus at all leave every row, notice, entry and protocol message as it was", async () => {
+				const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+				try {
+					const baseline = await nativeOutcome(undefined);
+					expect((baseline.success as any).row).toMatchObject({ details: { itemId: "c1", exitCode: 0, status: "completed" }, isError: false });
+					expect((baseline["exit 7"] as any).row).toMatchObject({ isError: true });
+					expect((baseline.refused as any).row).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+					expect((baseline["cut then late completion"] as any).row.rejected).toContain(ROW_STATUS.aborted);
+					expect((baseline["client death"] as any).row).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
+
+					expect(await nativeOutcome(createEventBus())).toEqual(baseline);
+
+					let thrown = 0;
+					const throwing = (bus: Bus) => {
+						bus.on(SHELL_DISPLAY_CHANNEL, () => {
+							thrown++;
+							throw new Error("subscriber blew up");
+						});
+						return bus;
+					};
+					expect(await nativeOutcome(throwing(createEventBus()))).toEqual(baseline);
+					const afterPiBus = thrown;
+					expect(afterPiBus).toBeGreaterThan(15);
+					expect(await nativeOutcome(throwing(rawBus()))).toEqual(baseline);
+					expect(thrown).toBeGreaterThan(afterPiBus + 15);
+
+					const broken: Bus = {
+						emit: () => {
+							thrown++;
+							throw new Error("bus blew up");
+						},
+						on: () => {
+							throw new Error("cannot subscribe");
+						},
+					};
+					expect(await nativeOutcome(broken)).toEqual(baseline);
+				} finally {
+					errors.mockRestore();
+				}
+			}, 120_000);
+		});
+	});
+});

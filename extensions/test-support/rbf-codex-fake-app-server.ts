@@ -8,7 +8,8 @@ export type FakeApproval = { when: "before" | "after"; command?: string | null; 
 /** Computer use's per-app question, as Codex 0.154.0 sends it (probe 2026-09-14): an empty-form MCP elicitation during the `mcpToolCall`; a refused one fails the call and the turn goes on. */
 export type FakeElicitation = { message: string; app?: string; subtitle?: string; persist?: string[]; mode?: string; properties?: Record<string, unknown>; approvalKind?: string | null };
 export type FakeTurnEvent =
-	| { kind: "command"; id: string; command: string; cwd?: string; exitCode?: number; output?: string[]; approvals?: FakeApproval[]; aggregatedOutput?: string; incomplete?: boolean }
+	/** `completion` overrides fields of the completed item and `omit` leaves fields out of it, for a completion Codex sent incomplete or at odds with itself. */
+	| { kind: "command"; id: string; command: string; cwd?: string; exitCode?: number; output?: string[]; approvals?: FakeApproval[]; aggregatedOutput?: string; incomplete?: boolean; completion?: Record<string, unknown>; omit?: string[] }
 	| { kind: "toolCall"; id: string; server: string; tool: string; arguments?: unknown; appContext?: Record<string, unknown> | null; result?: { content?: unknown[]; structuredContent?: unknown }; status?: "completed" | "failed"; error?: string; elicitations?: FakeElicitation[]; progress?: boolean; incomplete?: boolean; durationMs?: number }
 	| { kind: "startupStatus"; name: string; status: string; error?: string | null; failureReason?: string | null }
 	/** A `subAgentActivity` item on the current turn, as Codex announces a sub-agent (probe 2026-09-14). */
@@ -16,7 +17,7 @@ export type FakeTurnEvent =
 	/** A sub-agent's turn on its own thread: `turn/started`, its events with the child's ids, ending on its own `complete`. Inline unless `detached`, which lets two children run at once. */
 	| { kind: "childTurn"; threadId: string; turnId?: string; events: FakeTurnEvent[]; detached?: boolean }
 	/** Complete a command started with `incomplete` earlier, on the current turn (a root row held open while a child works). */
-	| { kind: "finishCommand"; id: string; command: string; exitCode?: number; aggregatedOutput?: string }
+	| { kind: "finishCommand"; id: string; command: string; exitCode?: number; aggregatedOutput?: string; completion?: Record<string, unknown>; omit?: string[] }
 	/** A `collabAgentToolCall` on the current turn; draws nothing. A code-mode model announces a child only here: `receivers` on the completion, `states` per child (probe `subapproval-luna.jsonl` and Tomek's sol rollouts, 2026-09-15). */
 	| { kind: "collab"; tool?: string; receivers?: string[]; states?: Record<string, string> }
 	/** Timing controls for interleaved turns: pause, or wait until Pi has answered this many server requests in this process. */
@@ -170,8 +171,10 @@ async function approve(ctl: TurnCtl, itemId: string, method: string, a: FakeAppr
 	return true;
 }
 
-function completeCommand(threadId: string, turnId: string, ev: { id: string; command: string; cwd?: string; exitCode?: number; aggregatedOutput?: string; output?: string[] }): void {
-	notify("item/completed", { threadId, turnId, item: { id: ev.id, type: "commandExecution", command: ev.command, cwd: ev.cwd ?? process.cwd(), status: ev.exitCode ? "failed" : "completed", exitCode: ev.exitCode ?? 0, aggregatedOutput: ev.aggregatedOutput ?? (ev.output ?? []).join(""), durationMs: 12 } });
+function completeCommand(threadId: string, turnId: string, ev: { id: string; command: string; cwd?: string; exitCode?: number; aggregatedOutput?: string; output?: string[]; completion?: Record<string, unknown>; omit?: string[] }): void {
+	const item: Record<string, unknown> = { id: ev.id, type: "commandExecution", command: ev.command, cwd: ev.cwd ?? process.cwd(), status: ev.exitCode ? "failed" : "completed", exitCode: ev.exitCode ?? 0, aggregatedOutput: ev.aggregatedOutput ?? (ev.output ?? []).join(""), durationMs: 12, ...(ev.completion ?? {}) };
+	for (const field of ev.omit ?? []) delete item[field];
+	notify("item/completed", { threadId, turnId, item });
 }
 
 async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {

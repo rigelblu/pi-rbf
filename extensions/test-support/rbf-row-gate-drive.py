@@ -5,7 +5,13 @@ The row gate's test hands this script one JSON plan on stdin:
 
   {"argv": ["pi", ...], "cwd": "...", "env": {...}, "cols": 100, "rows": 40, "timeout": 30,
    "out": "raw.bin",
-   "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}, {"snapshot": "after-turn"}]}
+   "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}, {"snapshot": "after-turn"},
+             {"bytes": "\u001b[<0;6;20M"}, {"resize": {"cols": 80, "rows": 40}}]}
+
+A bytes step writes its string to the terminal as it is, one byte per character (mouse reports, a lone control byte).
+A resize step changes the terminal's size, which the kernel reports to Pi as SIGWINCH.
+A locate step, {"locate": {"name": "header", "text": "regex"}}, finds the screen row a fullscreen Pi last drew matching
+text on, and a later bytes step may name it: "\u001b[<0;6;{header}M", or {header+2} for a row below it.
 
 A reloadReady step waits for the test-only probe's activation receipt, then sends its
 idempotent command until the newly loaded handler acknowledges it from the editor.
@@ -29,13 +35,40 @@ import sys
 import termios
 import time
 
-KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f", "ctrl-u": b"\x15", "alt-enter": b"\x1b\r"}
+KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-b": b"\x02", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f", "ctrl-u": b"\x15", "alt-enter": b"\x1b\r"}
 # CSI sequences; OSC sequences ended by BEL or by ST (ESC \), never spanning a later ESC; charset and keypad selects; CR.
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|\r")
 
 
 def strip(raw: bytes) -> bytes:
     return ANSI.sub(b"", raw)
+
+
+CSI_OR_TEXT = re.compile(rb"\x1b\[([0-9;?<>=]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|([^\x1b]+)")
+
+
+def drawn_row(raw: bytes, pattern: "re.Pattern[bytes]"):
+    """The 1-based row of the latest row drawing that matches. A fullscreen Pi addresses a row (ESC[row;colH) and then writes all of it."""
+    rows = {}
+    row, order = 1, 0
+    for m in CSI_OR_TEXT.finditer(raw):
+        if m.group(2) in (b"H", b"f"):
+            row = int((m.group(1) or b"1").split(b";")[0] or b"1")
+            order += 1
+            rows[row] = (order, b"")
+        elif m.group(2) == b"J":
+            rows = {}
+        elif m.group(3) is not None:
+            text = m.group(3)
+            for i, piece in enumerate(text.split(b"\n")):
+                if i > 0:
+                    row += 1
+                    order += 1
+                    rows[row] = (order, b"")
+                seen = rows.get(row, (order, b""))
+                rows[row] = (seen[0], seen[1] + piece.replace(b"\r", b""))
+    found = [(seen[0], r) for r, seen in rows.items() if pattern.search(seen[1])]
+    return max(found)[1] if found else None
 
 
 def main() -> int:
@@ -57,6 +90,7 @@ def main() -> int:
 
     raw = bytearray()
     snapshots = {}
+    located = {}
     failure = None
 
     def pump(until: float) -> None:
@@ -122,6 +156,23 @@ def main() -> int:
             elif "key" in step:
                 os.write(fd, KEYS[step["key"]])
                 pump(time.monotonic() + 0.15)
+            elif "locate" in step:
+                target = step["locate"]
+                found = drawn_row(bytes(raw), re.compile(target["text"].encode()))
+                if found is None:
+                    failure = f"could not locate a drawn row matching {target['text']!r}"
+                    break
+                located[target["name"]] = found
+                snapshots[f"row:{target['name']}"] = found
+            elif "bytes" in step:
+                def row_of(m):
+                    return str(located[m.group(1)] + int(m.group(2) or 0))
+                os.write(fd, re.sub(r"\{(\w+)([+-]\d+)?\}", row_of, step["bytes"]).encode("latin1"))
+                pump(time.monotonic() + 0.15)
+            elif "resize" in step:
+                size = step["resize"]
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", int(size["rows"]), int(size["cols"]), 0, 0))
+                pump(time.monotonic() + 0.4)
             elif "sleep" in step:
                 pump(time.monotonic() + float(step["sleep"]))
             elif "waitSessionTurns" in step:
