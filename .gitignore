@@ -1,2 +1,5 @@
 node_modules/
+
+# rb
 .rb-drive-remote
+.rb-drive-public-share
