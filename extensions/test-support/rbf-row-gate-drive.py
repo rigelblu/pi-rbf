@@ -5,7 +5,16 @@ The row gate's test hands this script one JSON plan on stdin:
 
   {"argv": ["pi", ...], "cwd": "...", "env": {...}, "cols": 100, "rows": 40, "timeout": 30,
    "out": "raw.bin",
-   "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}]}
+   "steps": [{"wait": "regex on the ANSI-stripped stream"}, {"paste": "text"}, {"key": "enter"}, {"sleep": 0.5}, {"snapshot": "after-turn"},
+             {"bytes": "\u001b[<0;6;20M"}, {"resize": {"cols": 80, "rows": 40}}]}
+
+A bytes step writes its string to the terminal as it is, one byte per character (mouse reports, a lone control byte).
+A resize step changes the terminal's size, which the kernel reports to Pi as SIGWINCH.
+A locate step, {"locate": {"name": "header", "text": "regex"}}, finds the screen row a fullscreen Pi last drew matching
+text on, and a later bytes step may name it: "\u001b[<0;6;{header}M", or {header+2} for a row below it.
+
+A reloadReady step waits for the test-only probe's activation receipt, then sends its
+idempotent command until the newly loaded handler acknowledges it from the editor.
 
 Rules learned driving Pi 0.85.1 (core memories): a slash command or prompt goes in as one
 bracketed paste, never char by char, or Pi's autocomplete opens and Enter takes a completion;
@@ -13,6 +22,8 @@ TERM must be xterm-256color for the row escapes to match daily use; only the Pi 
 Exit 0 when every wait matched; 2 on a timeout, with the raw bytes still written for a post-mortem.
 """
 import fcntl
+import glob
+import hashlib
 import json
 import os
 import pty
@@ -24,13 +35,40 @@ import sys
 import termios
 import time
 
-KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f"}
+KEYS = {"enter": b"\r", "tab": b"\t", "escape": b"\x1b", "up": b"\x1b[A", "down": b"\x1b[B", "ctrl-b": b"\x02", "ctrl-c": b"\x03", "ctrl-d": b"\x04", "ctrl-o": b"\x0f", "ctrl-u": b"\x15", "alt-enter": b"\x1b\r"}
 # CSI sequences; OSC sequences ended by BEL or by ST (ESC \), never spanning a later ESC; charset and keypad selects; CR.
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|\r")
 
 
 def strip(raw: bytes) -> bytes:
     return ANSI.sub(b"", raw)
+
+
+CSI_OR_TEXT = re.compile(rb"\x1b\[([0-9;?<>=]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|([^\x1b]+)")
+
+
+def drawn_row(raw: bytes, pattern: "re.Pattern[bytes]"):
+    """The 1-based row of the latest row drawing that matches. A fullscreen Pi addresses a row (ESC[row;colH) and then writes all of it."""
+    rows = {}
+    row, order = 1, 0
+    for m in CSI_OR_TEXT.finditer(raw):
+        if m.group(2) in (b"H", b"f"):
+            row = int((m.group(1) or b"1").split(b";")[0] or b"1")
+            order += 1
+            rows[row] = (order, b"")
+        elif m.group(2) == b"J":
+            rows = {}
+        elif m.group(3) is not None:
+            text = m.group(3)
+            for i, piece in enumerate(text.split(b"\n")):
+                if i > 0:
+                    row += 1
+                    order += 1
+                    rows[row] = (order, b"")
+                seen = rows.get(row, (order, b""))
+                rows[row] = (seen[0], seen[1] + piece.replace(b"\r", b""))
+    found = [(seen[0], r) for r, seen in rows.items() if pattern.search(seen[1])]
+    return max(found)[1] if found else None
 
 
 def main() -> int:
@@ -51,6 +89,8 @@ def main() -> int:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
     raw = bytearray()
+    snapshots = {}
+    located = {}
     failure = None
 
     def pump(until: float) -> None:
@@ -73,10 +113,40 @@ def main() -> int:
         for step in plan["steps"]:
             if "wait" in step:
                 pattern = re.compile(step["wait"].encode())
-                while not pattern.search(strip(bytes(raw))):
-                    if time.monotonic() > deadline:
-                        failure = f"timed out waiting for {step['wait']!r}"
+                count = int(step.get("count", 1))
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
+                while len(list(pattern.finditer(strip(bytes(raw))))) < count:
+                    if time.monotonic() > wait_deadline:
+                        failure = f"timed out waiting for {step['wait']!r} (count={count})"
                         break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
+            elif "reloadReady" in step:
+                receipt = step["reloadReady"]
+                target = int(receipt["loads"])
+                last_ping = 0.0
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
+                while True:
+                    try:
+                        with open(receipt["path"], encoding="utf-8") as f:
+                            state = json.load(f)
+                    except (OSError, ValueError):  # writer may be replacing the receipt
+                        state = {}
+                    if state.get("readyLoad") == target and state.get("loads") == target:
+                        # The receipt is written inside the command handler; let Pi
+                        # finish that command's redraw before the next paste/Enter.
+                        pump(time.monotonic() + 0.25)
+                        break
+                    if time.monotonic() > wait_deadline:
+                        failure = f"timed out waiting for reload readiness (loads={target})"
+                        break
+                    if state.get("loads") == target and time.monotonic() - last_ping >= 0.75:
+                        # A swallowed ping during the reload box is harmless: retry until
+                        # the new extension's command handler actually runs in the editor.
+                        command = f"{receipt.get('command', '/rbf-reload-ready')} {target}".encode()
+                        os.write(fd, b"\x1b[200~" + command + b"\x1b[201~\r")
+                        last_ping = time.monotonic()
                     pump(time.monotonic() + 0.1)
                 if failure:
                     break
@@ -86,8 +156,82 @@ def main() -> int:
             elif "key" in step:
                 os.write(fd, KEYS[step["key"]])
                 pump(time.monotonic() + 0.15)
+            elif "locate" in step:
+                target = step["locate"]
+                found = drawn_row(bytes(raw), re.compile(target["text"].encode()))
+                if found is None:
+                    failure = f"could not locate a drawn row matching {target['text']!r}"
+                    break
+                located[target["name"]] = found
+                snapshots[f"row:{target['name']}"] = found
+            elif "bytes" in step:
+                def row_of(m):
+                    return str(located[m.group(1)] + int(m.group(2) or 0))
+                os.write(fd, re.sub(r"\{(\w+)([+-]\d+)?\}", row_of, step["bytes"]).encode("latin1"))
+                pump(time.monotonic() + 0.15)
+            elif "resize" in step:
+                size = step["resize"]
+                # Where in the stream the size changed, for a replay of the screen.
+                snapshots[f"resize:{sum(1 for name in snapshots if name.startswith('resize:')) + 1}"] = len(raw)
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", int(size["rows"]), int(size["cols"]), 0, 0))
+                pump(time.monotonic() + 0.4)
             elif "sleep" in step:
                 pump(time.monotonic() + float(step["sleep"]))
+            elif "waitSessionTurns" in step:
+                target = step["waitSessionTurns"]
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
+                while True:
+                    files = glob.glob(os.path.join(target["dir"], "*.jsonl"))
+                    try:
+                        with open(files[0], "r", encoding="utf-8") as f:
+                            count = sum(1 for line in f if '"customType":"rbf-codex-turn/v1"' in line)
+                    except (IndexError, OSError):
+                        count = 0
+                    if count >= int(target["count"]):
+                        pump(time.monotonic() + 0.3)
+                        break
+                    if time.monotonic() > wait_deadline:
+                        failure = f"timed out waiting for {target['count']} Codex turns, saw {count}"
+                        break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
+            elif "waitJsonl" in step:
+                target = step["waitJsonl"]
+                wait_deadline = min(deadline, time.monotonic() + float(step.get("timeout", plan.get("timeout", 30))))
+                while True:
+                    try:
+                        with open(target["path"], encoding="utf-8") as f:
+                            matches = [json.loads(line) for line in f if line.strip()]
+                        matches = [item for item in matches if item.get(target["field"]) == target["value"]]
+                        count = len({json.dumps(item.get(target["unique"]), sort_keys=True) for item in matches}) if "unique" in target else len(matches)
+                    except (OSError, ValueError):
+                        count = 0
+                    if count >= int(target["count"]):
+                        pump(time.monotonic() + 0.3)
+                        break
+                    if time.monotonic() > wait_deadline:
+                        failure = f"timed out waiting for JSONL receipt count={target['count']}, saw {count}"
+                        break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
+            elif "sessionSnapshot" in step:
+                target = step["sessionSnapshot"]
+                name = target["name"]
+                files = glob.glob(os.path.join(target["dir"], "*.jsonl"))
+                if name in snapshots or len(files) != 1:
+                    failure = f"session snapshot {name!r} expected exactly one JSONL, got {len(files)}"
+                    break
+                with open(files[0], "rb") as f:
+                    data = f.read()
+                snapshots[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+            elif "snapshot" in step:
+                name = step["snapshot"]
+                if name in snapshots:
+                    failure = f"duplicate snapshot {name!r}"
+                    break
+                snapshots[name] = len(raw)
     finally:
         # Let the last frame land, then take only Pi down; its children follow it (stdin EOF).
         pump(time.monotonic() + 0.4)
@@ -108,6 +252,7 @@ def main() -> int:
     if failure:
         print(failure, file=sys.stderr)
         return 2
+    print(json.dumps(snapshots))
     return 0
 
 

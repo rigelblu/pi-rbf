@@ -291,7 +291,7 @@ export function formatEditSummaryLine(added: number, removed: number, activeThem
 	const removedWord = removed === 1 ? "line" : "lines";
 
 	return (
-		activeTheme.fg("dim", "└ ") +
+		activeTheme.fg("dim", "└  ") +
 		activeTheme.fg("dim", "Added ") +
 		activeTheme.bold(activeTheme.fg("text", String(added))) +
 		activeTheme.fg("dim", ` ${addedWord}, removed `) +

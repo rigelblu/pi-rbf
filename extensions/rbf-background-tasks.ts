@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -8,6 +9,7 @@ import {
 	FooterComponent,
 	getShellConfig,
 	keyText,
+	parseArgs,
 	ToolExecutionComponent,
 	type BashOperations,
 	type ExtensionAPI,
@@ -35,6 +37,9 @@ export const DEFAULT_LOG_BASE_DIR = "/tmp/pi-tasks";
 export const BACKGROUND_TASKS_STATUS_KEY = "rbf-background-tasks";
 export const TASK_ID_LENGTH = 8;
 
+/** `rbf-cd.ts` asks this before it switches sessions: the switch stops every tracked task and aborts a running command. */
+export const BUSY_QUERY_CHANNEL = "rbf-background-tasks:busy/v1";
+
 export const BASH_EXECUTION_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.bashExecutionPatched");
 export const LOADER_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.loaderPatched");
 export const TOOL_EXECUTION_PATCHED_KEY = Symbol.for("rbf.backgroundTasks.toolExecutionPatched");
@@ -42,6 +47,7 @@ const ORIG_LOADER_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origLoaderUpd
 const ORIG_LOADER_SET_MESSAGE = Symbol.for("rbf.backgroundTasks.origLoaderSetMessage");
 const ORIG_BASH_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origBashUpdateDisplay");
 const ORIG_TOOL_EXECUTION_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.origToolExecutionUpdateDisplay");
+export const INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY = Symbol.for("rbf.backgroundTasks.installedToolExecutionUpdateDisplay");
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -63,12 +69,21 @@ export interface BackgroundTask {
 	isBackgrounded: boolean;
 	child?: ChildProcess;
 	logStream?: fs.WriteStream;
+	/** Display only (pi-42): tells a shell-count view what happened to the agent call this task belongs to. Never throws. */
+	tellDisplay?: (fact: ShellDisplayFact) => void;
 }
 
 export interface ActiveForegroundExecution {
 	task: BackgroundTask;
 	detach: () => void;
 	abort: () => void;
+}
+
+/** Filled in by the listener before `emit` returns. Flags are only ever raised, so a second listener can't hide running work. */
+export interface BusyQuery {
+	answered?: boolean;
+	backgroundTask?: boolean;
+	command?: boolean;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -251,6 +266,7 @@ export class TaskManager {
 		if (task.status === "running") {
 			task.status = "stopped";
 			task.endTime = Date.now();
+			task.tellDisplay?.({ kind: "stop-request", reason: "cancel" });
 			if (task.pid) {
 				terminateProcessTree(task.pid);
 			}
@@ -440,7 +456,7 @@ export function patchBashExecutionComponent(): void {
 		const origToolUpdateDisplay = toolProto.updateDisplay;
 		toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY] = origToolUpdateDisplay;
 
-		toolProto.updateDisplay = function () {
+		const installedUpdateDisplay = function (this: any) {
 			if (typeof origToolUpdateDisplay === "function") {
 				try {
 					origToolUpdateDisplay.call(this);
@@ -457,6 +473,8 @@ export function patchBashExecutionComponent(): void {
 			}
 		};
 
+		toolProto.updateDisplay = installedUpdateDisplay;
+		toolProto[INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY] = installedUpdateDisplay;
 		toolProto[TOOL_EXECUTION_PATCHED_KEY] = true;
 	}
 }
@@ -486,11 +504,19 @@ export function unpatchBashExecutionComponent(): void {
 
 	const toolProto = (ToolExecutionComponent as any)?.prototype;
 	if (toolProto && toolProto[TOOL_EXECUTION_PATCHED_KEY]) {
-		if (toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY]) {
-			toolProto.updateDisplay = toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
-			delete toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+		const installed = toolProto[INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY];
+		const canRestore =
+			typeof installed === "function"
+				? toolProto.updateDisplay === installed
+				: true;
+		if (canRestore) {
+			if (toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY]) {
+				toolProto.updateDisplay = toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+				delete toolProto[ORIG_TOOL_EXECUTION_UPDATE_DISPLAY];
+			}
+			delete toolProto[TOOL_EXECUTION_PATCHED_KEY];
+			delete toolProto[INSTALLED_TOOL_EXECUTION_UPDATE_DISPLAY];
 		}
-		delete toolProto[TOOL_EXECUTION_PATCHED_KEY];
 	}
 }
 
@@ -668,6 +694,8 @@ export interface FooterRegistry {
 	originalRender: (width: number) => string[];
 	originalHandleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 	isHandlingMouse?: boolean;
+	installedRender?: (this: any, width: number) => string[];
+	installedHandleMouse?: (this: any, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 }
 
 export function getOrCreateFooterRegistry(): FooterRegistry | null {
@@ -678,15 +706,8 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 	if (!registry) {
 		const originalRender = FooterComponent.prototype.render;
 		const originalHandleMouse = (FooterComponent.prototype as any).handleMouse;
-		registry = {
-			hooks: new Map(),
-			originalRender,
-			originalHandleMouse,
-			isHandlingMouse: false,
-		};
-		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
 
-		FooterComponent.prototype.render = function (this: any, width: number): string[] {
+		const installedRender = function (this: any, width: number): string[] {
 			let lines = registry.originalRender.call(this, width);
 			for (const hook of registry.hooks.values()) {
 				try {
@@ -698,7 +719,7 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 			return lines;
 		};
 
-		(FooterComponent.prototype as any).handleMouse = function (
+		const installedHandleMouse = function (
 			this: any,
 			event: TuiMouseEvent,
 		): TuiMouseEventResult | undefined {
@@ -728,6 +749,19 @@ export function getOrCreateFooterRegistry(): FooterRegistry | null {
 				registry.isHandlingMouse = false;
 			}
 		};
+
+		registry = {
+			hooks: new Map(),
+			originalRender,
+			originalHandleMouse,
+			isHandlingMouse: false,
+			installedRender,
+			installedHandleMouse,
+		};
+		(FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY] = registry;
+
+		FooterComponent.prototype.render = installedRender;
+		(FooterComponent.prototype as any).handleMouse = installedHandleMouse;
 	}
 	return registry;
 }
@@ -838,13 +872,23 @@ export function unpatchFooterComponent(): void {
 	if (registry) {
 		registry.hooks.delete("tasks");
 		if (registry.hooks.size === 0) {
-			FooterComponent.prototype.render = registry.originalRender;
-			if (registry.originalHandleMouse) {
-				(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
-			} else {
-				delete (FooterComponent.prototype as any).handleMouse;
+			const currentRender = FooterComponent.prototype.render;
+			const currentHandleMouse = (FooterComponent.prototype as any).handleMouse;
+			const canRestore =
+				typeof registry.installedRender === "function" &&
+				typeof registry.installedHandleMouse === "function" &&
+				currentRender === registry.installedRender &&
+				currentHandleMouse === registry.installedHandleMouse;
+
+			if (canRestore) {
+				FooterComponent.prototype.render = registry.originalRender;
+				if (registry.originalHandleMouse) {
+					(FooterComponent.prototype as any).handleMouse = registry.originalHandleMouse;
+				} else {
+					delete (FooterComponent.prototype as any).handleMouse;
+				}
+				delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 			}
-			delete (FooterComponent.prototype as any)[FOOTER_PI_RBF_REGISTRY_KEY];
 		}
 	}
 	delete (FooterComponent.prototype as any)[FOOTER_TASKS_PATCHED_KEY];
@@ -877,6 +921,170 @@ export function updateFooterBadge(
 	}
 }
 
+// ─── Shell display observer (pi-42) ──────────────────────────────────────────
+// Display only. A shell-count view listens on this channel. Nothing sent here starts, stops, approves or settles work,
+// and nothing in this section may throw into the code that does. The view is a separate extension that can be removed,
+// so this owner imports nothing from it and publishes what it saw without saying what it proves.
+
+export const SHELL_DISPLAY_CHANNEL = "rbf:shell-display:v1";
+/** How many invocations an owner keeps for a view that attaches late. */
+export const SHELL_DISPLAY_SNAPSHOT_LIMIT = 2000;
+/** How many facts it keeps for one invocation: the first, and the newest after it. */
+export const SHELL_DISPLAY_FACTS_PER_INVOCATION = 16;
+
+/**
+ * What this owner saw of one agent bash call, as it saw it.
+ * - `start`: the process spawned
+ * - `background`: the call was detached and the process runs on as this task
+ * - `stop-request`: an abort, `/cancel`, a timeout or a shutdown asked the process to stop. Only a `close` says it did
+ * - `close`: the spawned process closed, with the code and signal Node reported
+ * - `child-error`: the spawned process reported an error; no close has said it ended
+ * - `not-run`: the call failed before a process spawned
+ */
+export type ShellDisplayFact =
+	| { kind: "start" }
+	| { kind: "background"; identity: string }
+	| { kind: "stop-request"; reason: "cancel" | "timeout" }
+	| { kind: "close"; code: number | null; signal: string | null }
+	| { kind: "child-error" }
+	| { kind: "not-run" };
+
+type ShellDisplayBus = { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
+type ShellDisplayTool = { name: string; execute: unknown; renderCall?: unknown; renderResult?: unknown };
+
+/** One invocation's identity, captured when its execute began. `tell` publishes a fact about it and never throws. */
+export type ShellDisplayCall<Fact> = { sessionId: string; toolCallId: string; tell: (fact: Fact) => void };
+
+/**
+ * One owner's side of the display channel: it announces itself, publishes facts, keeps the last `limit` invocations for a view
+ * that asks later, and withdraws. `ends` says which facts close an invocation; when the bound is hit the least recently updated
+ * ended invocation goes first, and an open one only when no ended one is left. Undefined on a Pi with no event bus.
+ */
+export function createShellDisplayOwner<Fact extends { kind: string }>(
+	events: ShellDisplayBus | undefined,
+	source: string,
+	ends: (fact: Fact) => boolean,
+	limit = SHELL_DISPLAY_SNAPSHOT_LIMIT,
+) {
+	if (typeof events?.emit !== "function" || typeof events.on !== "function") return undefined;
+	let sessionId = "";
+	let ownerGeneration = "";
+	let tool: ShellDisplayTool | undefined;
+	let stopListening: (() => void) | undefined;
+	/** Retained invocations by call id, least recently updated first. */
+	const retained = new Map<string, { ended: boolean; messages: unknown[] }>();
+
+	// Each message is sent on its own: a subscriber that throws on one must not cut short the withdrawal, the announcement or the facts after it.
+	const send = (message: unknown) => {
+		try {
+			events.emit(SHELL_DISPLAY_CHANNEL, message);
+		} catch {}
+	};
+	const announce = () =>
+		send({ kind: "announce", sessionId, source, toolName: tool?.name, ownerGeneration, execute: tool?.execute, renderCall: tool?.renderCall, renderResult: tool?.renderResult });
+	const answer = (data: unknown) => {
+		try {
+			const request = data as { kind?: unknown; sessionId?: unknown; toolCallIds?: unknown } | undefined;
+			if (!ownerGeneration || request?.kind !== "snapshot-request" || request.sessionId !== sessionId) return;
+			announce();
+			// A request that names calls gets those calls' facts only; one that names none gets everything kept.
+			const wanted = Array.isArray(request.toolCallIds) ? request.toolCallIds.flatMap((id) => retained.get(id) ?? []) : [...retained.values()];
+			for (const invocation of wanted) {
+				for (const message of invocation.messages) send(message);
+			}
+		} catch {}
+	};
+	const withdraw = () => {
+		if (!ownerGeneration) return;
+		send({ kind: "withdraw", sessionId, source, ownerGeneration });
+		ownerGeneration = "";
+		retained.clear();
+	};
+
+	return {
+		/** A session began: withdraw what was announced before, then announce under a fresh generation. */
+		start(session: string | undefined, registered: ShellDisplayTool): void {
+			try {
+				withdraw();
+				if (!session) return;
+				sessionId = session;
+				tool = registered;
+				ownerGeneration = `${source}:${crypto.randomUUID()}`;
+				stopListening ??= events.on(SHELL_DISPLAY_CHANNEL, answer);
+				announce();
+			} catch {}
+		},
+		/** The identity of one invocation, captured now. Undefined while nothing is announced. */
+		open(toolCallId: string): ShellDisplayCall<Fact> | undefined {
+			if (!ownerGeneration) return undefined;
+			const identity = { sessionId, source, ownerGeneration, toolCallId };
+			let revision = 0;
+			const tell = (fact: Fact) => {
+				try {
+					// A call from before a withdrawal or a new session says nothing: no old callback speaks for a new owner.
+					if (identity.ownerGeneration !== ownerGeneration) return;
+					const message = { kind: "fact", ...identity, revision: ++revision, fact };
+					const invocation = retained.get(toolCallId) ?? { ended: false, messages: [] };
+					retained.delete(toolCallId);
+					invocation.messages.push(message);
+					if (invocation.messages.length > SHELL_DISPLAY_FACTS_PER_INVOCATION) invocation.messages.splice(1, 1);
+					invocation.ended ||= ends(fact);
+					retained.set(toolCallId, invocation);
+					if (retained.size > limit) {
+						let evict: string | undefined;
+						for (const [id, kept] of retained) {
+							evict ??= id;
+							if (kept.ended) {
+								evict = id;
+								break;
+							}
+						}
+						retained.delete(evict!);
+					}
+					send(message);
+				} catch {}
+			};
+			return { sessionId, toolCallId, tell };
+		},
+		/** The owner is going away: withdraw, forget the snapshot and stop answering. */
+		stop(): void {
+			try {
+				withdraw();
+				stopListening?.();
+				stopListening = undefined;
+			} catch {}
+		},
+	};
+}
+
+/** `pi --sandbox` owns its own bash rows (#pi-23), so a sandbox launch gets no display observer. An argv Pi can't parse gets none either. */
+export function isSandboxLaunch(argv: readonly string[]): boolean {
+	try {
+		return parseArgs([...argv]).unknownFlags.has("sandbox");
+	} catch {
+		return true;
+	}
+}
+
+/** An agent bash call under way: its display identity, and whether `spawn` returned a process for it. */
+type ObservedShellCall = ShellDisplayCall<ShellDisplayFact> & { spawnReturned?: boolean };
+
+/** Carries a call's identity from the tool's `execute` to the process it spawns. A `!` command runs outside any call and finds nothing here. */
+const observedShellCalls = new AsyncLocalStorage<ObservedShellCall>();
+
+/** Runs one agent bash call with its display identity in scope. The call's own result or error passes through untouched. */
+export async function observeShellCall<T>(call: ShellDisplayCall<ShellDisplayFact> | undefined, run: () => Promise<T>): Promise<T> {
+	if (!call) return run();
+	const observed: ObservedShellCall = { ...call };
+	try {
+		return await observedShellCalls.run(observed, run);
+	} catch (error) {
+		// It failed before `spawn` returned a process, so nothing ran for it.
+		if (!observed.spawnReturned) observed.tell({ kind: "not-run" });
+		throw error;
+	}
+}
+
 // ─── Operations Factory ──────────────────────────────────────────────────────
 
 export function createBackgroundableOperations(
@@ -887,6 +1095,8 @@ export function createBackgroundableOperations(
 ): BashOperations {
 	return {
 		exec: async (command, cwd, options) => {
+			// Display only (pi-42): the agent call this process belongs to, if any. Captured here, used by the callbacks below.
+			const observed = observedShellCalls.getStore();
 			const shellConfig = getShellConfig();
 			const taskId = generateTaskId();
 			const sessionDir = ensureLogDir(sessionId, baseDir);
@@ -907,6 +1117,7 @@ export function createBackgroundableOperations(
 				isTruncated: false,
 				isBackgrounded: false,
 				logStream,
+				tellDisplay: observed?.tell,
 			};
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
@@ -926,6 +1137,15 @@ export function createBackgroundableOperations(
 			task.pid = child.pid || 0;
 			task.pgid = child.pid || 0;
 
+			let spawned = false;
+			if (observed) {
+				observed.spawnReturned = true;
+				child.once("spawn", () => {
+					spawned = true;
+					observed.tell({ kind: "start" });
+				});
+			}
+
 			if (commandFromStdin) {
 				child.stdin?.on("error", () => {});
 				child.stdin?.end(command);
@@ -939,6 +1159,7 @@ export function createBackgroundableOperations(
 				if (options.timeout && options.timeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
+						observed?.tell({ kind: "stop-request", reason: "timeout" });
 						if (task.pid) {
 							terminateProcessTree(task.pid);
 						}
@@ -989,6 +1210,9 @@ export function createBackgroundableOperations(
 					const notice = `\nCommand was manually backgrounded by user with ID: ${task.id}. Output is being written to:\n  ${task.logPath}\n\n[Process running in background]\nTask ID: ${task.id}\nCommand: ${task.command}\nStatus: actively running in background\nNotice: This command was moved to the background by the user and is still executing. Inform the user that it is running in the background and do not state that it has completed.\n`;
 					options.onData(Buffer.from(notice));
 
+					// The tool returns exit 0 here while the process runs on: say so before the row settles.
+					observed?.tell({ kind: "background", identity: task.id });
+
 					// Resolve foreground execution cleanly so chat row completes
 					isResolved = true;
 					resolve({ exitCode: 0 });
@@ -1002,6 +1226,7 @@ export function createBackgroundableOperations(
 					}
 					task.status = "stopped";
 					task.endTime = Date.now();
+					observed?.tell({ kind: "stop-request", reason: "cancel" });
 					taskManager.clearActiveForeground();
 					(ctx?.ui as any)?.requestRender?.();
 					if (task.pid) {
@@ -1031,7 +1256,9 @@ export function createBackgroundableOperations(
 					}
 				});
 
-				child.on("close", (code) => {
+				child.on("close", (code, signal) => {
+					// A failed spawn also emits `close`, with a negative code: that is no process closing.
+					if (spawned) observed?.tell({ kind: "close", code, signal });
 					if (timeoutHandle) {
 						clearTimeout(timeoutHandle);
 						timeoutHandle = undefined;
@@ -1072,6 +1299,7 @@ export function createBackgroundableOperations(
 				});
 
 				child.on("error", (err) => {
+					observed?.tell(spawned ? { kind: "child-error" } : { kind: "not-run" });
 					if (timeoutHandle) {
 						clearTimeout(timeoutHandle);
 						timeoutHandle = undefined;
@@ -1477,7 +1705,19 @@ export function createTasksModalComponent(
 
 // ─── Extension Entry Point ───────────────────────────────────────────────────
 
-export function rbfBackgroundTasks(pi: ExtensionAPI): void {
+/** The session a context belongs to, or undefined when it can't say. Never throws. */
+function sessionIdOf(ctx: ExtensionContext | undefined): string | undefined {
+	try {
+		const id = ctx?.sessionManager?.getSessionId?.();
+		return typeof id === "string" && id ? id : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function rbfBackgroundTasks(pi: ExtensionAPI, options: { /** Frozen argv for the `--sandbox` guard; defaults to `process.argv.slice(2)`. */ argv?: string[] } = {}): void {
+	// Frozen at entry: a sandbox launch gets no display observer, now or on re-entry.
+	const sandboxLaunch = isSandboxLaunch([...(options.argv ?? process.argv.slice(2))]);
 	const taskManager = new TaskManager();
 	setActiveTaskManager(taskManager);
 	setIsFooterSelected(false);
@@ -1487,6 +1727,20 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 
 	// Patch FooterComponent to render task count to right of stats line
 	patchFooterComponent(taskManager, () => getIsFooterSelected());
+
+	// ─── Busy query ───────────────────────────────────────────────────────────
+
+	// Another extension can't import this task manager: a bare import may reach a different module instance.
+	const stopAnsweringBusyQuery =
+		typeof pi.events?.on === "function"
+			? pi.events.on(BUSY_QUERY_CHANNEL, (data) => {
+					const query = data as BusyQuery;
+					query.answered = true;
+					if (taskManager.getRunningTasks().length > 0) query.backgroundTask = true;
+					// A `!` command or the agent's bash tool, still in the foreground.
+					if (taskManager.getActiveForeground()) query.command = true;
+				})
+			: undefined;
 
 	// ─── Agent bash tool registration ─────────────────────────────────────────
 
@@ -1509,8 +1763,19 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 		operations: bashOperations,
 	});
 
+	// Display only (pi-42). A close or a spawn error ends an invocation for the snapshot's bound.
+	const display = sandboxLaunch
+		? undefined
+		: createShellDisplayOwner<ShellDisplayFact>(pi.events, "pi-bash", (fact) => fact.kind === "close" || fact.kind === "not-run");
+	let registeredBashTool: ShellDisplayTool | undefined;
+	/** Registers the tool and keeps the object Pi was given, whose functions the owner announces. */
+	const registerBashTool: typeof pi.registerTool = (tool) => {
+		pi.registerTool(tool);
+		registeredBashTool = tool;
+	};
+
 	if (typeof pi.registerTool === "function") {
-		pi.registerTool({
+		registerBashTool({
 			...baseBashTool,
 			promptGuidelines: [
 				...(baseBashTool.promptGuidelines || []),
@@ -1522,7 +1787,7 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 				}
 				try {
 					ctx?.ui?.setWorkingMessage?.("Working (ctrl+b to run in background · Esc to cancel)");
-					return await baseBashTool.execute(id, params, signal, onUpdate, ctx);
+					return await observeShellCall(display?.open(id), () => baseBashTool.execute(id, params, signal, onUpdate, ctx));
 				} finally {
 					ctx?.ui?.setWorkingMessage?.(undefined);
 				}
@@ -1555,6 +1820,7 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentSessionCtx = ctx;
+		if (registeredBashTool) display?.start(sessionIdOf(ctx), registeredBashTool);
 		setOnBadgeClick(() => {
 			void showTasksUI(ctx);
 		});
@@ -1804,6 +2070,7 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 	// ─── Session Shutdown Cleanup ─────────────────────────────────────────────
 
 	pi.on("session_shutdown", async () => {
+		stopAnsweringBusyQuery?.();
 		unpatchBashExecutionComponent();
 		unpatchFooterComponent();
 		taskManager.stopAllTasks();
@@ -1811,6 +2078,7 @@ export function rbfBackgroundTasks(pi: ExtensionAPI): void {
 		setIsFooterSelected(false);
 		setIsBadgeHovered(false);
 		setOnBadgeClick(null);
+		display?.stop();
 	});
 }
 

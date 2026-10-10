@@ -1,14 +1,15 @@
 // Scripted `codex app-server` stand-in for rbf-codex tests: JSON-RPC lines over stdio.
 // The scenario comes from RBF_FAKE_SCENARIO (JSON); every inbound message is appended
 // to RBF_FAKE_LOG so a test can assert exactly what Pi sent.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 export type FakeApproval = { when: "before" | "after"; command?: string | null; reason?: string; kind?: string; approvalId?: string };
 /** Computer use's per-app question, as Codex 0.154.0 sends it (probe 2026-09-14): an empty-form MCP elicitation during the `mcpToolCall`; a refused one fails the call and the turn goes on. */
 export type FakeElicitation = { message: string; app?: string; subtitle?: string; persist?: string[]; mode?: string; properties?: Record<string, unknown>; approvalKind?: string | null };
 export type FakeTurnEvent =
-	| { kind: "command"; id: string; command: string; cwd?: string; exitCode?: number; output?: string[]; approvals?: FakeApproval[]; aggregatedOutput?: string; incomplete?: boolean }
+	/** `completion` overrides fields of the completed item and `omit` leaves fields out of it, for a completion Codex sent incomplete or at odds with itself. */
+	| { kind: "command"; id: string; command: string; cwd?: string; exitCode?: number; output?: string[]; approvals?: FakeApproval[]; aggregatedOutput?: string; incomplete?: boolean; completion?: Record<string, unknown>; omit?: string[] }
 	| { kind: "toolCall"; id: string; server: string; tool: string; arguments?: unknown; appContext?: Record<string, unknown> | null; result?: { content?: unknown[]; structuredContent?: unknown }; status?: "completed" | "failed"; error?: string; elicitations?: FakeElicitation[]; progress?: boolean; incomplete?: boolean; durationMs?: number }
 	| { kind: "startupStatus"; name: string; status: string; error?: string | null; failureReason?: string | null }
 	/** A `subAgentActivity` item on the current turn, as Codex announces a sub-agent (probe 2026-09-14). */
@@ -16,7 +17,7 @@ export type FakeTurnEvent =
 	/** A sub-agent's turn on its own thread: `turn/started`, its events with the child's ids, ending on its own `complete`. Inline unless `detached`, which lets two children run at once. */
 	| { kind: "childTurn"; threadId: string; turnId?: string; events: FakeTurnEvent[]; detached?: boolean }
 	/** Complete a command started with `incomplete` earlier, on the current turn (a root row held open while a child works). */
-	| { kind: "finishCommand"; id: string; command: string; exitCode?: number; aggregatedOutput?: string }
+	| { kind: "finishCommand"; id: string; command: string; exitCode?: number; aggregatedOutput?: string; completion?: Record<string, unknown>; omit?: string[] }
 	/** A `collabAgentToolCall` on the current turn; draws nothing. A code-mode model announces a child only here: `receivers` on the completion, `states` per child (probe `subapproval-luna.jsonl` and Tomek's sol rollouts, 2026-09-15). */
 	| { kind: "collab"; tool?: string; receivers?: string[]; states?: Record<string, string> }
 	/** Timing controls for interleaved turns: pause, or wait until Pi has answered this many server requests in this process. */
@@ -42,10 +43,18 @@ export type FakeScenario = {
 	turn?: FakeTurnEvent[];
 	/** Events for the second and later turns, when they differ. */
 	laterTurns?: FakeTurnEvent[];
+	/** Per-persisted-turn scripts for real-Pi first/later interruption probes. */
+	turnScripts?: FakeTurnEvent[][];
 	/** Swallow `turn/interrupt` so no completion ever arrives. */
 	ignoreInterrupt?: boolean;
+	/** Answer `turn/interrupt` at once but end the turn this many ms later, so a steer can land inside the interrupt window. */
+	interruptDelayMs?: number;
 	/** Turns listed on `thread/resume` (with turns). */
 	resumeTurns?: { id: string; status: string }[];
+	/** Only list the scripted turns once turn/start has actually created them. */
+	dynamicResumeTurns?: boolean;
+	/** Simulate a mismatched response to a named thread/resume request. */
+	resumeThreadId?: string;
 	/** Reject `thread/fork` with this message. */
 	forkError?: string;
 	/** Reject `turn/steer` with this message. */
@@ -57,12 +66,47 @@ export type FakeScenario = {
 	approvalPolicy?: string;
 	sandboxType?: string;
 	models?: { id: string; displayName: string; efforts: string[]; hidden?: boolean; input?: string[] }[];
+	version?: string;
+	versionHang?: boolean;
+	versionExitCode?: number;
+	/** Retain actual input, items and terminal statuses; optionally persist across fake processes. */
+	retainHistory?: boolean;
+	/** Raw pages for malformed/pagination controls, newest first. */
+	turnsListPages?: unknown[];
+	turnsList?: { id: string; status: string; items?: unknown[] }[];
+	turnsListError?: string;
+	/** Simulate a malformed but successful turns/list response. */
+	turnsListMalformed?: boolean;
+	/** Hold a branch-history reply while real Pi navigates away. */
+	turnsListDelayMs?: number;
+	compactStartError?: string;
+	compactHang?: boolean;
+	compactDelayMs?: number;
+	compactTurn?: { status?: "completed" | "failed" | "interrupted"; includeItem?: boolean; itemStatus?: "completed" | "failed"; itemTurnId?: string };
 };
 
 const scenario: FakeScenario = process.env.RBF_FAKE_SCENARIO ? (JSON.parse(process.env.RBF_FAKE_SCENARIO) as FakeScenario) : {};
+
+if (process.argv.includes("--version")) {
+	if (scenario.versionHang) {
+		setInterval(() => {}, 10_000);
+	} else if (scenario.versionExitCode) {
+		process.exit(scenario.versionExitCode);
+	} else {
+		const v = process.env.RBF_FAKE_VERSION ?? scenario.version ?? "codex-cli 0.157.1";
+		process.stdout.write(`${v}\n`);
+		process.exit(0);
+	}
+}
+
 const log = process.env.RBF_FAKE_LOG;
 const THREAD_ID = "thread-fake-1";
-let turnCounter = 0;
+type HistoryTurn = { id: string; status: string; items: Record<string, unknown>[] };
+const historyPath = process.env.RBF_FAKE_HISTORY;
+const history: HistoryTurn[] = scenario.retainHistory && historyPath && existsSync(historyPath)
+	? JSON.parse(readFileSync(historyPath, "utf8")) as HistoryTurn[] : [];
+let turnCounter = history.length;
+const saveHistory = () => { if (scenario.retainHistory && historyPath) writeFileSync(historyPath, JSON.stringify(history)); };
 let forkCounter = 0;
 let requestCounter = 9000;
 let childCounter = 0;
@@ -76,6 +120,17 @@ function send(m: Record<string, unknown>): void {
 	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...m })}\n`);
 }
 function notify(method: string, params: unknown): void {
+	if (scenario.retainHistory) {
+		const p = params as { turnId?: string; turn?: { id: string; status: string }; item?: Record<string, unknown> };
+		const turn = history.find((t) => t.id === (p.turn?.id ?? p.turnId));
+		if (turn && method === "turn/completed") turn.status = p.turn!.status;
+		if (turn && p.item && (method === "item/started" || method === "item/completed")) {
+			const i = turn.items.findIndex((item) => item.id === p.item!.id);
+			if (i < 0) turn.items.push(p.item);
+			else turn.items[i] = p.item;
+		}
+		saveHistory();
+	}
 	send({ method, params });
 }
 /** Send a server request and wait for Pi's reply (result or error). */
@@ -116,8 +171,10 @@ async function approve(ctl: TurnCtl, itemId: string, method: string, a: FakeAppr
 	return true;
 }
 
-function completeCommand(threadId: string, turnId: string, ev: { id: string; command: string; cwd?: string; exitCode?: number; aggregatedOutput?: string; output?: string[] }): void {
-	notify("item/completed", { threadId, turnId, item: { id: ev.id, type: "commandExecution", command: ev.command, cwd: ev.cwd ?? process.cwd(), status: ev.exitCode ? "failed" : "completed", exitCode: ev.exitCode ?? 0, aggregatedOutput: ev.aggregatedOutput ?? (ev.output ?? []).join(""), durationMs: 12 } });
+function completeCommand(threadId: string, turnId: string, ev: { id: string; command: string; cwd?: string; exitCode?: number; aggregatedOutput?: string; output?: string[]; completion?: Record<string, unknown>; omit?: string[] }): void {
+	const item: Record<string, unknown> = { id: ev.id, type: "commandExecution", command: ev.command, cwd: ev.cwd ?? process.cwd(), status: ev.exitCode ? "failed" : "completed", exitCode: ev.exitCode ?? 0, aggregatedOutput: ev.aggregatedOutput ?? (ev.output ?? []).join(""), durationMs: 12, ...(ev.completion ?? {}) };
+	for (const field of ev.omit ?? []) delete item[field];
+	notify("item/completed", { threadId, turnId, item });
 }
 
 async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
@@ -312,12 +369,97 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			send({ id: m.id, result: threadResponse() });
 			break;
 		case "thread/resume":
-			send({ id: m.id, result: threadResponse(String(m.params?.threadId ?? THREAD_ID), m.params?.excludeTurns ? undefined : (scenario.resumeTurns ?? [])) });
+			send({ id: m.id, result: threadResponse(scenario.resumeThreadId ?? String(m.params?.threadId ?? THREAD_ID), m.params?.excludeTurns ? undefined : (scenario.resumeTurns ?? [])) });
 			break;
 		case "thread/fork":
 			if (scenario.forkError) send({ id: m.id, error: { code: -32000, message: scenario.forkError } });
 			else send({ id: m.id, result: threadResponse(`thread-fake-fork-${++forkCounter}`) });
 			break;
+		case "thread/turns/list": {
+			if (scenario.turnsListPages) {
+				const index = Number(m.params?.cursor ?? 0);
+				send({ id: m.id, result: scenario.turnsListPages[index] });
+				break;
+			}
+			if (scenario.turnsListMalformed) {
+				send({ id: m.id, result: { nextCursor: null } });
+				break;
+			}
+			if (scenario.turnsListError) {
+				send({ id: m.id, error: { code: -32000, message: scenario.turnsListError } });
+				break;
+			}
+			const p = (m.params ?? {}) as Record<string, unknown>;
+			const limit = typeof p.limit === "number" ? p.limit : 20;
+			const cursor = typeof p.cursor === "string" ? p.cursor : undefined;
+
+			let allTurns: { id: string; status: string; items?: unknown[] }[] = [];
+			if (scenario.turnsList) {
+				allTurns = scenario.turnsList;
+			} else if (scenario.retainHistory) {
+				allTurns = p.sortDirection === "asc" ? history.slice() : history.slice().reverse();
+			} else if (scenario.resumeTurns) {
+				const visible = scenario.dynamicResumeTurns
+					? scenario.resumeTurns.filter((t) => Number(t.id.match(/^turn-fake-(\d+)$/)?.[1]) <= turnCounter)
+					: scenario.resumeTurns;
+				const turns = p.sortDirection === "asc" ? visible : visible.slice().reverse();
+				allTurns = turns.map((t) => ({
+					id: t.id,
+					status: t.status,
+					items: [
+						{
+							id: `msg-${t.id}`,
+							type: "userMessage",
+							content: [{ type: "text", text: "hi" }],
+						},
+					],
+				}));
+			}
+
+			let startIndex = 0;
+			if (cursor) {
+				const found = allTurns.findIndex((t) => t.id === cursor);
+				if (found >= 0) startIndex = found + 1;
+			}
+			const page = allTurns.slice(startIndex, startIndex + limit);
+			const hasMore = startIndex + limit < allTurns.length;
+			const nextCursor = hasMore && page.length > 0 ? page[page.length - 1].id : null;
+
+			const respond = () => send({
+				id: m.id,
+				result: {
+					data: page,
+					nextCursor,
+				},
+			});
+			if (scenario.turnsListDelayMs) setTimeout(respond, scenario.turnsListDelayMs);
+			else respond();
+			break;
+		}
+		case "thread/compact/start": {
+			const threadId = String((m.params as Record<string, unknown> | undefined)?.threadId ?? THREAD_ID);
+			if (scenario.compactStartError) {
+				send({ id: m.id, error: { code: -32000, message: scenario.compactStartError } });
+				break;
+			}
+			send({ id: m.id, result: {} });
+			if (scenario.compactHang) break;
+			const turnId = `turn-compact-${++turnCounter}`;
+			const cTurn = scenario.compactTurn ?? { status: "completed", includeItem: true, itemStatus: "completed" };
+			setTimeout(async () => {
+				notify("turn/started", { threadId, turn: { id: turnId, status: "inProgress", items: [] } });
+				await tick();
+				if (cTurn.includeItem !== false) {
+					const itemId = `compact-item-${turnCounter}`;
+					notify("item/started", { threadId, turnId: cTurn.itemTurnId ?? turnId, item: { id: itemId, type: "contextCompaction", status: "inProgress" } });
+					await tick();
+					notify("item/completed", { threadId, turnId: cTurn.itemTurnId ?? turnId, item: { id: itemId, type: "contextCompaction", status: cTurn.itemStatus ?? "completed" } });
+					await tick();
+				}
+				notify("turn/completed", { threadId, turn: { id: turnId, status: cTurn.status ?? "completed", items: [] } });
+			}, scenario.compactDelayMs ?? 10);
+			break;
+		}
 		case "turn/start": {
 			const model = m.params?.model;
 			if (scenario.retiredModel && model === scenario.retiredModel) {
@@ -326,7 +468,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			}
 			turnCounter += 1;
 			const turnId = `turn-fake-${turnCounter}`;
-			const events = (turnCounter > 1 && scenario.laterTurns) || scenario.turn || [{ kind: "answer", id: "msg-1", text: "FAKE_OK", phase: "final_answer" }, { kind: "complete" }];
+			if (scenario.retainHistory) {
+				history.push({ id: turnId, status: "inProgress", items: [{ id: `input-${turnCounter}`, type: "userMessage", content: m.params?.input ?? [] }] });
+				saveHistory();
+			}
+			const events = scenario.turnScripts?.[turnCounter - 1] || (turnCounter > 1 && scenario.laterTurns) || scenario.turn || [{ kind: "answer", id: "msg-1", text: "FAKE_OK", phase: "final_answer" }, { kind: "complete" }];
 			const begin = () => {
 				send({ id: m.id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
 				void runTurn({ threadId: String(m.params?.threadId ?? THREAD_ID), turnId, interrupted: false }, events as FakeTurnEvent[]);
@@ -336,19 +482,24 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		}
 		case "turn/steer":
-			if (scenario.steerError) send({ id: m.id, error: { code: -32000, message: scenario.steerError } });
+			if (scenario.retainHistory && !turns.has(String(m.params?.expectedTurnId))) send({ id: m.id, error: { code: -32000, message: "turn is no longer active" } });
+			else if (scenario.steerError) send({ id: m.id, error: { code: -32000, message: scenario.steerError } });
 			else send({ id: m.id, result: { turnId: m.params?.expectedTurnId } });
 			break;
 		case "turn/interrupt": {
 			if (m.id !== undefined) send({ id: m.id, result: {} }); // a request in the real schema; Codex answers it
 			if (scenario.ignoreInterrupt) break; // the "no completion within 3 s" path
 			// Only the named turn ends, as on real Codex (probe 2026-09-14: the parent's interrupt never reaches a child's turn); a running command is not killed.
-			const ctl = turns.get(String(m.params?.turnId));
-			if (ctl) ctl.interrupted = true;
-			turns.delete(String(m.params?.turnId));
-			const threadId = ctl?.threadId ?? String(m.params?.threadId ?? THREAD_ID);
-			notify("turn/completed", { threadId, turn: { id: m.params?.turnId, status: "interrupted", items: [] } });
-			void lateEvents(threadId, String(m.params?.turnId));
+			const end = () => {
+				const ctl = turns.get(String(m.params?.turnId));
+				if (ctl) ctl.interrupted = true;
+				turns.delete(String(m.params?.turnId));
+				const threadId = ctl?.threadId ?? String(m.params?.threadId ?? THREAD_ID);
+				notify("turn/completed", { threadId, turn: { id: m.params?.turnId, status: "interrupted", items: [] } });
+				void lateEvents(threadId, String(m.params?.turnId));
+			};
+			if (scenario.interruptDelayMs) setTimeout(end, scenario.interruptDelayMs);
+			else end();
 			break;
 		}
 		default:

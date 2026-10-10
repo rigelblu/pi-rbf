@@ -70,13 +70,13 @@ describe("rbf-edit-glance parsing and formatting helpers", () => {
 		};
 
 		const line1 = formatEditSummaryLine(7, 3, themeMock);
-		expect(stripAnsi(line1)).toBe("└ Added 7 lines, removed 3 lines");
+		expect(stripAnsi(line1)).toBe("└  Added 7 lines, removed 3 lines");
 
 		const line2 = formatEditSummaryLine(1, 1, themeMock);
-		expect(stripAnsi(line2)).toBe("└ Added 1 line, removed 1 line");
+		expect(stripAnsi(line2)).toBe("└  Added 1 line, removed 1 line");
 
 		const line3 = formatEditSummaryLine(0, 0, themeMock);
-		expect(stripAnsi(line3)).toBe("└ Added 0 lines, removed 0 lines");
+		expect(stripAnsi(line3)).toBe("└  Added 0 lines, removed 0 lines");
 	});
 
 	it("isLightTheme correctly detects light themes by name and luminance", () => {
@@ -184,7 +184,7 @@ describe("rbf-edit-glance parsing and formatting helpers", () => {
 		expect(result.removedCount).toBe(1);
 		expect(result.isTruncated).toBe(false);
 		expect(result.remainingLines).toBe(0);
-		expect(stripAnsi(result.summaryLine)).toBe("└ Added 1 line, removed 1 line");
+		expect(stripAnsi(result.summaryLine)).toBe("└  Added 1 line, removed 1 line");
 
 		// Checks line-level background tinting is present on changed lines
 		expect(result.diffText).toContain("\x1b[48;2;");
@@ -310,7 +310,7 @@ describe("rbf-edit-glance ToolExecutionComponent patching", () => {
 		// Must show header
 		expect(fullText).toContain("edit src/index.ts");
 		// Must show summary line
-		expect(fullText).toContain("└ Added 1 line, removed 1 line");
+		expect(fullText).toContain("└  Added 1 line, removed 1 line");
 		// Must show diff lines
 		expect(fullText).toContain("newLine();");
 	});
@@ -366,7 +366,7 @@ describe("rbf-edit-glance ToolExecutionComponent patching", () => {
 		expect(callComp.paddingY).toBe(0);
 		expect(callComp.bgFn).toBeUndefined();
 		const fullText = stripAnsi(comp.render(80).join("\n"));
-		expect(fullText).toContain("└ Added 1 line, removed 1 line");
+		expect(fullText).toContain("└  Added 1 line, removed 1 line");
 		expect(fullText).toContain("newLine();");
 	});
 

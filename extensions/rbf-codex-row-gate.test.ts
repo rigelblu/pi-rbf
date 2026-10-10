@@ -37,7 +37,11 @@ const SUPPORT = resolve(import.meta.dirname, "test-support");
 const DRIVER = join(SUPPORT, "rbf-row-gate-drive.py");
 const PROVIDER = join(SUPPORT, "rbf-row-gate-provider.ts");
 const CODEX = join(SUPPORT, "rbf-row-gate-codex.ts");
-const DAILY = [join(ROOT, "extensions", "rbf-tool-execution-blended.ts"), join(ROOT, "extensions", "rbf-edit-glance.ts")];
+const DAILY = [
+	join(ROOT, "extensions", "rbf-tool-execution-blended.ts"),
+	join(ROOT, "extensions", "rbf-edit-glance.ts"),
+	join(ROOT, "extensions", "rbf-tool-parts-indent.ts"),
+];
 const PYTHON = spawnSync("python3", ["--version"]).status === 0;
 const READY = existsSync(PI) && PYTHON;
 const KEEP = !!process.env.RBF_ROW_GATE_KEEP;
@@ -153,6 +157,28 @@ function hint(cap: Capture): { line: Buffer; text: string } {
 const exact = (b: Buffer) => show(b).replace(/(Took|Elapsed) \d+\.\ds/, "$1 N.Ns");
 /** Every distinct final line carrying `marker`, for a marker that several rows share (`Took`, the glance summaries). */
 const distinct = (c: Capture, marker: string) => [...new Set(c.lines.filter((l) => l.includes(marker)).map(exact))].sort();
+
+function cutFirst4Cols(b: Buffer): Buffer {
+	const s = b.toString("utf8");
+	const tokens = s.match(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|[\s\S]/gu) ?? [];
+	let col = 0;
+	let cutIdx = 0;
+	for (let i = 0; i < tokens.length; i++) {
+		if (!tokens[i]!.startsWith("\x1b")) {
+			col++;
+			if (col === 4) {
+				cutIdx = i + 1;
+				break;
+			}
+		}
+	}
+	return Buffer.from(tokens.slice(cutIdx).join(""), "utf8");
+}
+
+function firstCharCol(b: Buffer): number {
+	const t = b.toString("utf8").replace(ESCAPES, "");
+	return t.search(/\S/);
+}
 /**
  * What a line looks like, column for column, not what it says. Every escape sequence is listed with where it sits:
  * a column from the left before the text (`L`), an offset inside it (`T`), right after it before any padding (`E`),
@@ -460,22 +486,95 @@ describe.skipIf(!READY)("rbf-codex row gate: Codex rows against Pi's own, byte f
 		const tools = () => cap(name, "tools");
 		it("a tool call row's title is styled as Pi's bash title, its result lines as bash output, its hint and blank line as Pi's collapsed preview", () => {
 			expect(styling(line(tools(), "bear_app.list_tags"), "bear_app.list_tags")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
-			expect(styling(output(tools(), "GATE_T6"), "GATE_T6")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
-			const [t, p] = [hint(tools()), hint(pi())];
-			expect(t.text).toBe("... (1 earlier lines,");
-			expect(styling(t.line, t.text)).toBe(styling(p.line, p.text));
-			expect(blanksAbove(tools(), "earlier lines")).toBe(blanksAbove(pi(), "earlier lines"));
+			if (name === CONFIGS[1]!.name) {
+				expect(styling(output(tools(), "GATE_T6"), "GATE_T6")).toBe(styling(output(pi(), "GATE_P8"), "GATE_P8"));
+				const [t, p] = [hint(tools()), hint(pi())];
+				expect(t.text).toBe("... (1 earlier lines,");
+				expect(t.line.toString("utf8").replace(ESCAPES, "").indexOf(t.text)).toBe(4);
+				expect(p.line.toString("utf8").replace(ESCAPES, "").indexOf(p.text)).toBe(4);
+				expect(styling(cutFirst4Cols(t.line), t.text)).toBe(styling(cutFirst4Cols(p.line), p.text));
+				expect(blanksAbove(tools(), "earlier lines")).toBe(1);
+				expect(blanksAbove(pi(), "earlier lines")).toBe(0);
+			} else {
+				expect(styling(output(tools(), "GATE_T6"), "GATE_T6")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+				const [t, p] = [hint(tools()), hint(pi())];
+				expect(t.text).toBe("... (1 earlier lines,");
+				expect(styling(t.line, t.text)).toBe(styling(p.line, p.text));
+				expect(blanksAbove(tools(), "earlier lines")).toBe(blanksAbove(pi(), "earlier lines"));
+			}
 			expect(blanksAbove(tools(), "GATE_T2")).toBe(0); // the first shown line sits right under the hint
 		});
 		it("a code argument's lines sit directly under a bold title, styled as bash output, with no hint for three lines", () => {
 			expect(styling(line(tools(), "node_repl.js"), "node_repl.js")).toBe(styling(line(pi(), "$ echo GATE_CMD"), "$ echo GATE_CMD"));
-			for (const marker of ["GATE_J1", "GATE_J2", "GATE_J3"]) expect(styling(line(tools(), marker), marker)).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+			if (name === CONFIGS[1]!.name) {
+				expect(styling(line(tools(), "GATE_J1"), "GATE_J1")).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+				for (const marker of ["GATE_J2", "GATE_J3"]) {
+					expect(styling(line(tools(), marker), marker)).toBe(styling(output(pi(), "GATE_P8"), "GATE_P8"));
+				}
+			} else {
+				for (const marker of ["GATE_J1", "GATE_J2", "GATE_J3"]) expect(styling(line(tools(), marker), marker)).toBe(styling(output(pi(), "GATE_CMD"), "GATE_CMD"));
+			}
 			expect(blanksAbove(tools(), "GATE_J1")).toBe(0);
 		});
 		it("a failed tool call row reads as Pi's failed bash row, column for column", () => {
 			expect(styling(line(tools(), "bear_app.fail"), "bear_app.fail")).toBe(styling(line(pi(), "$ echo GATE_ERR"), "$ echo GATE_ERR; exit 3"));
-			expect(styling(line(tools(), "GATE_TOOL_FAIL"), "GATE_TOOL_FAIL")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
+			if (name === CONFIGS[1]!.name) {
+				expect(styling(line(tools(), "GATE_TOOL_FAIL"), "GATE_TOOL_FAIL")).toBe(styling(line(pi(), "Command exited with code 3"), "Command exited with code 3"));
+			} else {
+				expect(styling(line(tools(), "GATE_TOOL_FAIL"), "GATE_TOOL_FAIL")).toBe(styling(output(pi(), "GATE_ERR"), "GATE_ERR"));
+			}
 		});
+		if (name === CONFIGS[1]!.name) {
+			it("for codex_command, codex_patch, and codex_tool rows the header's first character is at column 1 and every line under it has its first character at column 4", () => {
+				// codex_command
+				const cmdHeader = line(codex(), "$ echo GATE_CMD");
+				expect(firstCharCol(cmdHeader)).toBe(1);
+				const cmdOut = output(codex(), "GATE_CMD");
+				expect(firstCharCol(cmdOut)).toBe(1);
+				expect(cmdOut.toString("utf8").replace(ESCAPES, "").indexOf("GATE_CMD")).toBe(4);
+				const cmdTook = line(codex(), "Took ");
+				expect(firstCharCol(cmdTook)).toBe(4);
+				expect(text(cmdTook)).not.toContain("└");
+
+				// codex_patch
+				const patchHeader = line(codex(), "gate.txt");
+				expect(firstCharCol(patchHeader)).toBe(1);
+				const patchSummary = line(codex(), "Added ");
+				expect(firstCharCol(patchSummary)).toBe(1);
+				expect(patchSummary.toString("utf8").replace(ESCAPES, "").indexOf("Added")).toBe(4);
+				expect(firstCharCol(line(codex(), "GATE_OLD"))).toBe(4);
+				expect(firstCharCol(line(codex(), "GATE_NEW"))).toBe(4);
+				// GATE_CTX is a diff context line: column 4 is the context space prefix, line number at column 5
+				const ctxLine = line(codex(), "GATE_CTX").toString("utf8").replace(ESCAPES, "");
+				expect(ctxLine.startsWith("     1 GATE_CTX")).toBe(true);
+				expect(firstCharCol(line(codex(), "GATE_APP"))).toBe(4);
+				expect(firstCharCol(line(codex(), "GATE_ADD"))).toBe(4);
+
+				// codex_tool
+				// text result
+				expect(firstCharCol(line(tools(), "bear_app.list_tags"))).toBe(1);
+				expect(firstCharCol(output(tools(), "GATE_T6"))).toBe(4);
+				// code argument: GATE_J1 is on the branch line and its Took line starts at column 4 with no └
+				expect(firstCharCol(line(tools(), "node_repl.js"))).toBe(1);
+				const j1 = line(tools(), "GATE_J1");
+				expect(firstCharCol(j1)).toBe(1);
+				expect(j1.toString("utf8").replace(ESCAPES, "").indexOf("GATE_J1")).toBe(4);
+				expect(firstCharCol(line(tools(), "GATE_J2"))).toBe(4);
+				expect(firstCharCol(line(tools(), "GATE_J3"))).toBe(4);
+				// its own Took line: the first one under GATE_J3 and above the next row's title, not the screen's last
+				const toolLines = tools().lines;
+				const j3 = toolLines.findIndex((l) => l.includes("GATE_J3"));
+				const nextTitle = toolLines.findIndex((l) => l.includes("bear_app.fail"));
+				expect(nextTitle).toBeGreaterThan(j3);
+				const took = toolLines.slice(j3 + 1, nextTitle).find((l) => l.includes("Took "));
+				expect(took, "a Took line between GATE_J3 and the failed call's title").toBeDefined();
+				expect(firstCharCol(took!)).toBe(4);
+				expect(text(took!)).not.toContain("└");
+				// failed call
+				expect(firstCharCol(line(tools(), "bear_app.fail"))).toBe(1);
+				expect(firstCharCol(line(tools(), "GATE_TOOL_FAIL"))).toBe(4);
+			});
+		}
 		it("a sub-agent's command row is Pi's bash row byte for byte below the title; the title, tag stripped, is Pi's title with the width ignored", () => {
 			expect(exact(output(tools(), "GATE_CMD"))).toBe(exact(output(pi(), "GATE_CMD")));
 			expect(blanksAbove(tools(), "GATE_CMD", "$ ")).toBe(blanksAbove(pi(), "GATE_CMD", "$ "));

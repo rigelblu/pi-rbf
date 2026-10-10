@@ -7,8 +7,10 @@ import {
 	applyElapsedHint,
 	BASH_EXECUTION_PATCHED_KEY,
 	BACKGROUND_TASKS_STATUS_KEY,
+	BUSY_QUERY_CHANNEL,
 	calculateBadgeBounds,
 	createBackgroundableOperations,
+	createShellDisplayOwner,
 	createTasksModalComponent,
 	ensureLogDir,
 	formatBackgroundHintMessage,
@@ -17,6 +19,7 @@ import {
 	formatStatsLineWithTasks,
 	generateTaskId,
 	getActiveTaskManager,
+	isSandboxLaunch,
 	getBadgeBounds,
 	getIsBadgeHovered,
 	getIsFooterSelected,
@@ -24,6 +27,7 @@ import {
 	LOADER_PATCHED_KEY,
 	MAX_CONCURRENT_BACKGROUND_TASKS,
 	MAX_LOG_BYTES,
+	observeShellCall,
 	patchBashExecutionComponent,
 	patchFooterComponent,
 	rbfBackgroundTasks,
@@ -31,6 +35,9 @@ import {
 	setIsBadgeHovered,
 	setIsFooterSelected,
 	setOnBadgeClick,
+	SHELL_DISPLAY_CHANNEL,
+	SHELL_DISPLAY_FACTS_PER_INVOCATION,
+	SHELL_DISPLAY_SNAPSHOT_LIMIT,
 	TaskManager,
 	terminateProcessTree,
 	TOOL_EXECUTION_PATCHED_KEY,
@@ -38,8 +45,11 @@ import {
 	unpatchFooterComponent,
 	updateFooterBadge,
 	type BackgroundTask,
+	type BusyQuery,
+	type ShellDisplayCall,
+	type ShellDisplayFact,
 } from "./rbf-background-tasks.ts";
-import { BashExecutionComponent, FooterComponent, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, createEventBus, FooterComponent, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 
 describe("rbf-background-tasks", () => {
@@ -962,6 +972,54 @@ describe("rbf-background-tasks", () => {
 			expect(commands.has("kill")).toBe(true);
 		});
 
+		it("answers the busy query for a foreground command and a tracked task, and stops answering on shutdown", async () => {
+			const eventHandlers = new Map<string, Function>();
+			const events = createEventBus();
+			const mockPi: any = {
+				events,
+				on: vi.fn((event: string, handler: Function) => {
+					eventHandlers.set(event, handler);
+				}),
+				registerCommand: vi.fn(),
+			};
+			const ask = (): BusyQuery => {
+				const query: BusyQuery = {};
+				events.emit(BUSY_QUERY_CHANNEL, query);
+				return query;
+			};
+			expect(BUSY_QUERY_CHANNEL).toBe("rbf-background-tasks:busy/v1");
+			expect(ask()).toEqual({});
+
+			rbfBackgroundTasks(mockPi);
+			expect(ask()).toEqual({ answered: true });
+
+			// A `!` command in the foreground.
+			const mockCtx: any = { ui: { setStatus: vi.fn() }, sessionManager: { getSessionId: () => "sess-busy" } };
+			const { operations } = await eventHandlers.get("user_bash")!({ command: "sleep 10" }, mockCtx);
+			const running = operations.exec("sleep 10", tempDir, { onData: vi.fn() });
+			await new Promise((r) => setTimeout(r, 100));
+			expect(ask()).toEqual({ answered: true, command: true });
+
+			// The same command, moved to the background: now a tracked task and no longer a foreground command.
+			getActiveTaskManager()!.detachActiveForeground();
+			await running;
+			expect(ask()).toEqual({ answered: true, backgroundTask: true });
+
+			// A flag another listener raised is never lowered.
+			const raised: BusyQuery = { command: true };
+			events.emit(BUSY_QUERY_CHANNEL, raised);
+			expect(raised).toEqual({ answered: true, backgroundTask: true, command: true });
+
+			await eventHandlers.get("session_shutdown")!();
+			expect(ask()).toEqual({});
+		});
+
+		it("loads on a Pi that has no event bus", () => {
+			const mockPi: any = { on: vi.fn(), registerCommand: vi.fn() };
+
+			expect(() => rbfBackgroundTasks(mockPi)).not.toThrow();
+		});
+
 		it("session_start wires onTerminalInput to intercept Ctrl+B when active task exists", async () => {
 			const eventHandlers = new Map<string, Function>();
 			const mockPi: any = {
@@ -1513,6 +1571,585 @@ describe("rbf-background-tasks", () => {
 
 			// Working message is cleared in finally
 			expect(setWorkingMessage).toHaveBeenLastCalledWith(undefined);
+		});
+	});
+
+	// ─── Shell display observer (pi-42) ────────────────────────────────────────
+
+	describe("Shell display observer (pi-42)", () => {
+		type Message = Record<string, any>;
+		type Bus = { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
+		const SESSION = "sess-display";
+		const SIGNALLED = expect.stringMatching(/^SIG(TERM|KILL)$/);
+
+		/** A bus with no safety net, unlike Pi's: a subscriber's throw goes straight back into `emit`. */
+		function rawBus(): Bus {
+			const handlers = new Set<(data: unknown) => void>();
+			return {
+				emit: (_channel, data) => {
+					for (const handler of [...handlers]) handler(data);
+				},
+				on: (_channel, handler) => {
+					handlers.add(handler);
+					return () => handlers.delete(handler);
+				},
+			};
+		}
+
+		/** The extension loaded on a Pi with `events` (none when null), its session started, and every display message recorded unless `listen` is false. */
+		async function owner(opts: { events?: Bus | null; argv?: string[]; sessionId?: string; listen?: boolean } = {}) {
+			const events = opts.events === null ? undefined : (opts.events ?? createEventBus());
+			const handlers = new Map<string, Function>();
+			let tool: any;
+			const mockPi: any = {
+				on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)),
+				registerCommand: vi.fn(),
+				registerTool: vi.fn((registered: any) => {
+					if (registered.name === "bash") tool = registered;
+				}),
+			};
+			if (events) mockPi.events = events;
+			const seen: Message[] = [];
+			if (opts.listen !== false) events?.on(SHELL_DISPLAY_CHANNEL, (message) => seen.push(message as Message));
+			rbfBackgroundTasks(mockPi, { argv: opts.argv ?? [] });
+			const manager = getActiveTaskManager()!;
+			const ctxFor = (sessionId: string): any => ({
+				hasUI: false,
+				ui: { setWorkingMessage: vi.fn(), setStatus: vi.fn(), requestRender: vi.fn(), notify: vi.fn() },
+				sessionManager: { getSessionId: () => sessionId, getSessionFile: () => `/tmp/${sessionId}.json` },
+			});
+			const ctx = ctxFor(opts.sessionId ?? SESSION);
+			await handlers.get("session_start")!({}, ctx);
+			const run = (id: string, command: string, o: { signal?: AbortSignal; timeout?: number } = {}): Promise<any> =>
+				tool.execute(id, { command, ...(o.timeout ? { timeout: o.timeout } : {}) }, o.signal ?? new AbortController().signal, vi.fn(), ctx);
+			const facts = (id?: string) => seen.filter((message) => message.kind === "fact" && (!id || message.toolCallId === id));
+			const kinds = (id?: string) => facts(id).map((message) => message.fact.kind);
+			/** The foreground task once its process is up and Node has said so: `spawn` is emitted a tick after the pid is known. */
+			const foreground = async (): Promise<BackgroundTask> => {
+				await vi.waitFor(() => expect(manager.getActiveForeground()?.task.pid).toBeTruthy());
+				await new Promise((r) => setImmediate(r));
+				return manager.getActiveForeground()!.task;
+			};
+			return { events, handlers, tool, seen, ctx, ctxFor, run, facts, kinds, foreground, manager, shutdown: () => handlers.get("session_shutdown")!() };
+		}
+
+		/** The identity every fact of one call carries. */
+		const identity = (o: { seen: Message[] }, toolCallId: string) => ({
+			kind: "fact",
+			sessionId: SESSION,
+			source: "pi-bash",
+			ownerGeneration: o.seen.find((message) => message.kind === "announce")!.ownerGeneration,
+			toolCallId,
+		});
+
+		describe("Announcement and snapshot", () => {
+			it("announces on session_start with the functions it registered", async () => {
+				const o = await owner();
+				expect(SHELL_DISPLAY_CHANNEL).toBe("rbf:shell-display:v1");
+				expect(o.seen).toEqual([
+					{
+						kind: "announce",
+						sessionId: SESSION,
+						source: "pi-bash",
+						toolName: "bash",
+						ownerGeneration: expect.stringMatching(/^pi-bash:.{8,}$/),
+						execute: o.tool.execute,
+						renderCall: o.tool.renderCall,
+						renderResult: o.tool.renderResult,
+					},
+				]);
+				expect(o.seen[0]!.execute).toBe(o.tool.execute);
+				expect(o.seen[0]!.renderCall).toBe(o.tool.renderCall);
+				expect(o.seen[0]!.renderResult).toBe(o.tool.renderResult);
+				await o.shutdown();
+			});
+
+			it("two owners never share a generation", async () => {
+				const a = await owner();
+				const generation = a.seen[0]!.ownerGeneration;
+				await a.shutdown();
+				const b = await owner();
+				expect(b.seen[0]!.ownerGeneration).not.toBe(generation);
+				await b.shutdown();
+			});
+
+			it("a view that attaches after the owner asks and gets the announce, then every retained fact in order", async () => {
+				const o = await owner({ listen: false });
+				await o.run("call-1", "echo first");
+				await expect(o.run("call-2", "exit 2")).rejects.toThrow();
+				const late: Message[] = [];
+				o.events!.on(SHELL_DISPLAY_CHANNEL, (message) => late.push(message as Message));
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION });
+				const answers = late.filter((message) => message.kind !== "snapshot-request");
+				expect(answers.map((m) => [m.kind, m.toolCallId, m.revision, m.fact?.kind])).toEqual([
+					["announce", undefined, undefined, undefined],
+					["fact", "call-1", 1, "start"],
+					["fact", "call-1", 2, "close"],
+					["fact", "call-2", 1, "start"],
+					["fact", "call-2", 2, "close"],
+				]);
+				expect(answers[0]).toMatchObject({ sessionId: SESSION, source: "pi-bash", toolName: "bash", execute: o.tool.execute });
+				for (const fact of answers.slice(1)) expect(fact).toMatchObject({ sessionId: SESSION, source: "pi-bash", ownerGeneration: answers[0]!.ownerGeneration });
+				await o.shutdown();
+			});
+
+			it("a view that attached first hears the announce and each fact as it happens", async () => {
+				const events = createEventBus();
+				const early: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => early.push(message as Message));
+				const o = await owner({ events, listen: false });
+				await o.run("call-1", "echo first");
+				expect(early.map((m) => [m.kind, m.toolCallId, m.revision, m.fact?.kind])).toEqual([
+					["announce", undefined, undefined, undefined],
+					["fact", "call-1", 1, "start"],
+					["fact", "call-1", 2, "close"],
+				]);
+				await o.shutdown();
+			});
+
+			it("a request that names calls gets the announce and those calls' facts only", async () => {
+				const o = await owner({ listen: false });
+				await o.run("call-1", "echo first");
+				await expect(o.run("call-2", "exit 2")).rejects.toThrow();
+				await o.run("call-3", "echo third");
+				const late: Message[] = [];
+				o.events!.on(SHELL_DISPLAY_CHANNEL, (message) => late.push(message as Message));
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION, toolCallIds: ["call-3", "never-seen", "call-1"] });
+				expect(late.filter((m) => m.kind !== "snapshot-request").map((m) => [m.kind, m.toolCallId, m.revision])).toEqual([
+					["announce", undefined, undefined],
+					["fact", "call-3", 1],
+					["fact", "call-3", 2],
+					["fact", "call-1", 1],
+					["fact", "call-1", 2],
+				]);
+				late.length = 0;
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION, toolCallIds: [] });
+				expect(late.map((m) => m.kind)).toEqual(["announce", "snapshot-request"]);
+				await o.shutdown();
+			});
+
+			it("a request for another session, and a kind it doesn't know, get no answer", async () => {
+				const o = await owner();
+				await o.run("call-1", "echo first");
+				const before = o.seen.length;
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "sess-other" });
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "something-new", sessionId: SESSION });
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, undefined);
+				expect(o.seen.slice(before).map((m) => m?.kind)).toEqual(["snapshot-request", "something-new", undefined]);
+				await o.shutdown();
+			});
+
+			it("shutdown asks tasks to stop, withdraws, forgets the snapshot, and a process closing afterwards says nothing", async () => {
+				const o = await owner();
+				const running = o.run("call-bg", "sleep 30");
+				const task = await o.foreground();
+				o.manager.detachActiveForeground();
+				await running;
+				await o.shutdown();
+				const generation = o.seen[0]!.ownerGeneration;
+				expect(o.kinds("call-bg")).toEqual(["start", "background", "stop-request"]);
+				expect(o.seen.at(-1)).toEqual({ kind: "withdraw", sessionId: SESSION, source: "pi-bash", ownerGeneration: generation });
+				await vi.waitFor(() => expect(task.child!.exitCode !== null || task.child!.signalCode !== null).toBe(true));
+				await new Promise((r) => setTimeout(r, 50));
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION });
+				expect(o.seen.at(-2)).toMatchObject({ kind: "withdraw" });
+				expect(o.seen.at(-1)).toEqual({ kind: "snapshot-request", sessionId: SESSION });
+			});
+
+			it("a new session on the same owner withdraws the old generation, and a call from before it says nothing more", async () => {
+				const o = await owner();
+				const first = o.seen[0]!.ownerGeneration;
+				const running = o.run("call-old", "sleep 30");
+				const task = await o.foreground();
+				o.manager.detachActiveForeground();
+				await running;
+				await o.handlers.get("session_start")!({}, o.ctxFor("sess-next"));
+				const [withdrawn, announced] = o.seen.slice(-2);
+				expect(withdrawn).toEqual({ kind: "withdraw", sessionId: SESSION, source: "pi-bash", ownerGeneration: first });
+				expect(announced).toMatchObject({ kind: "announce", sessionId: "sess-next", source: "pi-bash" });
+				expect(announced!.ownerGeneration).not.toBe(first);
+				const before = o.seen.length;
+				o.manager.stopTask(task.id);
+				await vi.waitFor(() => expect(task.child!.exitCode !== null || task.child!.signalCode !== null).toBe(true));
+				await new Promise((r) => setTimeout(r, 50));
+				expect(o.seen.slice(before)).toEqual([]);
+				await o.shutdown();
+			});
+		});
+
+		describe("Facts for each path of a call", () => {
+			it("a foreground command that succeeds: start, then close 0, before the tool returns", async () => {
+				const o = await owner();
+				const result = await o.run("call-ok", "echo hi");
+				expect(result.content[0].text).toContain("hi");
+				expect(o.facts()).toEqual([
+					{ ...identity(o, "call-ok"), revision: 1, fact: { kind: "start" } },
+					{ ...identity(o, "call-ok"), revision: 2, fact: { kind: "close", code: 0, signal: null } },
+				]);
+				await o.shutdown();
+			});
+
+			it("a command that exits 7: start, then close 7, and never not-run", async () => {
+				const o = await owner();
+				await expect(o.run("call-fail", "echo 'Status: completed'; exit 7")).rejects.toThrow("Command exited with code 7");
+				expect(o.facts()).toEqual([
+					{ ...identity(o, "call-fail"), revision: 1, fact: { kind: "start" } },
+					{ ...identity(o, "call-fail"), revision: 2, fact: { kind: "close", code: 7, signal: null } },
+				]);
+				await o.shutdown();
+			});
+
+			it("a detach: background with the task id while the tool returns exit 0, then the real close", async () => {
+				const o = await owner();
+				const running = o.run("call-bg", "sleep 0.4; echo BG-DONE");
+				const task = await o.foreground();
+				await vi.waitFor(() => expect(o.kinds("call-bg")).toEqual(["start"]));
+				o.manager.detachActiveForeground();
+				const result = await running;
+				expect(result.content[0].text).toContain("Command was manually backgrounded by user with ID:");
+				expect(o.facts("call-bg")).toEqual([
+					{ ...identity(o, "call-bg"), revision: 1, fact: { kind: "start" } },
+					{ ...identity(o, "call-bg"), revision: 2, fact: { kind: "background", identity: task.id } },
+				]);
+				await vi.waitFor(() => expect(o.facts("call-bg")).toHaveLength(3));
+				expect(o.facts("call-bg")[2]).toEqual({ ...identity(o, "call-bg"), revision: 3, fact: { kind: "close", code: 0, signal: null } });
+				await o.shutdown();
+			});
+
+			it("a detached task stopped from /tasks: the stop request is not a close; the close comes when the process ends", async () => {
+				const o = await owner();
+				const running = o.run("call-stop", "sleep 30");
+				const task = await o.foreground();
+				o.manager.detachActiveForeground();
+				await running;
+				expect(o.manager.stopTask(task.id)).toBe(true);
+				expect(task.status).toBe("stopped");
+				expect(o.kinds("call-stop")).toEqual(["start", "background", "stop-request"]);
+				expect(o.facts("call-stop")[2]).toEqual({ ...identity(o, "call-stop"), revision: 3, fact: { kind: "stop-request", reason: "cancel" } });
+				await vi.waitFor(() => expect(o.facts("call-stop")).toHaveLength(4));
+				expect(o.facts("call-stop")[3]).toEqual({ ...identity(o, "call-stop"), revision: 4, fact: { kind: "close", code: null, signal: SIGNALLED } });
+				await o.shutdown();
+			});
+
+			it("a foreground abort: the tool settles at the stop request, and the close follows", async () => {
+				const o = await owner();
+				const ac = new AbortController();
+				const running = o.run("call-abort", "sleep 30", { signal: ac.signal });
+				await o.foreground();
+				await vi.waitFor(() => expect(o.kinds("call-abort")).toEqual(["start"]));
+				ac.abort();
+				expect(o.kinds("call-abort")).toEqual(["start", "stop-request"]);
+				await running.catch(() => {});
+				expect(o.kinds("call-abort")).toEqual(["start", "stop-request"]);
+				expect(o.facts("call-abort")[1]).toEqual({ ...identity(o, "call-abort"), revision: 2, fact: { kind: "stop-request", reason: "cancel" } });
+				await vi.waitFor(() => expect(o.facts("call-abort")).toHaveLength(3));
+				expect(o.facts("call-abort")[2]).toEqual({ ...identity(o, "call-abort"), revision: 3, fact: { kind: "close", code: null, signal: SIGNALLED } });
+				await o.shutdown();
+			});
+
+			it("a timeout: the request, then the close, then the tool's own timeout error", async () => {
+				const o = await owner();
+				await expect(o.run("call-timeout", "sleep 30", { timeout: 1 })).rejects.toThrow();
+				expect(o.facts("call-timeout")).toEqual([
+					{ ...identity(o, "call-timeout"), revision: 1, fact: { kind: "start" } },
+					{ ...identity(o, "call-timeout"), revision: 2, fact: { kind: "stop-request", reason: "timeout" } },
+					{ ...identity(o, "call-timeout"), revision: 3, fact: { kind: "close", code: null, signal: SIGNALLED } },
+				]);
+				await o.shutdown();
+			}, 15_000);
+
+			it("a call that fails before any spawn is not run, and its error passes through", async () => {
+				const told: ShellDisplayFact[] = [];
+				const call: ShellDisplayCall<ShellDisplayFact> = { sessionId: SESSION, toolCallId: "call-refused", tell: (fact) => told.push(fact) };
+				const refusal = new Error("refused before spawn");
+				await expect(observeShellCall(call, async () => { throw refusal; })).rejects.toBe(refusal);
+				expect(told).toEqual([{ kind: "not-run" }]);
+			});
+
+			it("a spawn that fails is not run: its close is no process closing, and the native result is unchanged", async () => {
+				const told: ShellDisplayFact[] = [];
+				const call: ShellDisplayCall<ShellDisplayFact> = { sessionId: SESSION, toolCallId: "call-nospawn", tell: (fact) => told.push(fact) };
+				const ops = () => createBackgroundableOperations({ ui: { setStatus: vi.fn() } } as any, new TaskManager(), SESSION, tempDir);
+				const missing = path.join(tempDir, "no-such-dir");
+				const unobserved = await ops().exec("echo never", missing, { onData: vi.fn() });
+				const observed = await observeShellCall(call, () => ops().exec("echo never", missing, { onData: vi.fn() }));
+				expect(observed).toEqual(unobserved);
+				expect(observed).toEqual({ exitCode: 1 });
+				await new Promise((r) => setTimeout(r, 50));
+				expect(told).toEqual([{ kind: "not-run" }]);
+			});
+
+			it("an error from a process that did spawn is not its end: child-error, and the close only when it really closes", async () => {
+				const o = await owner();
+				const running = o.run("call-err", "sleep 30");
+				const task = await o.foreground();
+				task.child!.emit("error", new Error("EPIPE"));
+				await running.catch(() => {});
+				expect(task.status).toBe("failed");
+				expect(o.facts("call-err")).toEqual([
+					{ ...identity(o, "call-err"), revision: 1, fact: { kind: "start" } },
+					{ ...identity(o, "call-err"), revision: 2, fact: { kind: "child-error" } },
+				]);
+				process.kill(task.pid, "SIGKILL");
+				await vi.waitFor(() => expect(o.facts("call-err")).toHaveLength(3));
+				expect(o.facts("call-err")[2]).toEqual({ ...identity(o, "call-err"), revision: 3, fact: { kind: "close", code: null, signal: "SIGKILL" } });
+				await o.shutdown();
+			});
+
+			it("a call with no display identity runs as it always did", async () => {
+				expect(await observeShellCall(undefined, async () => "plain")).toBe("plain");
+			});
+
+			it("two calls with the same command text keep their own ids", async () => {
+				const o = await owner();
+				await Promise.all([o.run("call-a", "sleep 0.2; echo same"), o.run("call-b", "sleep 0.2; echo same")]);
+				for (const id of ["call-a", "call-b"]) {
+					expect(o.facts(id)).toEqual([
+						{ ...identity(o, id), revision: 1, fact: { kind: "start" } },
+						{ ...identity(o, id), revision: 2, fact: { kind: "close", code: 0, signal: null } },
+					]);
+				}
+				await o.shutdown();
+			});
+
+			it("a call that finishes while another is still running reports under its own id, not the latest one", async () => {
+				const o = await owner();
+				const slow = o.run("call-slow", "sleep 0.5");
+				await vi.waitFor(() => expect(o.kinds("call-slow")).toEqual(["start"]));
+				await expect(o.run("call-quick", "exit 3")).rejects.toThrow();
+				await slow;
+				expect(o.facts().map((m) => [m.toolCallId, m.revision, m.fact.kind, m.fact.code])).toEqual([
+					["call-slow", 1, "start", undefined],
+					["call-quick", 1, "start", undefined],
+					["call-quick", 2, "close", 3],
+					["call-slow", 2, "close", 0],
+				]);
+				await o.shutdown();
+			});
+
+			it("a user ! command is not an agent call and reports nothing", async () => {
+				const o = await owner();
+				const { operations } = await o.handlers.get("user_bash")!({ command: "echo mine" }, o.ctx);
+				expect(await operations.exec("echo mine", tempDir, { onData: vi.fn() })).toEqual({ exitCode: 0 });
+				expect(o.facts()).toEqual([]);
+				await o.shutdown();
+			});
+		});
+
+		describe("Snapshot bound", () => {
+			type Fact = { kind: "start" | "close" };
+			function bounded(limit?: number) {
+				const events = createEventBus();
+				const display = createShellDisplayOwner<Fact>(events, "pi-bash", (fact) => fact.kind === "close", limit)!;
+				display.start(SESSION, { name: "bash", execute: () => {} });
+				const live: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => live.push(message as Message));
+				const snapshot = () => {
+					const from = live.length;
+					events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION });
+					return live.slice(from).filter((m) => m.kind === "fact").map((m) => `${m.toolCallId}#${m.revision}:${m.fact.kind}`);
+				};
+				return { display, live, snapshot };
+			}
+
+			it("keeps 2,000 invocations by default", () => {
+				expect(SHELL_DISPLAY_SNAPSHOT_LIMIT).toBe(2000);
+				const { display, snapshot } = bounded();
+				for (let i = 0; i < 2005; i++) display.open(`call-${i}`)!.tell({ kind: "start" });
+				const kept = snapshot();
+				expect(kept).toHaveLength(2000);
+				expect(kept[0]).toBe("call-5#1:start");
+				expect(kept.at(-1)).toBe("call-2004#1:start");
+			});
+
+			it("at the bound the least recently updated ended invocation goes first, and an open one only when none has ended", () => {
+				const { display, snapshot } = bounded(3);
+				const call = Object.fromEntries(["a", "b", "c", "d", "e", "f"].map((id) => [id, display.open(id)!]));
+				call.a!.tell({ kind: "start" });
+				call.b!.tell({ kind: "start" });
+				call.b!.tell({ kind: "close" });
+				call.c!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["a#1:start", "b#1:start", "b#2:close", "c#1:start"]);
+				// b ended, so it goes before a, which is older and still open.
+				call.d!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["a#1:start", "c#1:start", "d#1:start"]);
+				// Nothing has ended: the open invocation updated longest ago goes, and that is a.
+				call.e!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["c#1:start", "d#1:start", "e#1:start"]);
+				// An update makes c the most recent, so d is now the oldest.
+				call.c!.tell({ kind: "start" });
+				call.f!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["e#1:start", "c#1:start", "c#2:start", "f#1:start"]);
+			});
+
+			it("an evicted invocation still publishes, and its revisions keep counting", () => {
+				const { display, live, snapshot } = bounded(1);
+				const a = display.open("a")!;
+				a.tell({ kind: "start" });
+				display.open("b")!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["b#1:start"]);
+				a.tell({ kind: "close" });
+				expect(live.filter((m) => m.kind === "fact" && m.toolCallId === "a").map((m) => m.revision)).toEqual([1, 2]);
+			});
+
+			it("one invocation keeps 16 facts: the first, and the newest after it", () => {
+				expect(SHELL_DISPLAY_FACTS_PER_INVOCATION).toBe(16);
+				const { display, live, snapshot } = bounded();
+				const call = display.open("chatty")!;
+				for (let i = 0; i < 20; i++) call.tell({ kind: "start" });
+				expect(live.filter((m) => m.kind === "fact").map((m) => m.revision)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+				expect(snapshot()).toEqual([1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20].map((revision) => `chatty#${revision}:start`));
+			});
+
+			it("a subscriber that throws on one message does not cut short the messages after it", () => {
+				// On a bus with no safety net the throw comes back out of `emit`, in the middle of what the owner was doing.
+				const events = rawBus();
+				const heard: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => heard.push(message as Message));
+				const display = createShellDisplayOwner<Fact>(events, "pi-bash", (fact) => fact.kind === "close")!;
+				display.start(SESSION, { name: "bash", execute: () => {} });
+				display.open("a")!.tell({ kind: "start" });
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => {
+					const kind = (message as Message).kind;
+					if (kind === "withdraw" || kind === "announce") throw new Error(`cannot take ${kind}`);
+				});
+
+				// The snapshot answer: the announce throws, the facts still follow.
+				heard.length = 0;
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION });
+				expect(heard.map((m) => m.kind)).toEqual(["snapshot-request", "announce", "fact"]);
+
+				// A new session: the withdrawal throws, the owner still moves on and announces the new one.
+				heard.length = 0;
+				display.start("sess-next", { name: "bash", execute: () => {} });
+				expect(heard.map((m) => [m.kind, m.sessionId])).toEqual([["withdraw", SESSION], ["announce", "sess-next"]]);
+				expect(heard[1]!.ownerGeneration).not.toBe(heard[0]!.ownerGeneration);
+				expect(display.open("b")!.sessionId).toBe("sess-next");
+
+				// Shutdown: the withdrawal throws, the snapshot is still forgotten.
+				display.open("b")!.tell({ kind: "start" });
+				heard.length = 0;
+				display.stop();
+				expect(heard.map((m) => m.kind)).toEqual(["withdraw"]);
+				expect(display.open("c")).toBeUndefined();
+			});
+
+			it("the Pi owner and the Codex owner carry the same channel code", () => {
+				// Neither owner imports the other, and Pi loads every file in its extensions folder as an extension, so the code lives twice.
+				const channelCode = (file: string) => {
+					const source = fs.readFileSync(path.join(import.meta.dirname, file), "utf8");
+					const constants = source.slice(source.indexOf("export const SHELL_DISPLAY_CHANNEL"), source.indexOf("/**\n * What this owner saw"));
+					const from = source.indexOf("type ShellDisplayBus = ");
+					const owner = source.slice(from, source.indexOf("\n}\n", source.indexOf("export function createShellDisplayOwner")) + 3);
+					expect(constants).toContain("SHELL_DISPLAY_FACTS_PER_INVOCATION");
+					expect(owner).toContain("stop(): void {");
+					return (constants + owner).replaceAll("crypto.randomUUID()", "randomUUID()");
+				};
+				expect(channelCode("rbf-codex.ts")).toBe(channelCode("rbf-background-tasks.ts"));
+			});
+
+			it("no invocation can be opened before a session is announced, and none on a Pi with no bus", () => {
+				const display = createShellDisplayOwner<Fact>(createEventBus(), "pi-bash", () => false)!;
+				expect(display.open("early")).toBeUndefined();
+				expect(createShellDisplayOwner<Fact>(undefined, "pi-bash", () => false)).toBeUndefined();
+			});
+		});
+
+		describe("Sandbox launch", () => {
+			it("reads the frozen argv with Pi's own parser", () => {
+				expect(isSandboxLaunch(["--sandbox"])).toBe(true);
+				expect(isSandboxLaunch(["--model", "x", "--sandbox"])).toBe(true);
+				expect(isSandboxLaunch([])).toBe(false);
+				expect(isSandboxLaunch(["--model", "sandbox"])).toBe(false);
+			});
+
+			it("a sandbox launch announces nothing, reports nothing and answers nothing, and the command still runs", async () => {
+				const o = await owner({ argv: ["--sandbox"] });
+				const result = await o.run("call-ok", "echo hi");
+				expect(result.content[0].text).toContain("hi");
+				o.events!.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: SESSION });
+				await o.shutdown();
+				expect(o.seen).toEqual([{ kind: "snapshot-request", sessionId: SESSION }]);
+			});
+		});
+
+		describe("Isolation from native execution", () => {
+			const settled = (call: Promise<any>) =>
+				call.then(
+					(result) => ({ resolved: result.content.map((c: any) => c.text).join("") }),
+					(error) => ({ rejected: String(error?.message ?? error) }),
+				);
+
+			/** One script of calls on a fresh owner, reduced to what the native path returned and left behind. */
+			async function nativeOutcome(events: Bus | null) {
+				const o = await owner({ events, listen: false });
+				const out: Record<string, unknown> = {};
+				out.ok = await settled(o.run("iso-ok", "echo iso"));
+				out.fail = await settled(o.run("iso-fail", "echo boom; exit 7"));
+
+				const detached = o.run("iso-bg", "sleep 0.3; echo BG");
+				const task = await o.foreground();
+				o.manager.detachActiveForeground();
+				out.detached = JSON.parse(JSON.stringify(await settled(detached)).replaceAll(task.id, "<task>"));
+				out.foregroundAfterDetach = o.manager.getActiveForeground();
+
+				const ac = new AbortController();
+				const aborted = o.run("iso-abort", "sleep 30", { signal: ac.signal });
+				const cut = await o.foreground();
+				ac.abort();
+				out.aborted = await settled(aborted);
+				out.abortedStatus = cut.status;
+
+				await vi.waitFor(() => expect(task.status).not.toBe("running"));
+				out.detachedEnd = [task.status, task.exitCode, task.isBackgrounded];
+				out.log = fs.readFileSync(task.logPath, "utf8");
+				out.running = o.manager.getRunningTasks().length;
+				await o.shutdown();
+				out.managerAfterShutdown = getActiveTaskManager();
+				return out;
+			}
+
+			it("a throwing subscriber, a throwing bus and no bus at all leave every native result as it was", async () => {
+				const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+				try {
+					const baseline = await nativeOutcome(null);
+					expect(baseline.ok).toEqual({ resolved: "iso\n" });
+					expect(baseline.fail).toMatchObject({ rejected: expect.stringContaining("Command exited with code 7") });
+					expect(baseline.detached).toMatchObject({ resolved: expect.stringContaining("Command was manually backgrounded by user with ID: <task>") });
+					expect(baseline.detachedEnd).toEqual(["completed", 0, true]);
+					expect(baseline.abortedStatus).toBe("stopped");
+
+					expect(await nativeOutcome(createEventBus())).toEqual(baseline);
+
+					let thrown = 0;
+					const throwing = (bus: Bus) => {
+						bus.on(SHELL_DISPLAY_CHANNEL, () => {
+							thrown++;
+							throw new Error("subscriber blew up");
+						});
+						return bus;
+					};
+					expect(await nativeOutcome(throwing(createEventBus()))).toEqual(baseline);
+					const afterPiBus = thrown;
+					expect(afterPiBus).toBeGreaterThan(8);
+					expect(await nativeOutcome(throwing(rawBus()))).toEqual(baseline);
+					expect(thrown).toBeGreaterThan(afterPiBus + 8);
+
+					const broken: Bus = {
+						emit: () => {
+							thrown++;
+							throw new Error("bus blew up");
+						},
+						on: (channel) => {
+							if (channel === SHELL_DISPLAY_CHANNEL) throw new Error("cannot subscribe");
+							return () => {};
+						},
+					};
+					expect(await nativeOutcome(broken)).toEqual(baseline);
+				} finally {
+					errors.mockRestore();
+				}
+			}, 60_000);
 		});
 	});
 });

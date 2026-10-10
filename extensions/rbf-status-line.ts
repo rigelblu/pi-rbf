@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	FooterComponent,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -331,24 +332,123 @@ export function formatFooterLineWithRightSide(
 	return truncateToWidth(rightContent, width, "");
 }
 
-let statusLineCache: CachedStatusLine | null = null;
+export const STATUS_LINE_CACHE_KEY = Symbol.for("rbf.statusLine.cache");
 
 export function getCachedStatusLine(): CachedStatusLine | null {
-	return statusLineCache;
+	return (globalThis as any)[STATUS_LINE_CACHE_KEY] ?? null;
 }
 
 export function setCachedStatusLine(cache: CachedStatusLine | null): void {
-	statusLineCache = cache;
+	if (cache === null) {
+		delete (globalThis as any)[STATUS_LINE_CACHE_KEY];
+	} else {
+		(globalThis as any)[STATUS_LINE_CACHE_KEY] = cache;
+	}
 }
 
 export function invalidateStatusLineCache(): void {
-	statusLineCache = null;
+	delete (globalThis as any)[STATUS_LINE_CACHE_KEY];
+}
+
+// Last-message age (pi-43): `💬 <age>` at the left of Pi's token row.
+export const AGE_STATE_GETTER_KEY = Symbol.for("rbf.statusLine.getAgeState");
+export const AGE_WRAPPER_KEY = Symbol.for("rbf.statusLine.ageWrapper");
+export const AGE_RESTART_WARNED_KEY = Symbol.for("rbf.statusLine.ageRestartWarned");
+export const AGE_WRAPPER_VERSION = 1;
+export const AGE_RESTART_WARNING = "Last msg needs a Pi restart to appear.";
+const AGE_ICON = "💬";
+const AGE_SEPARATOR = " | ";
+const AGE_MIN_PADDING = 2;
+const AGE_REDRAW_STATUS_KEY = "rbf-status-line-age-redraw";
+const MINUTE_MS = 60_000;
+
+/** Newest user timestamp from one source; `unknown` when any candidate cannot be ordered. */
+export interface AgeMaximum {
+	submittedAt?: number;
+	unknown: boolean;
+}
+
+export type AgeSelection = { kind: "hidden" } | { kind: "unknown" } | { kind: "timed"; submittedAt: number };
+
+export interface AgeCue {
+	text: string;
+	/** `timed` advances by the minute; `future` is `?` until the clock reaches the timestamp. */
+	kind: "timed" | "unknown" | "future";
+}
+
+/** What the footer wrapper reads on every render; one per live extension instance. */
+export interface AgeState {
+	cue(now: number): AgeCue | undefined;
+	report(cue: AgeCue | undefined, drawn: boolean, now: number): void;
+}
+
+export function formatLastMessageAge(submittedAt: number, now: number): string {
+	const elapsed = now - submittedAt;
+	if (!Number.isFinite(elapsed) || elapsed < 0) return "?";
+	if (elapsed < MINUTE_MS) return "<1m";
+	if (elapsed < 60 * MINUTE_MS) return `${Math.floor(elapsed / MINUTE_MS)}m`;
+	if (elapsed < 24 * 60 * MINUTE_MS) return `${Math.floor(elapsed / (60 * MINUTE_MS))}h`;
+	return `${Math.floor(elapsed / (24 * 60 * MINUTE_MS))}d`;
+}
+
+export function raiseAgeMaximum(max: AgeMaximum, timestamp: unknown): AgeMaximum {
+	if (typeof timestamp !== "number" || !Number.isFinite(timestamp) || timestamp < 0) {
+		return { ...max, unknown: true };
+	}
+	return { submittedAt: Math.max(max.submittedAt ?? timestamp, timestamp), unknown: max.unknown };
+}
+
+export function scanBranchAgeMaximum(entries: readonly any[]): AgeMaximum {
+	let max: AgeMaximum = { unknown: false };
+	for (const entry of entries) {
+		if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+		max = raiseAgeMaximum(max, entry.message.timestamp);
+	}
+	return max;
+}
+
+export function selectAge(branch: AgeMaximum, delivered: AgeMaximum): AgeSelection {
+	if (branch.unknown || delivered.unknown) return { kind: "unknown" };
+	const at = Math.max(branch.submittedAt ?? -1, delivered.submittedAt ?? -1);
+	return at < 0 ? { kind: "hidden" } : { kind: "timed", submittedAt: at };
+}
+
+export function ageCueFor(selection: AgeSelection, now: number): AgeCue | undefined {
+	if (selection.kind === "hidden") return undefined;
+	if (selection.kind === "unknown") return { text: `${AGE_ICON} ?`, kind: "unknown" };
+	const age = formatLastMessageAge(selection.submittedAt, now);
+	return { text: `${AGE_ICON} ${age}`, kind: age === "?" ? "future" : "timed" };
+}
+
+/**
+ * Put the cue at the start of Pi's token row without changing the row's width: its cells
+ * come out of the padding between the token numbers and the model name. Returns the row
+ * untouched when that padding could not keep AGE_MIN_PADDING cells.
+ */
+export function prependAgeCue(row: string, cue: string): string {
+	let pad: RegExpMatchArray | undefined;
+	for (const run of row.matchAll(/ {2,}/g)) {
+		if (!pad || run[0].length > pad[0].length) pad = run;
+	}
+	const need = visibleWidth(cue) + AGE_SEPARATOR.length;
+	if (!pad || pad.index === undefined || pad[0].length - need < AGE_MIN_PADDING) return row;
+	const style = row.match(/^(?:\x1b\[[0-9;]*m)*/)?.[0] ?? "";
+	return (
+		style +
+		cue +
+		AGE_SEPARATOR +
+		row.slice(style.length, pad.index) +
+		" ".repeat(pad[0].length - need) +
+		row.slice(pad.index + pad[0].length)
+	);
 }
 
 export function patchFooterComponent(): boolean {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return false;
 	}
+	(FooterComponent.prototype as any)[Symbol.for("rbf.statusLine.invalidateCache")] = invalidateStatusLineCache;
+
 	if ((FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY]) {
 		return true;
 	}
@@ -356,6 +456,7 @@ export function patchFooterComponent(): boolean {
 	const originalRender = FooterComponent.prototype.render;
 	(FooterComponent.prototype as any)[ORIGINAL_STATUS_LINE_RENDER_KEY] = originalRender;
 	(FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY] = true;
+	(FooterComponent.prototype as any)[AGE_WRAPPER_KEY] = AGE_WRAPPER_VERSION;
 
 	FooterComponent.prototype.render = function (this: any, width: number): string[] {
 		const lines = originalRender.call(this, width);
@@ -368,22 +469,23 @@ export function patchFooterComponent(): boolean {
 		const now = Date.now();
 
 		let statusText: string;
+		const cached = getCachedStatusLine();
 		if (
-			statusLineCache &&
-			statusLineCache.cwd === cwd &&
-			statusLineCache.sessionName === sessionName &&
-			now - statusLineCache.timestamp < 2000
+			cached &&
+			cached.cwd === cwd &&
+			cached.sessionName === sessionName &&
+			now - cached.timestamp < 2000
 		) {
-			statusText = statusLineCache.line;
+			statusText = cached.line;
 		} else {
 			const components = resolveStatusLineComponents(cwd, { sessionName });
 			statusText = formatStatusLine(components);
-			statusLineCache = {
+			setCachedStatusLine({
 				cwd,
 				sessionName,
 				line: statusText,
 				timestamp: now,
-			};
+			});
 		}
 
 		const theme = this.session?.theme ?? getActiveTheme();
@@ -397,6 +499,19 @@ export function patchFooterComponent(): boolean {
 
 		lines[0] = formatFooterLineWithRightSide(dimStatusLine, guardianContent, width, theme);
 
+		const getAgeState = (FooterComponent.prototype as any)[AGE_STATE_GETTER_KEY];
+		const ageState: AgeState | undefined = typeof getAgeState === "function" ? getAgeState() : undefined;
+		if (ageState) {
+			const cue = ageState.cue(now);
+			let drawn = false;
+			if (cue && lines.length > 1) {
+				const row = prependAgeCue(lines[1], cue.text);
+				drawn = row !== lines[1];
+				lines[1] = row;
+			}
+			ageState.report(cue, drawn, now);
+		}
+
 		return lines;
 	};
 
@@ -407,6 +522,7 @@ export function unpatchFooterComponent(): void {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return;
 	}
+	invalidateStatusLineCache();
 	if ((FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY]) {
 		const originalRender = (FooterComponent.prototype as any)[ORIGINAL_STATUS_LINE_RENDER_KEY];
 		if (originalRender) {
@@ -414,11 +530,137 @@ export function unpatchFooterComponent(): void {
 		}
 		delete (FooterComponent.prototype as any)[ORIGINAL_STATUS_LINE_RENDER_KEY];
 		delete (FooterComponent.prototype as any)[STATUS_LINE_PATCHED_KEY];
+		delete (FooterComponent.prototype as any)[Symbol.for("rbf.statusLine.invalidateCache")];
 	}
+	delete (FooterComponent.prototype as any)[AGE_WRAPPER_KEY];
+	delete (FooterComponent.prototype as any)[AGE_RESTART_WARNED_KEY];
+	delete (FooterComponent.prototype as any)[AGE_STATE_GETTER_KEY];
+}
+
+/**
+ * Last-message age for one extension instance. Timing reads public delivery events and
+ * saved history only. The timer is armed from the footer's own report, so a cue that is
+ * hidden, unknown or never rendered holds no timer.
+ */
+function installLastMessageAge(pi: ExtensionAPI, legacyWrapper: boolean): void {
+	const proto = FooterComponent.prototype as any;
+	// RPC has a UI object but no footer; a redraw request there would reach the RPC client.
+	const isTui = (ctx: ExtensionContext) => ctx.hasUI && ctx.mode === "tui";
+
+	if (legacyWrapper) {
+		// A wrapper from before this feature never reads the age slot; only a restart replaces it.
+		pi.on("session_start", (_event, ctx) => {
+			if (!isTui(ctx) || proto[AGE_RESTART_WARNED_KEY]) return;
+			proto[AGE_RESTART_WARNED_KEY] = true;
+			ctx.ui.notify(AGE_RESTART_WARNING, "warning");
+		});
+		return;
+	}
+
+	let branch: AgeMaximum = { unknown: false };
+	let delivered: AgeMaximum = { unknown: false };
+	let ui: ExtensionContext["ui"] | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let armedFor: number | undefined;
+	let lastText: string | undefined;
+	let live = true;
+
+	const selection = (): AgeSelection => (ui ? selectAge(branch, delivered) : { kind: "hidden" });
+
+	const stopTimer = () => {
+		if (timer) clearTimeout(timer);
+		timer = undefined;
+		armedFor = undefined;
+	};
+
+	const requestRedrawIfChanged = (): boolean => {
+		const text = ageCueFor(selection(), Date.now())?.text;
+		if (text === lastText) return false;
+		lastText = text;
+		try {
+			ui?.setStatus(AGE_REDRAW_STATUS_KEY, undefined);
+		} catch {
+			lastText = undefined; // not drawn; the next tick or event asks again
+		}
+		return true;
+	};
+
+	const arm = (submittedAt: number, now: number) => {
+		stopTimer();
+		const elapsed = now - submittedAt;
+		const delay = elapsed < 0 ? Math.min(MINUTE_MS, -elapsed) : MINUTE_MS - (elapsed % MINUTE_MS);
+		armedFor = submittedAt;
+		timer = setTimeout(() => {
+			timer = undefined;
+			armedFor = undefined;
+			if (!live) return;
+			// A changed label is redrawn, and that render re-arms. An unchanged one re-arms here.
+			const current = selection();
+			if (!requestRedrawIfChanged() && current.kind === "timed") arm(current.submittedAt, Date.now());
+		}, delay);
+		(timer as any).unref?.();
+	};
+
+	// The selected message can change without changing the label; keep a running timer on its minute.
+	const selectionChanged = () => {
+		const current = selection();
+		if (!requestRedrawIfChanged() && timer && current.kind === "timed" && armedFor !== current.submittedAt) {
+			arm(current.submittedAt, Date.now());
+		}
+	};
+
+	const state: AgeState = {
+		cue: (now) => (live ? ageCueFor(selection(), now) : undefined),
+		report: (cue, drawn, now) => {
+			if (!live) return;
+			const current = selection();
+			const wantsTimer = current.kind === "timed" && cue && (cue.kind === "future" || (cue.kind === "timed" && drawn));
+			if (!wantsTimer) {
+				stopTimer();
+				return;
+			}
+			if (timer && armedFor === current.submittedAt) return;
+			arm(current.submittedAt, now);
+		},
+	};
+	proto[AGE_STATE_GETTER_KEY] = () => state;
+
+	const rebuild = (ctx: ExtensionContext, keepDelivered: boolean) => {
+		if (!live || !isTui(ctx)) return;
+		ui = ctx.ui;
+		try {
+			branch = scanBranchAgeMaximum(ctx.sessionManager.getBranch());
+		} catch {
+			branch = { unknown: true };
+		}
+		if (!keepDelivered) delivered = { unknown: false };
+		selectionChanged();
+	};
+
+	pi.on("session_start", (_event, ctx) => rebuild(ctx, false));
+	pi.on("session_tree", (_event, ctx) => rebuild(ctx, false));
+	pi.on("agent_settled", (_event, ctx) => rebuild(ctx, false));
+	pi.on("session_compact", (_event, ctx) => rebuild(ctx, true));
+	pi.on("message_start", (event, ctx) => {
+		if (!live || !isTui(ctx) || event.message.role !== "user") return;
+		ui = ctx.ui;
+		delivered = raiseAgeMaximum(delivered, (event.message as any).timestamp);
+		selectionChanged();
+	});
+	pi.on("session_shutdown", () => {
+		live = false;
+		stopTimer();
+		ui = undefined;
+		// A newer instance may already own the slot; never clear its state.
+		if (proto[AGE_STATE_GETTER_KEY]?.() === state) delete proto[AGE_STATE_GETTER_KEY];
+	});
 }
 
 export default function rbfStatusLine(pi: ExtensionAPI): void {
+	const proto = typeof FooterComponent === "undefined" ? undefined : (FooterComponent.prototype as any);
+	const legacyWrapper = Boolean(proto?.[STATUS_LINE_PATCHED_KEY]) && (proto[AGE_WRAPPER_KEY] ?? 0) < AGE_WRAPPER_VERSION;
 	patchFooterComponent();
+	invalidateStatusLineCache();
 
 	const invalidate = () => {
 		invalidateStatusLineCache();
@@ -429,4 +671,6 @@ export default function rbfStatusLine(pi: ExtensionAPI): void {
 	pi.on("turn_end", invalidate);
 	pi.on("agent_settled", invalidate);
 	pi.on("user_bash", invalidate);
+
+	if (proto) installLastMessageAge(pi, legacyWrapper);
 }

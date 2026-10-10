@@ -1,15 +1,19 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
-import { validateToolArguments } from "@earendil-works/pi-ai";
-import { Box } from "@earendil-works/pi-tui";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel, getSupportedThinkingLevels, validateToolArguments } from "@earendil-works/pi-ai";
+import { Box, Editor } from "@earendil-works/pi-tui";
+import { initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeInterruptionFixture } from "./test-support/rbf-codex-interruption-fixture.ts";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, loneString, mapEffort, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle } from "./rbf-codex.ts";
+import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COMPACT_DISPATCHER_KEY, COMPACT_NOTICE, COMPACT_SAFE_REASONS, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, AppServerClient, classifyCompletedTurn, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, isCompactCommand, isSupportedCodexVersion, loneString, mapEffort, parseCodexVersion, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle, verifyBranchHistory, verifyEmptyBranchHistory } from "./rbf-codex.ts";
 import type { FakeScenario } from "./test-support/rbf-codex-fake-app-server.ts";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
+import { createShellDisplayOwner, SHELL_DISPLAY_CHANNEL, SHELL_DISPLAY_SNAPSHOT_LIMIT, shellCompletionFact } from "./rbf-codex.ts";
+import { NO_EVIDENCE, reduceEvidence } from "./rbf-shell-command-groups.ts";
 
 const FAKE = resolve(import.meta.dirname, "test-support/rbf-codex-fake-app-server.ts");
 // Vitest runs on Node, which strips types from .ts on its own (Node 22.6+).
@@ -22,7 +26,7 @@ type Entry = { type: string; customType?: string; data?: unknown; message?: { ro
 type Tool = { name: string; execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: ((p: any) => void) | undefined, ctx: ExtensionContext) => Promise<any>; renderCall: (args: any, theme: any, context: any) => any; renderResult: (result: any, opts: any, theme: any, context: any) => any };
 const fakeTheme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-function makePi() {
+function makePi(opts?: { getThinkingLevel?: () => string; events?: unknown }) {
 	const handlers = new Map<string, Handler>();
 	const entries: { customType: string; data: unknown }[] = [];
 	const tools = new Map<string, Tool>();
@@ -34,6 +38,8 @@ function makePi() {
 		registerProvider: vi.fn((name: string, config: ProviderConfig) => {
 			provider = { name, config };
 		}),
+		getThinkingLevel: vi.fn(opts?.getThinkingLevel ?? (() => "medium")),
+		...(opts?.events ? { events: opts.events } : {}),
 	} as unknown as ExtensionAPI;
 	return {
 		pi,
@@ -50,7 +56,16 @@ function makePi() {
 	};
 }
 
-function makeCtx(opts: { branch?: Entry[]; sessionId?: string; cwd?: string; mode?: "tui" | "print" } = {}) {
+function makeCtx(opts: {
+	branch?: Entry[];
+	sessionId?: string;
+	cwd?: string;
+	mode?: "tui" | "print";
+	model?: Model<any>;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
+	leafId?: string;
+} = {}) {
 	const branch = opts.branch ?? [];
 	const notify = vi.fn();
 	const setWorkingMessage = vi.fn();
@@ -67,17 +82,44 @@ function makeCtx(opts: { branch?: Entry[]; sessionId?: string; cwd?: string; mod
 		return answers.shift();
 	});
 	const mode = opts.mode ?? "tui";
+	let currentModel = opts.model ?? model();
+	let leafId = opts.leafId ?? "leaf-1";
+	let cwd = opts.cwd ?? process.cwd();
+	let idle = true;
+	let pendingMessages = false;
 	const ctx = {
 		mode,
 		hasUI: mode === "tui",
 		ui: { notify, setWorkingMessage, select, input },
+		get model() {
+			return currentModel;
+		},
+		set model(m: Model<any>) {
+			currentModel = m;
+		},
+		isIdle: opts.isIdle ?? (() => idle),
+		hasPendingMessages: opts.hasPendingMessages ?? (() => pendingMessages),
 		sessionManager: {
 			getBranch: () => branch,
 			getSessionId: () => opts.sessionId ?? "session-A",
-			getCwd: () => opts.cwd ?? process.cwd(),
+			getCwd: () => cwd,
+			getLeafId: () => leafId,
 		},
-	} as unknown as ExtensionContext;
-	return { ctx, branch, notify, setWorkingMessage, answers, dialogs, select, input };
+	} as unknown as ExtensionContext & { model: Model<any> };
+	return {
+		ctx,
+		branch,
+		notify,
+		setWorkingMessage,
+		answers,
+		dialogs,
+		select,
+		input,
+		setLeafId: (id: string) => { leafId = id; },
+		setCwd: (path: string) => { cwd = path; },
+		setIsIdle: (val: boolean) => { idle = val; },
+		setHasPendingMessages: (val: boolean) => { pendingMessages = val; },
+	};
 }
 
 function model(id = BOOTSTRAP_MODEL_ID, thinkingLevelMap: Model<any>["thinkingLevelMap"] = BOOTSTRAP_MODEL.thinkingLevelMap): Model<any> {
@@ -122,7 +164,15 @@ describe("rbf-codex", () => {
 		// Close every fake child this test spawned; leaked children made the full suite flaky under load.
 		await Promise.all(booted.splice(0).map((b) => b.shutdown()));
 		process.env = { ...savedEnv };
-		rmSync(dir, { recursive: true, force: true });
+		try {
+			for (const s of sent().filter((m) => m.method === "turn/start")) {
+				const params = s.params as Record<string, unknown> | undefined;
+				expect(typeof params?.effort).toBe("string");
+				expect((params?.effort as string).length).toBeGreaterThan(0);
+			}
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	function scenario(s: FakeScenario) {
@@ -140,10 +190,14 @@ describe("rbf-codex", () => {
 	}
 
 	/** Boot an extension instance with `session_start` already fired, ready to stream. */
-	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[] } = {}) {
-		const fx = makePi();
-		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [] })(fx.pi);
+	async function boot(opts: Parameters<typeof makeCtx>[0] & { command?: typeof fakeCommand; argv?: string[]; compactTimeoutMs?: number; persistAppends?: boolean; thinkingLevel?: string; events?: unknown } = {}) {
+		const fx = makePi(opts.thinkingLevel || opts.events ? { getThinkingLevel: opts.thinkingLevel ? () => opts.thinkingLevel! : undefined, events: opts.events } : undefined);
+		createRbfCodex({ command: opts.command ?? fakeCommand, argv: opts.argv ?? [], compactTimeoutMs: opts.compactTimeoutMs })(fx.pi);
 		const c = makeCtx(opts);
+		if (opts.persistAppends) vi.mocked(fx.pi.appendEntry).mockImplementation((customType, data) => {
+			fx.entries.push({ customType, data });
+			c.branch.push({ type: "custom", customType, data });
+		});
 		await fx.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, c.ctx);
 		const turn = (text: string | Context["messages"], m: Model<any> = model(), options: { reasoning?: ThinkingLevel; signal?: AbortSignal } = {}) => {
 			const messages = typeof text === "string" ? [userMessage(text)] : text;
@@ -168,7 +222,12 @@ describe("rbf-codex", () => {
 			const next = await collect(fx.provider.config.streamSimple!(m, { messages: after } as Context, { signal: opts.signal }));
 			return { first, result, next, messages: after };
 		};
-		return { ...fx, ...c, turn, shutdown, exec, round };
+		const editor = new Editor({ requestRender: () => {} } as any, { borderColor: () => "" } as any);
+		const submit = async (text: string) => {
+			editor.setText(text);
+			(editor as any).submitValue();
+		};
+		return { ...fx, ...c, turn, shutdown, exec, round, editor, submit };
 	}
 
 	describe("registration", () => {
@@ -180,7 +239,7 @@ describe("rbf-codex", () => {
 			expect(typeof b.provider.config.refreshModels).toBe("function");
 			expect(b.provider.config.models).toEqual([BOOTSTRAP_MODEL]);
 			expect(BOOTSTRAP_MODEL.reasoning).toBe(true);
-			expect(BOOTSTRAP_MODEL.thinkingLevelMap).toEqual({ minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+			expect(BOOTSTRAP_MODEL.thinkingLevelMap).toEqual({ off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 		});
 
 		it("registers nothing when --sandbox is in argv", () => {
@@ -191,9 +250,15 @@ describe("rbf-codex", () => {
 		});
 	});
 
-	describe("catalog", () => {
-		const codexModel = (id: string, efforts: string[], extra: Record<string, unknown> = {}) => ({ id, model: id, displayName: id.toUpperCase(), hidden: false, supportedReasoningEfforts: efforts.map((e) => ({ reasoningEffort: e })), ...extra });
+	const codexModel = (id: string, efforts: string[], extra: Record<string, unknown> = {}) => ({ id, model: id, displayName: id.toUpperCase(), hidden: false, supportedReasoningEfforts: efforts.map((e) => ({ reasoningEffort: e })), ...extra });
 
+	function refreshCtx(opts: { allowNetwork: boolean; force?: boolean; stored?: RefreshModelsContext["stored"] }) {
+		const publish = vi.fn(async () => true);
+		const ctx = { allowNetwork: opts.allowNetwork, force: opts.force, stored: opts.stored, publish, signal: new AbortController().signal } as unknown as RefreshModelsContext;
+		return { ctx, publish };
+	}
+
+	describe("catalog", () => {
 		it("maps a Codex model to a Pi model with only listed efforts, minimal null, and xhigh and max named", () => {
 			const m = toProviderModel(codexModel("gpt-x", ["medium", "high", "ultra"], { inputModalities: ["text", "image"] }));
 			expect(m).toMatchObject({ id: "gpt-x", name: "GPT-X (Codex agent)", reasoning: true, input: ["text", "image"] }); // the provider tag keeps the row apart from openai-codex
@@ -201,15 +266,10 @@ describe("rbf-codex", () => {
 			expect(codexModelId("gpt-x")).toBe("gpt-x");
 			expect(codexModelId("codex-gpt-x")).toBe("gpt-x"); // a store from the brief prefix era
 			expect(codexModelId(BOOTSTRAP_MODEL_ID)).toBeUndefined();
-			expect(m.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null });
-			expect(toProviderModel(codexModel("gpt-y", ["low", "xhigh", "max"])).thinkingLevelMap).toEqual({ minimal: null, low: "low", medium: null, high: null, xhigh: "xhigh", max: "max" });
+			expect(m.thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: "medium", high: "high", xhigh: null, max: null });
+			expect(toProviderModel(codexModel("gpt-y", ["low", "xhigh", "max"])).thinkingLevelMap).toEqual({ off: null, minimal: null, low: "low", medium: null, high: null, xhigh: "xhigh", max: "max" });
 		});
 
-		function refreshCtx(opts: { allowNetwork: boolean; force?: boolean; stored?: RefreshModelsContext["stored"] }) {
-			const publish = vi.fn(async () => true);
-			const ctx = { allowNetwork: opts.allowNetwork, force: opts.force, stored: opts.stored, publish, signal: new AbortController().signal } as unknown as RefreshModelsContext;
-			return { ctx, publish };
-		}
 		const storedEntry = (checkedAt: number) => ({ models: [{ ...model("codex-gpt-stored", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), name: "GPT-STORED (Codex agent)" }], checkedAt }); // prefixed id, as a store from the prefix era would hold
 
 		it("returns the stored list without network and never spawns", async () => {
@@ -235,7 +295,7 @@ describe("rbf-codex", () => {
 			expect(list.map((m) => m.id)).toEqual([BOOTSTRAP_MODEL_ID, "gpt-fake-1", "gpt-fake-2"]);
 			expect(list[2]).toMatchObject({ name: "GPT Fake 2 (Codex agent)", input: ["text", "image"], reasoning: true });
 			expect(list[1]).toMatchObject({ input: ["text"] });
-			expect(list[2].thinkingLevelMap).toEqual({ minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+			expect(list[2].thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 			expect(forced.publish).toHaveBeenCalledTimes(1);
 			const persisted = (forced.publish.mock.calls[0] as unknown as [{ persist: { models: Model<any>[]; checkedAt: number } }])[0].persist;
 			expect(persisted.checkedAt).toBe(now);
@@ -266,23 +326,24 @@ describe("rbf-codex", () => {
 			expect(start.params).toMatchObject({ model: "gpt-fake-2", effort: "high" });
 		});
 
-		it("sends effort but no model for the bootstrap id, and neither effort when the level is unsupported or off", async () => {
+		it("sends effort but no model for the bootstrap id, uses displayed thinking level when none is passed, and refuses an unsupported level", async () => {
 			const b = await boot();
 			await b.turn("one", model(), { reasoning: "medium" });
 			await b.turn("two", model(), {});
-			await b.turn("three", model("gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
+			const errTurn = await b.turn("three", model("gpt-fake-1", { minimal: null, low: "low", medium: null, high: null, xhigh: null, max: null }), { reasoning: "high" });
+			expect(errTurn.final?.errorMessage).toBe(COPY["unsupported-thinking-level"]);
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts[0]).toMatchObject({ effort: "medium" });
 			expect(starts[0]).not.toHaveProperty("model");
-			expect(starts[1]).not.toHaveProperty("effort");
+			expect(starts[1]).toMatchObject({ effort: "medium" });
 			expect(starts[1]).not.toHaveProperty("model");
-			expect(starts[2]).toMatchObject({ model: "gpt-fake-1" });
-			expect(starts[2]).not.toHaveProperty("effort");
+			expect(starts).toHaveLength(2);
 			expect(mapEffort(model(), "max")).toBe("max");
 			expect(mapEffort(model(), "minimal")).toBeUndefined();
+			expect(mapEffort(model(), "off")).toBeUndefined();
 		});
 
-		it("retries once without model and effort when Codex rejects the persisted model id, with the retired-model notice", async () => {
+		it("retries once without model but with the same effort when Codex rejects the persisted model id, with the retired-model notice", async () => {
 			scenario({ retiredModel: "gpt-gone" });
 			const b = await boot();
 			const r = await b.turn("hi", model("gpt-gone"), { reasoning: "high" });
@@ -290,8 +351,8 @@ describe("rbf-codex", () => {
 			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params!);
 			expect(starts).toHaveLength(2);
 			expect(starts[0]).toMatchObject({ model: "gpt-gone", effort: "high" });
+			expect(starts[1]).toMatchObject({ effort: "high" });
 			expect(starts[1]).not.toHaveProperty("model");
-			expect(starts[1]).not.toHaveProperty("effort");
 			expect(b.notify).toHaveBeenCalledWith(NOTICE.retiredModel("gpt-gone"), "warning");
 		});
 	});
@@ -769,8 +830,8 @@ describe("rbf-codex", () => {
 			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
 			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
 			await b.turn("hi");
-			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
-			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1" });
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/turns/list", "turn/start"]);
+			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1", excludeTurns: true });
 			expect(threadEntries(b)).toEqual([]);
 		});
 
@@ -778,7 +839,7 @@ describe("rbf-codex", () => {
 			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "completed" }] });
 			const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
 			await b.turn("hi");
-			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/fork", "turn/start"]);
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/turns/list", "thread/fork", "turn/start"]);
 			expect(sent().find((m) => m.method === "thread/fork")!.params).toEqual({ threadId: "thread-fake-1", lastTurnId: "turn-1", cwd: process.cwd(), ephemeral: false });
 			expect(threadEntries(b)).toEqual([{ threadId: "thread-fake-fork-1", cwd: process.cwd(), sessionId: "A" }]);
 			expect(sent().find((m) => m.method === "turn/start")!.params).toMatchObject({ threadId: "thread-fake-fork-1" });
@@ -826,19 +887,27 @@ describe("rbf-codex", () => {
 			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
 		});
 
-		it("(h) a thread/fork error ends the call with turn-failed and sends no turn/start", async () => {
+		it("(h) a thread/fork error ends the call with fork-failed and sends no turn/start", async () => {
 			scenario({ forkError: "no such turn" });
 			const b = await boot({ sessionId: "B", branch: [T("A"), U("turn-1")] });
 			const r = await b.turn("hi");
-			expect(r.final?.errorMessage).toBe(COPY["turn-failed"]);
+			expect(r.final?.errorMessage).toBe(COPY["fork-failed"]);
 			expect(methods()).not.toContain("turn/start");
 		});
 
-		it("(i) own thread with no turn entry after it: resume without turns, never fork, even when Codex lists completed turns", async () => {
+		it("(i) own thread with no turn entry after it: unverified turns refuse with history-unverified", async () => {
 			scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }, { id: "turn-2", status: "completed" }] });
 			const b = await boot({ sessionId: "A", branch: [T("A")] });
-			await b.turn("hi");
-			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
+			const r = await b.turn("hi");
+			expect(r.final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods()).not.toContain("turn/start");
+		});
+
+		it("(i) own thread with no turn entry after it: genuinely cold thread resumes without fork", async () => {
+			scenario({ resumeTurns: [] });
+			const c = await boot({ sessionId: "A", branch: [T("A")] });
+			await c.turn("hi");
+			expect(methods()).toEqual(["initialize", "initialized", "thread/resume", "thread/turns/list", "turn/start"]);
 			expect(sent().find((m) => m.method === "thread/resume")!.params).toEqual({ threadId: "thread-fake-1", excludeTurns: true });
 		});
 	});
@@ -857,8 +926,8 @@ describe("rbf-codex", () => {
 		});
 
 		it("a refused steer becomes exactly one turn/start after the turn ends, carrying the steer text and images", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "turn already ended" });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "turn already ended" });
+			const b = await boot({ persistAppends: true });
 			const m = model("gpt-fake-2");
 			m.input = ["text", "image"];
 			const first = await b.turn("go", m);
@@ -875,8 +944,8 @@ describe("rbf-codex", () => {
 		});
 
 		it("a refused steer survives a row that opens before the turn ends, and is sent exactly once", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "command", id: "c2", command: "two" }, { kind: "answer", id: "m1", text: "both" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "refused" });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "one" }, { kind: "command", id: "c2", command: "two" }, { kind: "answer", id: "m1", text: "both" }, { kind: "complete" }], laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }], steerError: "refused" });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const result1 = await b.exec(first.toolCall!);
 			const second = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result1), userMessage("later")]); // steer refused; this call ends on row c2
@@ -903,6 +972,316 @@ describe("rbf-codex", () => {
 		});
 	});
 
+	describe("interruption recovery", () => {
+		const nativeUser = (text = "STOPPED") => ({ id: "user-1", type: "userMessage", content: [{ type: "text", text, text_elements: [] }] });
+		const interrupted = (id = "interrupted-1", items: unknown[] = [nativeUser()]) => ({ id, status: "interrupted", items });
+		const compact = (id = "compact-1") => ({ id, status: "completed", items: [{ id: `item-${id}`, type: "contextCompaction" }] });
+		const own = (status?: string): Entry[] => [
+			{ type: "custom", customType: ENTRY_TYPE, data: { threadId: "fixture-thread", cwd: process.cwd(), sessionId: "session-A" } },
+			...(status ? [{ type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "fixture-thread", turnId: "interrupted-1", status } }] : []),
+		];
+		function assertDispatch(b: Awaited<ReturnType<typeof boot>>, accepted: boolean) {
+			const starts = sent().filter((m) => m.method === "turn/start");
+			expect(starts).toHaveLength(accepted ? 1 : 0);
+			if (accepted) expect(starts[0].params).toMatchObject({ threadId: "fixture-thread", input: [{ type: "text", text: "NEW_ONLY", text_elements: [] }] });
+			expect(methods()).not.toContain("thread/start");
+			expect(methods()).not.toContain("thread/fork");
+			expect(b.entries.filter((e) => e.customType === ENTRY_TYPE)).toHaveLength(0);
+		}
+
+		it.each([undefined, "interrupted"])("first interruption with local entry %s continues exactly once on own T", async (status) => {
+			scenario({ turnsList: [interrupted()] });
+			const b = await boot({ branch: own(status) });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+		});
+
+		async function undrainedCommand(extra: FakeScenario = {}) {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "hang" }], laterTurns: [{ kind: "answer", id: "new", text: "FAKE_OK" }, { kind: "complete" }], ...extra });
+			const b = await boot({ persistAppends: true });
+			const first = await b.turn("STOPPED");
+			const ac = new AbortController();
+			const execution = b.exec(first.toolCall!, { signal: ac.signal });
+			ac.abort();
+			await expect(execution).rejects.toThrow(ROW_STATUS.aborted);
+			await vi.waitFor(() => expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).not.toBe("inProgress"));
+			// Model the actual host: it never calls the provider with this aborted
+			// signal. Native completion is buffered, but no Pi turn entry exists yet.
+			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toHaveLength(0);
+			return { b, messages: [userMessage("STOPPED"), first.final!, userMessage("NEW_ONLY")] };
+		}
+
+		it.each([
+			{ name: "interrupted", safe: true, native: {} },
+			{ name: "failed", safe: false, native: { turnsList: [{ ...interrupted("turn-fake-1"), status: "failed" }] } },
+			{ name: "active", safe: false, native: { turnsList: [{ ...interrupted("turn-fake-1"), status: "inProgress" }] } },
+			{ name: "unknown", safe: false, native: { turnsList: [{ ...interrupted("turn-fake-1"), status: "future" }] } },
+			{ name: "missing items", safe: false, native: { turnsList: [{ id: "turn-fake-1", status: "interrupted" }] } },
+			{ name: "unreadable", safe: false, native: { turnsListError: "unreadable" } },
+			{ name: "metadata mismatch", safe: false, native: { resumeThreadId: "wrong" } },
+			{ name: "older completed user", safe: false, native: { turnsList: [...Array.from({ length: 6 }, (_, i) => interrupted(`cut-${i}`)), { id: "older", status: "completed", items: [nativeUser("OLDER")] }] } },
+		])("direct undrained command checks $name history before any new dispatch", async ({ safe, native }) => {
+			const { b, messages } = await undrainedCommand(native);
+			const result = await b.turn(messages);
+			if (safe) expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			const calls = sent();
+			expect(calls.filter((m) => m.method === "turn/steer")).toHaveLength(1);
+			const steer = calls.findIndex((m) => m.method === "turn/steer");
+			const resume = calls.findIndex((m, i) => i > steer && m.method === "thread/resume");
+			expect(steer).toBeGreaterThan(0); expect(resume).toBeGreaterThan(steer);
+			const starts = calls.filter((m) => m.method === "turn/start");
+			expect(starts).toHaveLength(safe ? 2 : 1);
+			if (safe) {
+				const scan = calls.findIndex((m, i) => i > resume && m.method === "thread/turns/list");
+				expect(scan).toBeGreaterThan(resume);
+				expect(calls.indexOf(starts[1])).toBeGreaterThan(scan);
+				expect(starts[1].params).toMatchObject({ threadId: "thread-fake-1", input: [{ type: "text", text: "NEW_ONLY", text_elements: [] }] });
+			}
+			expect(calls.filter((m) => m.method === "thread/start")).toHaveLength(1);
+			expect(calls.filter((m) => m.method === "thread/fork")).toHaveLength(0);
+			expect(b.entries.filter((e) => e.customType === ENTRY_TYPE)).toHaveLength(1);
+		});
+
+		it("direct undrained command with an actual failed native end refuses without U", async () => {
+			const { b, messages } = await undrainedCommand({ ignoreInterrupt: true, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "sleep", ms: 200 }, { kind: "complete", status: "failed", errorMessage: "synthetic native failure" }] });
+			expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).toBe("failed");
+			expect((await b.turn(messages)).final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect(methods()).toContain("thread/turns/list");
+		});
+
+		// Known limit, accepted for the pi-10.6 release (2026-10-05): the stale completed end is recorded on the sibling, so its prompt is sent. Drop `.fails` when fixed.
+		it.fails("direct undrained command with an actual completed native end refuses a same-thread sibling that never showed it (Q33)", async () => {
+			const { b } = await undrainedCommand({ ignoreInterrupt: true, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "sleep", ms: 200 }, { kind: "complete", status: "completed" }] });
+			expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).toBe("completed");
+			// Move to a sibling on the same thread: it keeps the binding and shows neither the stopped prompt nor its row.
+			b.branch.splice(0, b.branch.length, ...b.branch.filter((e) => e.customType === ENTRY_TYPE));
+			const result = await b.turn([userMessage("NEW_ONLY")]);
+			expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		// Known limit, accepted for the pi-10.6 release (2026-10-05): the prompt is steered into the turn being stopped and ends aborted. Drop `.fails` when fixed.
+		it.fails("a prompt sent inside the interrupt window still gets its own answer", async () => {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, interruptDelayMs: 300, turn: [{ kind: "command", id: "cut", command: "sleep 8", incomplete: true }, { kind: "hang" }], laterTurns: [{ kind: "answer", id: "new", text: "FAKE_OK" }, { kind: "complete" }] });
+			const b = await boot({ persistAppends: true });
+			const first = await b.turn("STOPPED");
+			const ac = new AbortController();
+			const execution = b.exec(first.toolCall!, { signal: ac.signal });
+			ac.abort();
+			await expect(execution).rejects.toThrow(ROW_STATUS.aborted);
+			// Guard: no wait here, so the native turn must still be running when the next prompt arrives.
+			expect(JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"))[0].status).toBe("inProgress");
+			const result = await b.turn([userMessage("STOPPED"), first.final!, userMessage("NEW_ONLY")]);
+			expect(result.text).toBe("FAKE_OK");
+			const starts = sent().filter((m) => m.method === "turn/start");
+			expect(starts).toHaveLength(2);
+			expect(starts[1].params).toMatchObject({ input: [{ type: "text", text: "NEW_ONLY", text_elements: [] }] });
+		});
+
+		it("direct undrained command cancelled during its scan sends no new turn", async () => {
+			const { b, messages } = await undrainedCommand({ turnsListDelayMs: 200 });
+			const ac = new AbortController();
+			const pending = b.turn(messages, model(), { signal: ac.signal });
+			await vi.waitFor(() => expect(methods()).toContain("thread/turns/list"));
+			ac.abort();
+			expect((await pending).final?.stopReason).toBe("aborted");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+		});
+
+		it.each(["branch", "cwd"])("direct undrained command rechecks current %s ownership", async (changed) => {
+			const { b, messages } = await undrainedCommand({ turnsList: [{ id: "older", status: "completed", items: [nativeUser("OLDER")] }] });
+			if (changed === "branch") b.branch.splice(0, b.branch.length, ...own());
+			else b.setCwd(dir);
+			const result = await b.turn(messages);
+			expect(result.final?.errorMessage).toBe(COPY[changed === "branch" ? "history-unverified" : "workspace-mismatch"]);
+			if (changed === "branch") expect(sent().filter((m) => m.method === "thread/resume").at(-1)?.params?.threadId).toBe("fixture-thread");
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+		});
+
+		it.each(["00000003", "00000008"])("sibling interrupted context on persisted leaf %s sends only new input", async (leaf) => {
+			const file = join(dir, "fixture.jsonl");
+			writeInterruptionFixture(file, process.cwd());
+			const sm = SessionManager.open(file);
+			sm.branch(leaf);
+			scenario({ turnsList: [interrupted()] });
+			const b = await boot({ sessionId: "fixture-session" });
+			(b.ctx as unknown as { sessionManager: SessionManager }).sessionManager = sm;
+			vi.mocked(b.pi.appendEntry).mockImplementation((customType, data) => { b.entries.push({ customType, data }); sm.appendCustomEntry(customType, data); });
+			const newId = sm.appendMessage(userMessage("NEW_ONLY"));
+			expect(sm.getEntry(newId)?.parentId).toBe(leaf);
+			const input = sm.buildSessionContext().messages as Context["messages"];
+			expect((await b.turn(input)).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+			const reopened = SessionManager.open(file);
+			expect(reopened.getBranch().some((e) => e.id === "00000007")).toBe(leaf === "00000008");
+			expect(reopened.getEntries()).toHaveLength(10);
+		});
+
+		it.each([false, true])("sibling completed context refuses (older page=%s)", async (older) => {
+			const user = { id: "sibling-completed-1", status: "completed", items: [nativeUser("SIBLING_ONLY")] };
+			scenario({ turnsList: [...(older ? Array.from({ length: 6 }, (_, i) => interrupted(`cut-${i}`)) : []), user] });
+			const b = await boot({ branch: own() });
+			expect((await b.turn("NEW_ONLY")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, false);
+			if (older) expect(sent().filter((m) => m.method === "thread/turns/list")).toHaveLength(2);
+		});
+
+		it("repeated interruptions and mixed partial items with compaction-only completed turns scan every page", async () => {
+			scenario({ turnsList: [...Array.from({ length: 6 }, (_, i) => interrupted(`cut-${i}`, [nativeUser(), { type: "contextCompaction" }, { type: "futureItem" }])), compact()] });
+			const b = await boot({ branch: own("interrupted") });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+			expect(sent().filter((m) => m.method === "thread/turns/list").map((m) => m.params?.limit)).toEqual([5, 20]);
+		});
+
+		it.each([
+			{ name: "failed", data: [{ ...interrupted(), status: "failed" }] },
+			{ name: "active despite Pi abort", data: [{ ...interrupted(), status: "inProgress" }] },
+			{ name: "unknown status", data: [{ ...interrupted(), status: "futureStatus" }] },
+			{ name: "missing status", data: [{ id: "cut", items: [] }] },
+			{ name: "missing items", data: [{ id: "cut", status: "interrupted" }] },
+			{ name: "null items", data: [{ ...interrupted(), items: null }] },
+			{ name: "object items", data: [{ ...interrupted(), items: {} }] },
+			{ name: "empty completed origin", data: [{ ...interrupted(), status: "completed", items: [] }] },
+			{ name: "unknown completed origin", data: [{ ...interrupted(), status: "completed", items: [{ type: "futureItem" }] }] },
+			{ name: "user after compaction", data: [{ ...compact(), items: [{ type: "contextCompaction" }, nativeUser()] }] },
+			{ name: "duplicate turn", data: [interrupted(), interrupted()] },
+			{ name: "empty id", data: [interrupted("")] },
+			{ name: "null turn", data: [null] },
+			{ name: "nonarray page", data: {} },
+		])("unsafe $name refuses without dispatch", async ({ data }) => {
+			scenario({ turnsListPages: [{ data, nextCursor: null }] });
+			const b = await boot({ branch: own("interrupted") });
+			expect((await b.turn("NEW_ONLY")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, false);
+		});
+
+		it.each([undefined, null, "", 1, {}, false])("end cursor %j preserves optional/null and rejects all other sentinels", async (nextCursor) => {
+			scenario({ turnsListPages: [{ data: [compact()], ...(nextCursor === undefined ? {} : { nextCursor }) }] });
+			const b = await boot({ branch: own() });
+			const accepted = nextCursor === undefined || nextCursor === null;
+			const result = await b.turn("NEW_ONLY");
+			if (accepted) expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, accepted);
+		});
+
+		it.each([undefined, null, "", "1"])("empty page cursor %j is empty history only at genuine end", async (nextCursor) => {
+			scenario({ turnsListPages: [{ data: [], ...(nextCursor === undefined ? {} : { nextCursor }) }] });
+			const b = await boot({ branch: own() });
+			const accepted = nextCursor === undefined || nextCursor === null;
+			const result = await b.turn("NEW_ONLY");
+			if (accepted) expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, accepted);
+		});
+
+		it.each(["mismatch", "request-error", "malformed", "loop"])("%s history refuses zero dispatch", async (control) => {
+			scenario(control === "mismatch" ? { resumeThreadId: "wrong" }
+				: control === "request-error" ? { turnsListError: "synthetic failure" }
+				: control === "malformed" ? { turnsListMalformed: true }
+				: { turnsListPages: [{ data: [interrupted("cut-1")], nextCursor: "1" }, { data: [interrupted("cut-2")], nextCursor: "1" }] });
+			const b = await boot({ branch: own() });
+			expect((await b.turn("NEW_ONLY")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			assertDispatch(b, false);
+		});
+
+		it("abort during the native no-U scan sends zero turns", async () => {
+			scenario({ turnsList: [interrupted()], turnsListDelayMs: 200 });
+			const b = await boot({ branch: own() });
+			const ac = new AbortController();
+			const result = b.turn("NEW_ONLY", model(), { signal: ac.signal });
+			await vi.waitFor(() => expect(methods()).toContain("thread/turns/list"));
+			ac.abort();
+			expect((await result).final?.stopReason).toBe("aborted");
+			assertDispatch(b, false);
+		});
+
+		it.each(["abort", "deadline"])("a final response arriving after %s cannot admit no-U history", async (boundary) => {
+			const ac = new AbortController();
+			let now = 0;
+			const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+			const request = vi.fn(async () => {
+				if (boundary === "abort") ac.abort();
+				else now = 30_000;
+				return { data: [interrupted()], nextCursor: null };
+			});
+			try {
+				expect(await verifyEmptyBranchHistory({ request } as unknown as AppServerClient, "fixture-thread", ac.signal)).toBe(false);
+				expect(request).toHaveBeenCalledTimes(1);
+			} finally { clock.mockRestore(); }
+		});
+
+		it("no-U page and elapsed budgets still fail closed", async () => {
+			let requests = 0;
+			const client = { request: async () => ({ data: [interrupted(`cut-${++requests}`)], nextCursor: `cursor-${requests}` }) } as unknown as AppServerClient;
+			expect(await verifyEmptyBranchHistory(client, "fixture-thread")).toBe(false);
+			expect(requests).toBe(100);
+			const now = vi.spyOn(Date, "now");
+			let ticks = 0;
+			now.mockImplementation(() => ticks++ < 3 ? 0 : 30_001);
+			try {
+				requests = 0;
+				expect(await verifyEmptyBranchHistory(client, "fixture-thread")).toBe(false);
+				expect(requests).toBe(1);
+			} finally { now.mockRestore(); }
+		});
+
+		it("a completed U still skips later interruptions and forks only at U for unseen completed user input", async () => {
+			const branch = [...own(), { type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "fixture-thread", turnId: "checkpoint", status: "completed" } }, { type: "custom", customType: TURN_ENTRY_TYPE, data: { threadId: "fixture-thread", turnId: "cut", status: "interrupted" } }];
+			scenario({ turnsList: [interrupted("cut"), { id: "checkpoint", status: "completed", items: [nativeUser("OLD")] }] });
+			const b = await boot({ branch });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			assertDispatch(b, true);
+			await b.shutdown();
+			scenario({ turnsList: [{ id: "unseen", status: "completed", items: [nativeUser("UNSEEN")] }, interrupted("cut"), { id: "checkpoint", status: "completed", items: [nativeUser("OLD")] }] });
+			const c = await boot({ branch });
+			expect((await c.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			expect(sent().find((m) => m.method === "thread/fork")?.params).toMatchObject({ threadId: "fixture-thread", lastTurnId: "checkpoint" });
+		});
+
+		it("interrupted is not a foreign fork anchor and manual compact without U still refuses", async () => {
+			const b = await boot({ sessionId: "foreign", branch: own("interrupted") });
+			expect((await b.turn("NEW_ONLY")).text).toBe("FAKE_OK");
+			expect(methods()).toContain("thread/start");
+			expect(methods()).not.toContain("thread/fork");
+			const c = await boot({ branch: own("interrupted") });
+			await c.submit("/compact");
+			expect(c.notify).toHaveBeenCalledWith(COMPACT_NOTICE.noThread, "warning");
+			expect(methods()).not.toContain("thread/compact/start");
+		});
+
+		it("warmed history verification scans 138 full items on every fresh request within p95 two seconds", async () => {
+			const n = Number(process.env.RBF_INTERRUPTION_BENCH_SAMPLES ?? 10);
+			expect(Number.isInteger(n) && n >= 10).toBe(true);
+			scenario({ turnsList: [interrupted("cut", Array.from({ length: 138 }, (_, i) => ({ id: `item-${i}`, type: i === 0 ? "userMessage" : "futureItem", ...(i === 0 ? { content: [] } : {}) })))] });
+			const client = await AppServerClient.start(process.cwd(), fakeCommand);
+			try {
+				await client.request("initialize", { clientInfo: { name: "pi-10.6-bench", version: "test" }, capabilities: { experimentalApi: true } });
+				client.notify("initialized", {});
+				const samples: number[] = [];
+				for (let i = 0; i <= n; i++) {
+					const start = performance.now();
+					const res = await client.request("thread/resume", { threadId: "fixture-thread", excludeTurns: true });
+					expect(res).toMatchObject({ thread: { id: "fixture-thread" } });
+					expect(await verifyEmptyBranchHistory(client, "fixture-thread")).toBe(true);
+					if (i > 0) samples.push(performance.now() - start);
+				}
+				const p95 = samples.sort((a, b) => a - b)[Math.ceil(0.95 * n) - 1];
+				expect(p95).toBeLessThanOrEqual(2000);
+				expect(methods().filter((m) => m === "thread/resume")).toHaveLength(n + 1);
+				expect(methods().filter((m) => m === "thread/turns/list")).toHaveLength(n + 1);
+				expect(methods()).not.toContain("turn/start");
+				console.log(`synthetic samples=${n} items=138 p95_ms=${p95.toFixed(2)} fresh_requests=true turn_starts=0`);
+			} finally { await client.close(); }
+		}, (Number(process.env.RBF_INTERRUPTION_BENCH_SAMPLES ?? 10) + 1) * 30_000 + 30_000);
+	});
+
 	describe("images (Scenario 11)", () => {
 		it("an image on an image-capable model travels as a data URL after the text; text-only models and the bootstrap row refuse it", async () => {
 			const b = await boot();
@@ -919,8 +1298,8 @@ describe("rbf-codex", () => {
 
 	describe("abort during a row (Scenario 12)", () => {
 		it("aborting the tool's signal sends one turn/interrupt, rejects execute with the cut-row text, and Pi's re-call with the aborted signal finishes the turn silently", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], laterTurns: [{ kind: "answer", id: "ok", text: "FAKE_OK" }, { kind: "complete" }] });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const ac = new AbortController();
 			const p = b.exec(first.toolCall!, { signal: ac.signal });
@@ -934,14 +1313,17 @@ describe("rbf-codex", () => {
 			expect(recall.events.map((e) => e.type)).toEqual(["error"]);
 			expect(sent().length).toBe(before);
 			expect(b.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
-			delete process.env.RBF_FAKE_SCENARIO;
-			await b.turn("next");
+			expect((await b.turn("next")).text).toBe("FAKE_OK");
 			expect(methods().filter((m) => m === "turn/start")).toHaveLength(2);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods()).toContain("thread/turns/list");
+			expect(sent().filter((m) => m.method === "turn/start").at(-1)?.params).toMatchObject({ threadId: "thread-fake-1", input: [{ type: "text", text: "next", text_elements: [] }] });
 		});
 
-		it("with the interrupt ignored, the child is closed after 3 s and the next prompt spawns a new one", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], ignoreInterrupt: true });
-			const b = await boot();
+		it.each(["interrupted", "inProgress"])("with the interrupt ignored, the 3 s fallback checks native %s before dispatch", async (nativeStatus) => {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }], ignoreInterrupt: true });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const ac = new AbortController();
 			const p = b.exec(first.toolCall!, { signal: ac.signal });
@@ -950,22 +1332,33 @@ describe("rbf-codex", () => {
 			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
 			const recall = await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal });
 			expect(recall.final?.stopReason).toBe("aborted");
-			delete process.env.RBF_FAKE_SCENARIO;
 			await vi.waitFor(() => expect(sent().filter((m) => m.method === "initialize")).toHaveLength(1));
-			expect((await b.turn("again")).text).toBe("FAKE_OK");
+			const history = JSON.parse(readFileSync(process.env.RBF_FAKE_HISTORY!, "utf8"));
+			expect(history[0].status).toBe("inProgress");
+			// Explicit native outcome, not the local fallback's interrupted entry.
+			history[0].status = nativeStatus;
+			writeFileSync(process.env.RBF_FAKE_HISTORY!, JSON.stringify(history));
+			scenario({ retainHistory: true });
+			const result = await b.turn("again");
+			if (nativeStatus === "interrupted") expect(result.text).toBe("FAKE_OK");
+			else expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
 			expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(nativeStatus === "interrupted" ? 2 : 1);
 		}, 15_000);
 
 		it("child death during a row ends the row as Codex stopped and the next call as codex-stopped; under the shutdown flag both end aborted", async () => {
-			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
-			const b = await boot();
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
+			const b = await boot({ persistAppends: true });
 			const first = await b.turn("go");
 			const result = await b.exec(first.toolCall!);
 			expect(result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
 			const next = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result)]);
 			expect(next.final?.errorMessage).toBe(COPY["codex-stopped"]);
-			delete process.env.RBF_FAKE_SCENARIO;
-			expect((await b.turn("again")).text).toBe("FAKE_OK"); // activeTurn was nulled; a fresh child and turn
+			scenario({ retainHistory: true });
+			expect((await b.turn("again")).final?.errorMessage).toBe(COPY["history-unverified"]);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1); // child death is not native terminal proof
 
 			scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
 			const s = await boot();
@@ -1479,8 +1872,8 @@ describe("rbf-codex", () => {
 
 	describe("cancellation and child loss", () => {
 		it("Escape sends turn/interrupt and ends aborted when Codex reports interrupted", async () => {
-			scenario({ turn: [{ kind: "hang" }] });
-			const b = await boot();
+			scenario({ retainHistory: true, turn: [{ kind: "hang" }], laterTurns: [{ kind: "answer", id: "ok", text: "FAKE_OK" }, { kind: "complete" }] });
+			const b = await boot({ persistAppends: true });
 			const ac = new AbortController();
 			const p = b.turn("hi", model(), { signal: ac.signal });
 			await vi.waitFor(() => expect(methods()).toContain("turn/start"));
@@ -1491,11 +1884,15 @@ describe("rbf-codex", () => {
 			expect(typeof interrupt.id).toBe("number"); // a request, not a notification: real Codex ignores the latter
 			expect(interrupt.params).toEqual({ threadId: "thread-fake-1", turnId: "turn-fake-1" });
 			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			expect((await b.turn("next")).text).toBe("FAKE_OK");
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "thread/turns/list")).toHaveLength(1);
 		});
 
-		it("without a completion within 3 s the child is closed and the next prompt respawns", async () => {
-			scenario({ turn: [{ kind: "hang" }], ignoreInterrupt: true });
-			const b = await boot();
+		it("without a completion within 3 s the child respawns but refuses native active history", async () => {
+			process.env.RBF_FAKE_HISTORY = join(dir, "history.json");
+			scenario({ retainHistory: true, turn: [{ kind: "hang" }], ignoreInterrupt: true });
+			const b = await boot({ persistAppends: true });
 			const ac = new AbortController();
 			const p = b.turn("hi", model(), { signal: ac.signal });
 			await vi.waitFor(() => expect(methods()).toContain("turn/start"));
@@ -1503,10 +1900,12 @@ describe("rbf-codex", () => {
 			const r = await p;
 			expect(r.final?.stopReason).toBe("aborted");
 			await vi.waitFor(() => expect(sent().filter((m) => m.method === "initialize")).toHaveLength(1));
-			delete process.env.RBF_FAKE_SCENARIO;
+			scenario({ retainHistory: true });
 			await new Promise((r) => setTimeout(r, 100));
-			expect((await b.turn("again")).text).toBe("FAKE_OK");
+			expect((await b.turn("again")).final?.errorMessage).toBe(COPY["history-unverified"]);
 			expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+			expect(methods().filter((m) => m === "thread/start")).toHaveLength(1);
+			expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
 		}, 15_000);
 
 		it("child death mid-turn ends with codex-stopped, but with the shutdown flag set it ends aborted", async () => {
@@ -1632,6 +2031,1341 @@ describe("rbf-codex", () => {
 			const empty = await boot();
 			await empty.handlers.get("model_select")!({ model: model(), previousModel: undefined }, empty.ctx);
 			expect(empty.notify).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("manual compaction (pi-10.5)", () => {
+		const T = (sessionId: string, threadId = "thread-fake-1", cwd = process.cwd()) => ({
+			type: "custom",
+			customType: ENTRY_TYPE,
+			data: { threadId, cwd, sessionId },
+		});
+		const U = (turnId: string, status = "completed", threadId = "thread-fake-1") => ({
+			type: "custom",
+			customType: TURN_ENTRY_TYPE,
+			data: { threadId, turnId, status },
+		});
+
+		describe("B1: version floor", () => {
+			it("parses valid semver and rejects invalid/outdated versions", () => {
+				expect(parseCodexVersion("codex-cli 0.157.1")).toEqual([0, 157, 1]);
+				expect(parseCodexVersion("codex 0.158.0")).toEqual([0, 158, 0]);
+				expect(parseCodexVersion("v1.0.0")).toEqual([1, 0, 0]);
+				expect(parseCodexVersion("not a version")).toBeNull();
+				expect(parseCodexVersion("codex-cli 0.154.0, 0.157.1")).toBeNull();
+				expect(parseCodexVersion("unexpected prefix codex-cli 0.157.1")).toBeNull();
+
+				expect(isSupportedCodexVersion("codex-cli 0.157.1")).toBe(true);
+				expect(isSupportedCodexVersion("codex-cli 0.158.0")).toBe(true);
+				expect(isSupportedCodexVersion("codex 1.0.0")).toBe(true);
+				expect(isSupportedCodexVersion("codex-cli 0.157.0")).toBe(false);
+				expect(isSupportedCodexVersion("codex-cli 0.154.0")).toBe(false);
+				expect(isSupportedCodexVersion("invalid")).toBe(false);
+			});
+
+			it("normal prompt rejects Codex CLI < 0.157.1 with codex-version assistant error and closes child", async () => {
+				scenario({ version: "codex-cli 0.154.0" });
+				const b = await boot();
+				const r = await b.turn("hi");
+				expect(r.final?.errorMessage).toBe(COPY["codex-version"]);
+				expect(methods()).not.toContain("initialize");
+				expect(methods()).not.toContain("thread/start");
+				expect(methods()).not.toContain("thread/resume");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("normal prompt rejects unparseable version output", async () => {
+				scenario({ version: "random unparseable text" });
+				const b = await boot();
+				const r = await b.turn("hi");
+				expect(r.final?.errorMessage).toBe(COPY["codex-version"]);
+				expect(methods()).not.toContain("thread/start");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("normal prompt accepts Codex CLI >= 0.157.1", async () => {
+				scenario({ version: "codex-cli 0.157.1" });
+				const b = await boot();
+				const r = await b.turn("hi");
+				expect(r.text).toBe("FAKE_OK");
+			});
+
+			it("manual /compact warns and retains editor text when Codex CLI < 0.157.1", async () => {
+				scenario({ version: "codex-cli 0.154.0", resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.version, "warning"));
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+		});
+
+		describe("B2: classifier and branch history", () => {
+			it("classifies completed turns with userMessage as user, compaction-only as compaction, others as unverified", () => {
+				// Q31 before-turn auto compaction
+				expect(classifyCompletedTurn([
+					{ id: "c1", type: "contextCompaction" },
+					{ id: "u1", type: "userMessage", content: [{ type: "text", text: "hi" }] },
+					{ id: "a1", type: "agentMessage", text: "answer" },
+				])).toBe("user");
+
+				// Q31 mid-turn auto compaction
+				expect(classifyCompletedTurn([
+					{ id: "u1", type: "userMessage", content: [{ type: "text", text: "hi" }] },
+					{ id: "r1", type: "reasoning" },
+					{ id: "a1", type: "agentMessage", text: "thought" },
+					{ id: "c1", type: "commandExecution" },
+					{ id: "cmp1", type: "contextCompaction" },
+					{ id: "r2", type: "reasoning" },
+					{ id: "c2", type: "commandExecution" },
+					{ id: "cmp2", type: "contextCompaction" },
+					{ id: "a2", type: "agentMessage", text: "final" },
+				])).toBe("user");
+
+				// Exclusive contextCompaction
+				expect(classifyCompletedTurn([
+					{ id: "cmp1", type: "contextCompaction" },
+				])).toBe("compaction");
+
+				// Empty, unknown, or malformed
+				expect(classifyCompletedTurn([{ id: "u1", type: "userMessage", content: "not an item array" }])).toBe("unverified");
+				expect(classifyCompletedTurn([])).toBe("unverified");
+				expect(classifyCompletedTurn(undefined)).toBe("unverified");
+				expect(classifyCompletedTurn([{ id: "x1", type: "unknownType" }])).toBe("unverified");
+				expect(classifyCompletedTurn([{ id: "u1", type: "userMessage" }])).toBe("unverified");
+			});
+
+			it("manual /compact refuses a diverged branch (Codex completed a newer user turn)", async () => {
+				scenario({
+					turnsList: [
+						{ id: "turn-2", status: "completed", items: [{ id: "u2", type: "userMessage", content: [{ type: "text", text: "newer" }] }] },
+						{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [{ type: "text", text: "older" }] }] },
+					],
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unverified, "warning"));
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("does not fork on a newer user turn until the recorded U is actually verified", async () => {
+				scenario({ turnsList: [
+					{ id: "turn-2", status: "completed", items: [{ id: "u2", type: "userMessage", content: [] }] },
+					{ id: "turn-1", status: "completed", items: [{ id: "unknown", type: "other" }] },
+				] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("thread/fork");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("refuses an ambiguous turn even when a newer user turn was seen first", async () => {
+				scenario({ turnsList: [
+					{ id: "turn-3", status: "completed", items: [{ id: "u3", type: "userMessage", content: [] }] },
+					{ id: "turn-2", status: "completed", items: [] },
+					{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] },
+				] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("thread/fork");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("rejects malformed history for an own thread without U rather than treating it as empty", async () => {
+				scenario({ turnsListMalformed: true });
+				const b = await boot({ sessionId: "A", branch: [T("A")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("rejects a mismatched thread/resume response before trusting its history", async () => {
+				scenario({ resumeThreadId: "another-thread", resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("do not send this");
+				expect(result.final?.errorMessage).toBe(COPY["history-unverified"]);
+				expect(methods()).not.toContain("thread/turns/list");
+				expect(methods()).not.toContain("turn/start");
+			});
+
+			it("manual /compact succeeds when newer turn is exclusively contextCompaction", async () => {
+				scenario({
+					turnsList: [
+						{ id: "turn-cmp", status: "completed", items: [{ id: "cmp1", type: "contextCompaction" }] },
+						{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [{ type: "text", text: "first" }] }] },
+					],
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				expect(b.editor.getText()).toBe("");
+				expect(methods()).toContain("thread/compact/start");
+			});
+
+			it("paginates full-item history 5 then 20 past six internal compact turns and retains the thread", async () => {
+				const compactions = Array.from({ length: 6 }, (_, i) => ({
+					id: `turn-compact-${i}`,
+					status: "completed",
+					items: [{ id: `compact-${i}`, type: "contextCompaction" }],
+				}));
+				scenario({ turnsList: [...compactions, { id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				const pages = sent().filter((m) => m.method === "thread/turns/list");
+				expect(pages.map((m) => m.params)).toMatchObject([
+					{ threadId: "thread-fake-1", sortDirection: "desc", itemsView: "full", limit: 5 },
+					{ threadId: "thread-fake-1", sortDirection: "desc", itemsView: "full", limit: 20, cursor: "turn-compact-4" },
+				]);
+				const result = await b.turn("after compact");
+				expect(result.text).toBe("FAKE_OK");
+				expect(methods()).not.toContain("thread/fork");
+			});
+
+			it.each(["before", "mid-turn"])("an unseen user turn with %s automatic compaction forks an ordinary prompt", async (order) => {
+				const user = { id: "u2", type: "userMessage", content: [{ type: "text", text: "newer" }] };
+				const compact = { id: "cmp2", type: "contextCompaction" };
+				scenario({ turnsList: [
+					{ id: "turn-2", status: "completed", items: order === "before" ? [compact, user, { id: "extra", type: "unknownType" }] : [user, { id: "r", type: "reasoning" }, compact] },
+					{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] },
+				] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const result = await b.turn("on my branch");
+				expect(result.text).toBe("FAKE_OK");
+				expect(sent().find((m) => m.method === "thread/fork")?.params).toMatchObject({ threadId: "thread-fake-1", lastTurnId: "turn-1" });
+				expect(sent().find((m) => m.method === "turn/start")?.params).toMatchObject({ threadId: "thread-fake-fork-1" });
+			});
+
+			it("manual /compact refuses both observed orders of a newer completed user turn", async () => {
+				for (const items of [
+					[{ id: "cmp", type: "contextCompaction" }, { id: "u2", type: "userMessage", content: [] }],
+					[{ id: "u2", type: "userMessage", content: [] }, { id: "cmp", type: "contextCompaction" }],
+				]) {
+					scenario({ turnsList: [
+						{ id: "turn-2", status: "completed", items },
+						{ id: "turn-1", status: "completed", items: [{ id: "u1", type: "userMessage", content: [] }] },
+					] });
+					const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+					await b.submit("/compact");
+					await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unverified, "warning"));
+					expect(methods()).not.toContain("thread/compact/start");
+				}
+			});
+
+			it("manual /compact refuses when branch has no thread entry", async () => {
+				const b = await boot({ branch: [] });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.noThread, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("manual /compact refuses on foreign thread", async () => {
+				const b = await boot({ sessionId: "B", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.foreignBranch, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("manual /compact refuses when own thread has no completed turn entry", async () => {
+				const b = await boot({ sessionId: "A", branch: [T("A")] });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.noThread, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+		});
+
+		it("B2: cyclic cursors fail closed for recorded and empty branches without retrying forever", async () => {
+			for (const verify of [
+				(client: Parameters<typeof verifyBranchHistory>[0]) => verifyBranchHistory(client, "thread-1", "recorded-U"),
+				(client: Parameters<typeof verifyEmptyBranchHistory>[0]) => verifyEmptyBranchHistory(client, "thread-1"),
+			]) {
+				const requests: { cursor?: string; limit: number }[] = [];
+				const client = { request: async (_method: string, params: { cursor?: string; limit: number }) => {
+					requests.push(params);
+					return {
+						data: [{ id: `turn-${requests.length}`, status: "completed", items: [{ id: "cmp", type: "contextCompaction" }] }],
+						nextCursor: "repeated-cursor",
+					};
+				} } as unknown as Parameters<typeof verifyBranchHistory>[0];
+				const result = await verify(client);
+				expect(result === false || (typeof result === "object" && result.ok === false)).toBe(true);
+				expect(requests).toHaveLength(2);
+				expect(requests.map((r) => r.limit)).toEqual([5, 20]);
+			}
+		});
+
+		it("B2: refuses malformed, duplicate, missing-U, and unknown-only full-item pages", async () => {
+			const user = { id: "u1", type: "userMessage", content: [] };
+			for (const data of [
+				[{ id: "turn-1", status: "completed", items: [] }],
+				[{ id: "turn-1", status: "completed", items: [{ id: "x", type: "unknown" }] }],
+				[{ id: "turn-1", status: "failed", items: [user] }],
+				[{ id: "turn-other", status: "completed", items: [user] }],
+				[{ id: "duplicate", status: "completed", items: [{ type: "contextCompaction" }] }, { id: "duplicate", status: "completed", items: [user] }],
+			]) {
+				const client = { request: async () => ({ data, nextCursor: null }) } as unknown as Parameters<typeof verifyBranchHistory>[0];
+				expect(await verifyBranchHistory(client, "thread-1", "turn-1")).toEqual({ ok: false, diverged: false });
+			}
+		});
+
+		it("B2: history timeout refuses before requesting a second page", async () => {
+			const now = vi.spyOn(Date, "now");
+			let tick = 0;
+			now.mockImplementation(() => (tick++ < 3 ? 0 : 30_001));
+			try {
+				const requests: unknown[] = [];
+				const client = { request: async (_method: string, params: unknown) => {
+					requests.push(params);
+					return { data: [{ id: "only-compaction", status: "completed", items: [{ type: "contextCompaction" }] }], nextCursor: "more" };
+				} } as unknown as Parameters<typeof verifyBranchHistory>[0];
+				expect(await verifyBranchHistory(client, "thread-1", "recorded-U")).toEqual({ ok: false, diverged: false });
+				expect(requests).toHaveLength(1);
+			} finally {
+				now.mockRestore();
+			}
+		});
+
+		it("B2: a newly forked thread with no recorded U accepts only empty or compaction-only full history", async () => {
+			for (const [data, accepted] of [
+				[[], true],
+				[[{ id: "compact", status: "completed", items: [{ id: "c", type: "contextCompaction" }] }], true],
+				[[{ id: "inherited", status: "completed", items: [{ id: "u", type: "userMessage", content: [] }] }], false],
+				[[{ id: "ambiguous", status: "completed", items: [{ id: "x", type: "futureItem" }] }], false],
+				[[{ id: "unfinished", status: "inProgress", items: [{ id: "c", type: "contextCompaction" }] }], false],
+			] as const) {
+				const client = { request: async () => ({ data, nextCursor: null }) } as unknown as Parameters<typeof verifyEmptyBranchHistory>[0];
+				expect(await verifyEmptyBranchHistory(client, "forked-thread")).toBe(accepted);
+			}
+		});
+
+		it("B2: the 100-page history budget fails closed before reaching an unverified old turn", async () => {
+			let requests = 0;
+			const client = { request: async () => {
+				requests++;
+				return {
+					data: [{ id: `turn-${requests}`, status: "completed", items: [{ id: `cmp-${requests}`, type: "contextCompaction" }] }],
+					nextCursor: `cursor-${requests}`,
+				};
+			} } as unknown as Parameters<typeof verifyBranchHistory>[0];
+			expect(await verifyBranchHistory(client, "thread-1", "recorded-U")).toEqual({ ok: false, diverged: false });
+			expect(requests).toBe(100);
+		});
+
+		describe("B3: lifecycle match", () => {
+			it("synchronous {} acknowledgement is not completion; waits for matching contextCompaction item and turn/completed", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "completed", includeItem: true, itemStatus: "completed" },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				expect(b.editor.getText()).toBe("");
+			});
+
+			it("safe failure: synchronous rejection reports refused safe reason", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactStartError: "thread not eligible for compaction",
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.refused), "error")
+				);
+			});
+
+			it("safe failure: failed turn reports failed safe reason without raw error interpolation", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "failed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.failed), "error")
+				);
+			});
+
+			it("safe failure: interrupted turn reports interrupted safe reason", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "interrupted", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.interrupted), "error")
+				);
+			});
+
+			it("does not accept a contextCompaction item belonging to another turn", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "completed", includeItem: true, itemTurnId: "other-turn" },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknown, "warning"));
+				expect(b.notify).not.toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info");
+			});
+
+			it("unknown outcome: completed turn arrives without matching compaction item", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactTurn: { status: "completed", includeItem: false },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknown, "warning")
+				);
+			});
+		});
+
+		describe("B4: waiting prompt", () => {
+			it("normal prompt awaits in-flight compaction before bindThread and turn/start", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "completed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				// Normal prompt enters while compaction is running
+				const turnPromise = b.turn("followup message");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				const res = await turnPromise;
+				expect(res.text).toBe("FAKE_OK");
+				// Verify compact/start was called before the turn's turn/start
+				const m = methods();
+				const compactIdx = m.indexOf("thread/compact/start");
+				const turnIdx = m.indexOf("turn/start");
+				expect(compactIdx).toBeGreaterThanOrEqual(0);
+				expect(turnIdx).toBeGreaterThan(compactIdx);
+			});
+
+			it("a waiting prompt continues after synchronous compaction refusal without a second compact request", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], compactStartError: "not eligible" });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				const result = await b.turn("after refusal");
+				expect(result.text).toBe("FAKE_OK");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.refused), "error");
+				expect(methods().filter((m) => m === "thread/compact/start")).toHaveLength(1);
+				expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			});
+
+			it("timeout closes the compacting child before releasing the same waiting prompt onto a fresh child", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], compactHang: true });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")], compactTimeoutMs: 80 });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(methods()).toContain("thread/compact/start"));
+				const result = await b.turn("after unknown outcome");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknown, "warning");
+				expect(result.text).toBe("FAKE_OK");
+				expect(methods().filter((m) => m === "initialize")).toHaveLength(2);
+				expect(methods().filter((m) => m === "thread/compact/start")).toHaveLength(1);
+				expect(methods().filter((m) => m === "turn/start")).toHaveLength(1);
+			});
+
+			it("Escape on waiting prompt aborts only the prompt without cancelling compaction", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 80,
+					compactTurn: { status: "completed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				const ac = new AbortController();
+				const turnPromise = b.turn("will be aborted", model(), { signal: ac.signal });
+				await new Promise((r) => setTimeout(r, 20));
+				ac.abort();
+				const turnRes = await turnPromise;
+				expect(turnRes.final?.stopReason).toBe("aborted");
+				// Compaction still completes successfully
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+			});
+		});
+
+		describe("B5: editor intercept and state", () => {
+			it("intercepts /compact on codex-harness without calling original submitValue", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				const originalSubmit = vi.fn();
+				b.editor.onSubmit = originalSubmit;
+				await b.submit("/compact");
+				expect(originalSubmit).not.toHaveBeenCalled();
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+			});
+
+			it("passes /compact through to original submitValue for non-Codex models", async () => {
+				const nonCodex = { ...model("claude-3"), provider: "anthropic" };
+				const b = await boot({ model: nonCodex });
+				const originalSubmit = vi.fn();
+				b.editor.onSubmit = originalSubmit;
+				await b.submit("/compact");
+				expect(originalSubmit).toHaveBeenCalledWith("/compact");
+			});
+
+			it("passes non-compact input through to original submitValue", async () => {
+				const b = await boot();
+				const originalSubmit = vi.fn();
+				b.editor.onSubmit = originalSubmit;
+				await b.submit("Hello world");
+				expect(originalSubmit).toHaveBeenCalledWith("Hello world");
+			});
+
+			it("/compact with instructions warns and keeps editor text untouched", async () => {
+				const b = await boot();
+				await b.submit("/compact keep the system instructions");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.instructions, "warning");
+				expect(b.editor.getText()).toBe("/compact keep the system instructions");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("busy check warns and retains editor text when isIdle is false", async () => {
+				const b = await boot({ isIdle: () => false });
+				await b.submit("/compact");
+				expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.busy, "warning");
+				expect(b.editor.getText()).toBe("/compact");
+			});
+
+			it("draft modified during checking aborts dispatch and warns changedDraft", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				b.editor.setText("/compact");
+				// Start submit, and immediately modify editor text before async check finishes
+				const p = (b.editor as any).submitValue();
+				b.editor.setText("/compact wait I changed my mind");
+				await p;
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.changedDraft, "warning"));
+				expect(b.editor.getText()).toBe("/compact wait I changed my mind");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it.each(["leaf", "model", "cwd", "turn"])('last-moment %s change during the branch check refuses before dispatch', async (changed) => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], turnsListDelayMs: 80 });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(methods()).toContain("thread/turns/list"));
+				if (changed === "leaf") b.setLeafId("other-leaf");
+				if (changed === "model") b.ctx.model = model("another-codex-model");
+				if (changed === "cwd") b.setCwd(homedir());
+				if (changed === "turn") b.branch.push(U("turn-2"));
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.movedOrChanged, "warning"));
+				expect(b.editor.getText()).toBe("/compact");
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("reload and shutdown safety: prototype dispatcher rebinding and cleanup", async () => {
+				const b1 = await boot();
+				const disp1 = (Editor as any)[COMPACT_DISPATCHER_KEY];
+				expect(disp1).toBeDefined();
+
+				const b2 = await boot();
+				const disp2 = (Editor as any)[COMPACT_DISPATCHER_KEY];
+				expect(disp2).toBeDefined();
+				expect(disp2).not.toBe(disp1);
+
+				// Shutting down b1 does NOT remove b2's dispatcher
+				await b1.shutdown();
+				expect((Editor as any)[COMPACT_DISPATCHER_KEY]).toBe(disp2);
+
+				// Shutting down b2 removes its own dispatcher
+				await b2.shutdown();
+				expect((Editor as any)[COMPACT_DISPATCHER_KEY]).toBeUndefined();
+			});
+		});
+
+		describe("B6: navigation guard", () => {
+			it("session_tree during checking cancels check and defers movedOrChanged warning", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				b.editor.setText("/compact");
+				(b.editor as any).submitValue();
+				// Trigger session_tree while checking is in flight
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.movedOrChanged, "warning"));
+				expect(methods()).not.toContain("thread/compact/start");
+			});
+
+			it("session_tree during running latches navigation, does not cancel, and reports completeNavigated", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "completed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+
+				// Fire session_tree while compact is running
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatusNavigated, "info"));
+
+				// Upon completion, emits completeNavigated warning instead of completeStatus info
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeNavigated, "warning"));
+				expect(methods()).toContain("thread/compact/start");
+			});
+
+			it("terminal success immediately before session_tree is re-announced after redraw with its branch named", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeNavigated, "warning"));
+			});
+
+			it("a later prompt clears the terminal replay so unrelated navigation gets no stale compact notice", async () => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }] });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus, "info"));
+				await b.turn("followup");
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await new Promise((r) => setTimeout(r, 80));
+				expect(b.notify).not.toHaveBeenCalledWith(COMPACT_NOTICE.completeNavigated, "warning");
+			});
+
+			it.each([
+				{ status: "failed" as const, expected: COMPACT_NOTICE.failedNavigated(COMPACT_SAFE_REASONS.failed), type: "error" as const },
+				{ status: "completed" as const, expected: COMPACT_NOTICE.unknownNavigated, type: "warning" as const },
+			])("terminal $status immediately before navigation replays its branch-qualified outcome", async ({ status, expected, type }) => {
+				scenario({ resumeTurns: [{ id: "turn-1", status: "completed" }], compactTurn: { status, includeItem: status === "failed" } });
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(status === "failed" ? COMPACT_NOTICE.failed(COMPACT_SAFE_REASONS.failed) : COMPACT_NOTICE.unknown, type));
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(expected, type));
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+				await new Promise((r) => setTimeout(r, 80));
+				expect(b.notify.mock.calls.filter(([text]) => text === expected)).toHaveLength(1);
+			});
+
+			it("session_tree during running with failed compaction reports failedNavigated", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "failed", includeItem: true },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(
+						COMPACT_NOTICE.failedNavigated(COMPACT_SAFE_REASONS.failed),
+						"error"
+					)
+				);
+			});
+
+			it("session_tree during running with unknown outcome reports unknownNavigated", async () => {
+				scenario({
+					resumeTurns: [{ id: "turn-1", status: "completed" }],
+					compactDelayMs: 60,
+					compactTurn: { status: "completed", includeItem: false },
+				});
+				const b = await boot({ sessionId: "A", branch: [T("A"), U("turn-1")] });
+				await b.submit("/compact");
+				await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.runningStatus, "info"));
+
+				await b.handlers.get("session_tree")!({ type: "session_tree" }, b.ctx);
+
+				await vi.waitFor(() =>
+					expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.unknownNavigated, "warning")
+				);
+			});
+		});
+	});
+
+	describe("pi-10.7 thinking levels and effort dispatch", () => {
+		const cachedWithoutOff = {
+			models: [
+				{
+					...model("gpt-stored-no-off", {
+						minimal: null,
+						low: "low",
+						medium: "medium",
+						high: "high",
+						xhigh: null,
+						max: null,
+					}),
+					name: "GPT Stored No Off (Codex agent)",
+				},
+			],
+			checkedAt: Date.now(),
+		};
+
+		it("Sources: bootstrap, live catalog, and restored cached model without off all have seven keys with off: null and minimal: null", async () => {
+			const b = await boot();
+			// Source 1: the bootstrap model from the registered provider
+			const bootstrap = b.provider.config.models![0];
+			expect(bootstrap.id).toBe(BOOTSTRAP_MODEL_ID);
+
+			// Source 2: a model built from the live catalog via refreshModels
+			const liveCtx = refreshCtx({ allowNetwork: true, force: true });
+			const liveCatalog = await b.provider.config.refreshModels!(liveCtx.ctx);
+			const liveModel = liveCatalog.find((m) => m.id === "gpt-fake-2")!;
+			expect(liveModel).toBeDefined();
+
+			// Source 3: a model restored from a stored cache entry whose map has NO off key
+			const storedCtx = refreshCtx({ allowNetwork: false, stored: cachedWithoutOff });
+			const storedList = await b.provider.config.refreshModels!(storedCtx.ctx);
+			const restoredModel = storedList.find((m) => m.id === "gpt-stored-no-off")!;
+			expect(restoredModel).toBeDefined();
+
+			const expectedKeys = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+			for (const m of [bootstrap, liveModel, restoredModel]) {
+				expect(Object.keys(m.thinkingLevelMap!)).toEqual(expectedKeys);
+				expect(m.thinkingLevelMap!.off).toBeNull();
+				expect(m.thinkingLevelMap!.minimal).toBeNull();
+			}
+
+			expect(bootstrap.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: "max",
+			});
+			expect(liveModel.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: null,
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: "max",
+			});
+			expect(restoredModel.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: null,
+				max: null,
+			});
+		});
+
+		it("Pi's real rule: getSupportedThinkingLevels excludes off and minimal, and clampThinkingLevel clamps appropriately", async () => {
+			const b = await boot();
+			const bootstrap = b.provider.config.models![0] as Model<any>;
+
+			const liveCtx = refreshCtx({ allowNetwork: true, force: true });
+			const liveCatalog = await b.provider.config.refreshModels!(liveCtx.ctx);
+			const liveModel = liveCatalog.find((m) => m.id === "gpt-fake-2")! as Model<any>;
+
+			const storedCtx = refreshCtx({ allowNetwork: false, stored: cachedWithoutOff });
+			const storedList = await b.provider.config.refreshModels!(storedCtx.ctx);
+			const restoredModel = storedList.find((m) => m.id === "gpt-stored-no-off")! as Model<any>;
+
+			for (const m of [bootstrap, liveModel, restoredModel]) {
+				const supported = getSupportedThinkingLevels(m);
+				expect(supported).not.toContain("off");
+				expect(supported).not.toContain("minimal");
+			}
+
+			expect(clampThinkingLevel(bootstrap, "off")).toBe("low");
+			expect(clampThinkingLevel(bootstrap, "minimal")).toBe("low");
+
+			const medHighModel = toProviderModel(codexModel("gpt-med-high", ["medium", "high"])) as Model<any>;
+			expect(getSupportedThinkingLevels(medHighModel)).toEqual(["medium", "high"]);
+			expect(clampThinkingLevel(medHighModel, "off")).toBe("medium");
+			expect(clampThinkingLevel(medHighModel, "minimal")).toBe("medium");
+		});
+
+		it("Effort always sent: one turn at each of low, medium, high, xhigh, max records exactly one turn/start whose effort equals that level", async () => {
+			const b = await boot();
+			const levels = ["low", "medium", "high", "xhigh", "max"] as const;
+			for (let i = 0; i < levels.length; i++) {
+				const lvl = levels[i];
+				const r = await b.turn(`turn at ${lvl}`, BOOTSTRAP_MODEL as Model<any>, { reasoning: lvl });
+				expect(r.text).toBe("FAKE_OK");
+				const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+				expect(starts).toHaveLength(i + 1);
+				expect(starts[i].effort).toBe(lvl);
+			}
+		});
+
+		it("No level passed but Pi displays high -> one turn/start with effort: high", async () => {
+			const b = await boot({ thinkingLevel: "high" });
+			const r = await b.turn("no level passed");
+			expect(r.text).toBe("FAKE_OK");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+			expect(starts).toHaveLength(1);
+			expect(starts[0].effort).toBe("high");
+		});
+
+		it("Refusal, displayed off: errors with new sentence, zero thread/turn requests, no branch entries, no child spawn, and subsequent call starts normally", async () => {
+			const b = await boot({ thinkingLevel: "off" });
+			const r = await b.turn("prompt while displayed thinking is off");
+			expect(r.final?.stopReason).toBe("error");
+			expect(r.final?.errorMessage).toBe(COPY["unsupported-thinking-level"]);
+			expect(r.final?.errorMessage).toBe("This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.");
+
+			const threadOrTurnRequests = sent().filter((m) => m.method?.startsWith("thread/") || m.method?.startsWith("turn/"));
+			expect(threadOrTurnRequests).toHaveLength(0);
+
+			expect(b.entries.filter((e) => e.customType === ENTRY_TYPE || e.customType === TURN_ENTRY_TYPE)).toHaveLength(0);
+
+			expect(sent().filter((m) => m.method === "initialize")).toHaveLength(0);
+
+			const r2 = await b.turn("following valid turn", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			expect(r2.text).toBe("FAKE_OK");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+			expect(starts).toHaveLength(1);
+			expect(starts[0].effort).toBe("low");
+		});
+
+		it("Refusal, unmapped level: reasoning: xhigh on model with xhigh: null errors with same sentence and zero thread/turn requests", async () => {
+			const b = await boot();
+			const m = toProviderModel(codexModel("gpt-no-xhigh", ["low", "medium", "high"])) as Model<any>;
+			expect(m.thinkingLevelMap?.xhigh).toBeNull();
+
+			const r = await b.turn("unmapped level turn", m, { reasoning: "xhigh" });
+			expect(r.final?.stopReason).toBe("error");
+			expect(r.final?.errorMessage).toBe(COPY["unsupported-thinking-level"]);
+			expect(r.final?.errorMessage).toBe("This thinking level is not available for this Codex model. Your message was not sent. Choose a level with /thinking, then send again.");
+
+			const threadOrTurnRequests = sent().filter((m) => m.method?.startsWith("thread/") || m.method?.startsWith("turn/"));
+			expect(threadOrTurnRequests).toHaveLength(0);
+		});
+
+		it("Not refused: tool-result continuation and aborted-tool re-call both proceed when displayed thinking is off", async () => {
+			// Continuation path A: tool-result continuation of a running turn
+			scenario({ turn: [{ kind: "command", id: "c1", command: "pwd", output: ["/tmp\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+			const b1 = await boot();
+			const first = await b1.turn("go", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			expect(first.toolCall?.name).toBe(TOOL_COMMAND);
+			const result = await b1.exec(first.toolCall!);
+			vi.mocked(b1.pi.getThinkingLevel).mockReturnValue("off");
+			const next = await b1.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result)], BOOTSTRAP_MODEL as Model<any>);
+			expect(next.final?.stopReason).toBe("stop");
+			expect(next.text).toBe("done");
+
+			// Continuation path B: Pi's re-call after an aborted tool
+			scenario({ retainHistory: true, turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "hang" }] });
+			const b2 = await boot({ persistAppends: true });
+			const f = await b2.turn("go", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			const ac = new AbortController();
+			const p = b2.exec(f.toolCall!, { signal: ac.signal });
+			await sleep(50);
+			ac.abort();
+			await expect(p).rejects.toThrow(ROW_STATUS.aborted);
+			vi.mocked(b2.pi.getThinkingLevel).mockReturnValue("off");
+			const recall = await b2.turn([userMessage("go"), f.final!], BOOTSTRAP_MODEL as Model<any>, { signal: ac.signal });
+			expect(recall.final?.stopReason).toBe("aborted");
+			expect(recall.events.map((e) => e.type)).toEqual(["error"]);
+			expect(b2.entries.filter((e) => e.customType === TURN_ENTRY_TYPE)).toEqual([{ customType: TURN_ENTRY_TYPE, data: { threadId: "thread-fake-1", turnId: "turn-fake-1", status: "interrupted" } }]);
+		});
+
+		it("A refused steer that becomes its own turn carries effort", async () => {
+			scenario({
+				retainHistory: true,
+				turn: [{ kind: "command", id: "c1", command: "sleep 1" }, { kind: "answer", id: "m1", text: "woke" }, { kind: "complete" }],
+				laterTurns: [{ kind: "answer", id: "m2", text: "took the steer" }, { kind: "complete" }],
+				steerError: "turn already ended",
+			});
+			const b = await boot({ persistAppends: true, thinkingLevel: "high" });
+			const first = await b.turn("go", BOOTSTRAP_MODEL as Model<any>, { reasoning: "low" });
+			const result = await b.exec(first.toolCall!);
+			const steer = userMessage("steer now");
+			const r = await b.turn([userMessage("go"), first.final!, toolResultMessage(first.toolCall!, result), steer], BOOTSTRAP_MODEL as Model<any>);
+			expect(r.final?.stopReason).toBe("stop");
+			expect(r.text).toBe("woketook the steer");
+			const starts = sent().filter((m) => m.method === "turn/start").map((m) => m.params as Record<string, unknown>);
+			expect(starts).toHaveLength(2);
+			expect(starts[0].effort).toBe("low");
+			expect(starts[1].effort).toBe("high");
+		});
+	});
+
+	describe("shell display observer (pi-42)", () => {
+		type Message = Record<string, any>;
+		type Bus = { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
+		const SAME = "/bin/zsh -lc 'echo same'";
+		const SLEEP = "/bin/zsh -lc '/bin/sleep 30'";
+
+		/** A bus with no safety net, unlike Pi's: a subscriber's throw goes straight back into `emit`. */
+		function rawBus(): Bus {
+			const handlers = new Set<(data: unknown) => void>();
+			return {
+				emit: (_channel, data) => {
+					for (const handler of [...handlers]) handler(data);
+				},
+				on: (_channel, handler) => {
+					handlers.add(handler);
+					return () => handlers.delete(handler);
+				},
+			};
+		}
+
+		/** `boot` on a Pi with an event bus, with every display message recorded from before the owner loads. */
+		async function watched(opts: Parameters<typeof boot>[0] = {}) {
+			const events: Bus = (opts.events as Bus | undefined) ?? createEventBus();
+			const seen: Message[] = [];
+			events.on(SHELL_DISPLAY_CHANNEL, (message) => seen.push(message as Message));
+			const options = { ...opts, events };
+			const b = await boot(options);
+			const facts = (id?: string) => seen.filter((message) => message?.kind === "fact" && (!id || message.toolCallId === id));
+			const told = (id: string) => facts(id).map((message) => message.fact);
+			/** The identity every fact of one command carries: the session and generation announced, never a display argument. */
+			const identity = (toolCallId: string) => ({ kind: "fact", sessionId: "session-A", source: "codex-command", ownerGeneration: seen.find((message) => message.kind === "announce")!.ownerGeneration, toolCallId });
+			/** Pi's loop for one prompt: every row the turn opens is executed, until a call ends without one. */
+			const drive = async (text: string, signal?: AbortSignal) => {
+				let messages: Context["messages"] = [userMessage(text)];
+				const results: any[] = [];
+				for (;;) {
+					const step = await b.turn(messages, model(), { signal });
+					if (!step.toolCall) return { results, last: step };
+					const result = await b.exec(step.toolCall, { signal });
+					results.push(result);
+					messages = [...messages, step.final!, toolResultMessage(step.toolCall, result)];
+				}
+			};
+			return { ...b, events, seen, facts, told, identity, drive, options };
+		}
+
+		/** Start the turn's first row, then cut it with Pi's abort as Escape does: once `ready` holds, or after a moment. */
+		async function cutFirstRow(b: Awaited<ReturnType<typeof watched>>, text = "wait", ready?: () => void) {
+			const first = await b.turn(text);
+			const ac = new AbortController();
+			const row = b.exec(first.toolCall!, { signal: ac.signal });
+			if (ready) await vi.waitFor(ready);
+			else await sleep(50);
+			ac.abort();
+			const error = await row.then(() => undefined, (e) => e as Error);
+			await b.turn([userMessage(text), first.final!], model(), { signal: ac.signal });
+			return { first, error };
+		}
+
+		describe("announcement and snapshot", () => {
+			it("announces on session_start with the command tool's own functions", async () => {
+				const b = await watched();
+				const tool = b.tools.get(TOOL_COMMAND)!;
+				expect(SHELL_DISPLAY_CHANNEL).toBe("rbf:shell-display:v1");
+				expect(b.seen).toEqual([{ kind: "announce", sessionId: "session-A", source: "codex-command", toolName: TOOL_COMMAND, ownerGeneration: expect.stringMatching(/^codex-command:.{8,}$/), execute: tool.execute, renderCall: tool.renderCall, renderResult: tool.renderResult }]);
+				expect(b.seen[0]!.execute).toBe(tool.execute);
+				expect(b.seen[0]!.renderCall).toBe(tool.renderCall);
+				expect(b.seen[0]!.renderResult).toBe(tool.renderResult);
+			});
+
+			it("a view that attaches after the owner asks and gets the announce, then every retained fact in order; another session's request gets nothing", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SAME, output: ["same\n"] }, { kind: "command", id: "c2", command: SAME, exitCode: 3 }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+				const events = createEventBus();
+				const b = await boot({ events });
+				let messages: Context["messages"] = [userMessage("go")];
+				for (;;) {
+					const step = await b.turn(messages);
+					if (!step.toolCall) break;
+					messages = [...messages, step.final!, toolResultMessage(step.toolCall, await b.exec(step.toolCall))];
+				}
+				const late: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => late.push(message as Message));
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-B" });
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "something-new" });
+				expect(late.map((m) => m.kind)).toEqual(["snapshot-request", "something-new"]);
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+				const answers = late.slice(2).filter((m) => m.kind !== "snapshot-request");
+				expect(answers.map((m) => [m.kind, m.toolCallId, m.revision, m.fact?.kind])).toEqual([
+					["announce", undefined, undefined, undefined],
+					["fact", "codex-c1", 1, "start"],
+					["fact", "codex-c1", 2, "completion"],
+					["fact", "codex-c2", 1, "start"],
+					["fact", "codex-c2", 2, "completion"],
+				]);
+				expect(answers[0]).toMatchObject({ sessionId: "session-A", source: "codex-command", toolName: TOOL_COMMAND, execute: b.tools.get(TOOL_COMMAND)!.execute });
+				for (const fact of answers.slice(1)) expect(fact).toMatchObject({ sessionId: "session-A", source: "codex-command", ownerGeneration: answers[0]!.ownerGeneration });
+			});
+
+			it("shutdown closes the client, says its open command is lost, withdraws, and answers nothing afterwards", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }] });
+				const b = await watched();
+				await cutFirstRow(b);
+				await b.shutdown();
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }, { kind: "lost" }]);
+				const generation = b.seen[0]!.ownerGeneration;
+				expect(b.seen.at(-1)).toEqual({ kind: "withdraw", sessionId: "session-A", source: "codex-command", ownerGeneration: generation });
+				b.events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+				expect(b.seen.at(-1)).toEqual({ kind: "snapshot-request", sessionId: "session-A" });
+			});
+
+			it("a client closed without a shutdown loses its open commands and withdraws nothing", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }] });
+				const b = await watched();
+				await cutFirstRow(b);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }]);
+				await b.handlers.get("session_before_switch")!({ type: "session_before_switch" }, b.ctx);
+				expect(b.facts("codex-c1")).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "cut", identity: "c1" } },
+					{ ...b.identity("codex-c1"), revision: 3, fact: { kind: "lost" } },
+				]);
+				expect(b.seen.filter((m) => m.kind === "withdraw")).toEqual([]);
+			});
+
+			it("keeps 2,000 invocations and evicts an ended one before an open one", () => {
+				expect(SHELL_DISPLAY_SNAPSHOT_LIMIT).toBe(2000);
+				const events = createEventBus();
+				const display = createShellDisplayOwner<{ kind: "start" | "completion" }>(events, "codex-command", (fact) => fact.kind === "completion", 2)!;
+				display.start("session-A", { name: TOOL_COMMAND, execute: () => {} });
+				const live: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => live.push(message as Message));
+				const snapshot = () => {
+					const from = live.length;
+					events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+					return live.slice(from).filter((m) => m.kind === "fact").map((m) => `${m.toolCallId}#${m.revision}:${m.fact.kind}`);
+				};
+				const [a, b, c, d] = ["a", "b", "c", "d"].map((id) => display.open(id)!);
+				a!.tell({ kind: "start" });
+				b!.tell({ kind: "start" });
+				b!.tell({ kind: "completion" });
+				c!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["a#1:start", "c#1:start"]);
+				d!.tell({ kind: "start" });
+				expect(snapshot()).toEqual(["c#1:start", "d#1:start"]);
+			});
+		});
+
+		describe("facts for each path of a command", () => {
+			it("a command that succeeds: the admitted start, then the completion as Codex sent it", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'ls -la'", output: ["a.ts\n"] }, { kind: "answer", id: "m1", text: "one file" }, { kind: "complete" }] });
+				const b = await watched();
+				const r = await b.round([userMessage("list files")]);
+				expect(r.first.toolCall!.arguments).toMatchObject({ itemId: "c1", threadId: "" }); // the display args name no thread for the root
+				expect(r.result).toMatchObject({ details: { itemId: "c1", exitCode: 0, status: "completed" }, isError: false });
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "completion", exitCode: 0, status: "completed" } },
+				]);
+			});
+
+			it("exit 7: the completion is captured with its exit and status though the row throws its details away", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'exit 7'", exitCode: 7, output: ["Status: completed\n"] }, { kind: "answer", id: "m1", text: "failed" }, { kind: "complete" }] });
+				const b = await watched();
+				const r = await b.round([userMessage("run it")]);
+				expect(r.result).toMatchObject({ details: {}, isError: true });
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "completion", exitCode: 7, status: "failed" } },
+				]);
+			});
+
+			it("the completion fact carries the two fields as they arrived, never the row's defaults", () => {
+				expect(shellCompletionFact({ exitCode: 0, status: "completed" })).toEqual({ kind: "completion", exitCode: 0, status: "completed" });
+				expect(shellCompletionFact({ exitCode: null, status: "completed" })).toEqual({ kind: "completion", exitCode: null, status: "completed" });
+				expect(shellCompletionFact({})).toEqual({ kind: "completion", exitCode: undefined, status: undefined });
+				expect(shellCompletionFact({ exitCode: "0", status: "declined", aggregatedOutput: "exit 0" })).toEqual({ kind: "completion", exitCode: "0", status: "declined" });
+			});
+
+			it("an approval that opens the row says nothing; the start comes only with Codex's item/started, after the answer", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'echo hi'", output: ["hi\n"], approvals: [{ when: "before", command: "/bin/zsh -lc 'echo hi'" }] }, { kind: "answer", id: "m1", text: "said hi" }, { kind: "complete" }] });
+				const b = await watched();
+				const atDialog: unknown[][] = [];
+				const select = b.ctx.ui.select;
+				(b.ctx.ui as any).select = async (...args: Parameters<typeof select>) => {
+					atDialog.push(b.told("codex-c1"));
+					await sleep(30);
+					atDialog.push(b.told("codex-c1"));
+					return select(...args);
+				};
+				b.answers.push("Yes");
+				const r = await b.round([userMessage("say hi")]);
+				expect(r.result).toMatchObject({ isError: false });
+				expect(atDialog).toEqual([[], []]);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "completion", exitCode: 0, status: "completed" }]);
+			});
+
+			it("a refused approval before any start is not run, with no start", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'touch /etc/x'", approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+				const b = await watched();
+				b.answers.push("No, tell Codex what to do instead");
+				const r = await b.round([userMessage("go")]);
+				expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+				expect(b.facts()).toEqual([{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "not-run" } }]);
+			});
+
+			it("Escape on an approval that never started: not run, then the cut, which names the item but admits no start", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'touch /etc/x'", approvals: [{ when: "before" }] }, { kind: "hang" }] });
+				const b = await watched();
+				// Escape lands while the dialog is open. Earlier than that there is no dialog to close and no refusal to tell, only the cut.
+				const { error } = await cutFirstRow(b, "go", () => expect(b.dialogs).toHaveLength(1));
+				expect(error?.message).toContain(ROW_STATUS.aborted);
+				// The abort ends the turn, the ended turn closes the dialog, and `answerRequest` answers Codex `decline` for it: the owner itself refused the command.
+				// The fake logs a reply when it reads it, a moment after Pi wrote it.
+				const approvalReplies = () => sent().filter((m) => m.id !== undefined && !m.method && (m as any).result?.decision !== undefined).map((m) => (m as any).result);
+				await vi.waitFor(() => expect(approvalReplies()).toEqual([{ decision: "decline" }]));
+				expect(b.dialogs).toHaveLength(1);
+				expect(b.told("codex-c1")).toEqual([{ kind: "not-run" }, { kind: "cut", identity: "c1" }]);
+				// The view reads the pair as not run: the cut adds nothing to a command its owner refused.
+				const folded = b.told("codex-c1").reduce(reduceEvidence, NO_EVIDENCE);
+				expect(folded).toEqual({ executionEvidence: { state: "notRun" }, executionStarted: false });
+			});
+
+			it("a refusal after the command started is not a refusal to run: the start stands and the owner stops vouching", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "/bin/zsh -lc 'curl x'", approvals: [{ when: "after" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+				const b = await watched();
+				b.answers.push("No, tell Codex what to do instead");
+				const r = await b.round([userMessage("go")]);
+				expect(r.result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "lost" }]);
+			});
+
+			it("a command cut by Escape: start, cut with the item id, and the late completion under the identity captured before the session moved on", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "sleep", ms: 150 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] });
+				const b = await watched();
+				const { error } = await cutFirstRow(b);
+				expect(error?.message).toContain(ROW_STATUS.aborted);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }]);
+				// The session Pi shows changes before Codex reports the command finished.
+				b.options.sessionId = "session-B";
+				expect(b.ctx.sessionManager.getSessionId()).toBe("session-B");
+				await vi.waitFor(() => expect(b.facts("codex-c1")).toHaveLength(3));
+				expect(b.facts("codex-c1")).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "cut", identity: "c1" } },
+					{ ...b.identity("codex-c1"), revision: 3, fact: { kind: "completion", exitCode: 0, status: "completed" } },
+				]);
+				expect(b.identity("codex-c1").sessionId).toBe("session-A");
+				expect(b.notify).toHaveBeenCalledWith(NOTICE.finishedAfterCancel(0, "/bin/sleep 30"), "info");
+			});
+
+			it("a completion Codex repeats after the cut command finished is told once", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] });
+				const b = await watched();
+				await cutFirstRow(b);
+				await vi.waitFor(() => expect(b.facts("codex-c1")).toHaveLength(3));
+				await sleep(120);
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }, { kind: "completion", exitCode: 0, status: "completed" }]);
+			});
+
+			it("the client dying under a running command: the owner can no longer vouch, said once", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: "sleep 9", incomplete: true }, { kind: "die" }] });
+				const b = await watched();
+				const first = await b.turn("go");
+				const result = await b.exec(first.toolCall!);
+				expect(result).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "lost" } },
+				]);
+			});
+
+			it("a completion with no start still reports, as a completion alone", async () => {
+				scenario({ turn: [{ kind: "finishCommand", id: "c9", command: "/bin/zsh -lc 'true'", exitCode: 0 }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] });
+				const b = await watched();
+				const r = await b.round([userMessage("go")]);
+				expect(r.first.toolCall!.id).toBe("codex-c9");
+				expect(b.facts()).toEqual([{ ...b.identity("codex-c9"), revision: 1, fact: { kind: "completion", exitCode: 0, status: "completed" } }]);
+			});
+
+			it("two commands with the same text keep their own item ids", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SAME, output: ["same\n"] }, { kind: "command", id: "c2", command: SAME, output: ["same\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] });
+				const b = await watched();
+				const { results } = await b.drive("twice");
+				expect(results).toHaveLength(2);
+				expect(b.facts().map((m) => [m.toolCallId, m.revision, m.fact.kind])).toEqual([
+					["codex-c1", 1, "start"],
+					["codex-c1", 2, "completion"],
+					["codex-c2", 1, "start"],
+					["codex-c2", 2, "completion"],
+				]);
+			});
+
+			it("an announced child's command reports under the owner's session; a thread nobody announced reports nothing", async () => {
+				scenario({
+					turn: [
+						{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+						{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", events: [{ kind: "command", id: "c2", command: "/bin/zsh -lc 'pytest -x'", output: ["1 passed\n"] }, { kind: "complete" }] },
+						{ kind: "childTurn", threadId: "T3", turnId: "T3-turn-1", events: [{ kind: "command", id: "c3", command: "/bin/zsh -lc 'rm -rf x'", output: ["gone\n"] }, { kind: "complete" }] },
+						{ kind: "answer", id: "m1", text: "PARENT DONE" },
+						{ kind: "complete" },
+					],
+				});
+				const b = await watched();
+				const { results, last } = await b.drive("delegate");
+				expect(results).toHaveLength(1);
+				expect(last.text).toBe("PARENT DONE");
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c2"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c2"), revision: 2, fact: { kind: "completion", exitCode: 0, status: "completed" } },
+				]);
+			});
+
+			it("a start that names the item on another thread than the one it was first seen on is not this command's start", async () => {
+				// The root's approval opens the row for c1. While its dialog is open, an admitted child's turn reports an item with the same id as started.
+				scenario({
+					turn: [
+						{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+						{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", detached: true, events: [{ kind: "sleep", ms: 80 }, { kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }] },
+						{ kind: "command", id: "c1", command: SLEEP, approvals: [{ when: "before", command: SLEEP }] },
+						{ kind: "hang" },
+					],
+				});
+				const b = await watched();
+				const first = await b.turn("go");
+				expect(first.toolCall!.arguments).toMatchObject({ itemId: "c1", threadId: "" });
+				const row = b.exec(first.toolCall!).catch(() => undefined);
+				await vi.waitFor(() => expect(b.dialogs).toHaveLength(1));
+				await sleep(300);
+				// The root's command is still waiting on its approval: no start was told for it.
+				expect(b.told("codex-c1")).toEqual([]);
+				await b.shutdown();
+				await row;
+			});
+
+			it("a command that started and whose row Pi never executed has nobody watching it once its turn ends: the owner says so, and its late completion still lands", async () => {
+				scenario({ turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "sleep", ms: 150 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] });
+				const b = await watched();
+				const first = await b.turn("wait");
+				expect(first.toolCall!.id).toBe("codex-c1");
+				expect(b.told("codex-c1")).toEqual([{ kind: "start" }]);
+				// Pi is interrupted before it executes the row: its next call arrives already aborted, and the turn ends.
+				const ac = new AbortController();
+				ac.abort();
+				const recall = await b.turn([userMessage("wait"), first.final!], model(), { signal: ac.signal });
+				expect(recall.final?.stopReason).toBe("aborted");
+				await vi.waitFor(() => expect(b.told("codex-c1").slice(0, 2)).toEqual([{ kind: "start" }, { kind: "lost" }]));
+				// The view reads that as unknown, not as still running.
+				expect(b.told("codex-c1").slice(0, 2).reduce(reduceEvidence, NO_EVIDENCE).executionEvidence).toEqual({ state: "unknown" });
+				// Codex still reports the command when it finishes, and that proves how it ended.
+				await vi.waitFor(() => expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "lost" }, { kind: "completion", exitCode: 0, status: "completed" }]));
+				expect(b.told("codex-c1").reduce(reduceEvidence, NO_EVIDENCE)).toEqual({ executionEvidence: { state: "succeeded" }, executionStarted: true });
+			});
+
+			it("a completion that names the item on another thread is not this command's: the owner stops vouching and tells no completion", async () => {
+				scenario({
+					turn: [
+						{ kind: "command", id: "c1", command: SLEEP, incomplete: true },
+						{ kind: "subAgent", activity: "started", agentThreadId: "T2", agentPath: "/root/alpha" },
+						{ kind: "childTurn", threadId: "T2", turnId: "T2-turn-1", events: [{ kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }, { kind: "complete" }] },
+						{ kind: "answer", id: "m1", text: "done" },
+						{ kind: "complete" },
+					],
+				});
+				const b = await watched();
+				const { results } = await b.drive("go");
+				expect(results).toHaveLength(1);
+				expect(b.facts()).toEqual([
+					{ ...b.identity("codex-c1"), revision: 1, fact: { kind: "start" } },
+					{ ...b.identity("codex-c1"), revision: 2, fact: { kind: "lost" } },
+				]);
+			});
+		});
+
+		describe("sandbox launch", () => {
+			it("a sandbox launch loads no owner: nothing is announced, reported or answered", async () => {
+				const events = createEventBus();
+				const seen: Message[] = [];
+				events.on(SHELL_DISPLAY_CHANNEL, (message) => seen.push(message as Message));
+				const fx = makePi({ events });
+				createRbfCodex({ command: fakeCommand, argv: ["--sandbox"] })(fx.pi);
+				expect(fx.registered).toBe(false);
+				expect(fx.tools.size).toBe(0);
+				expect(fx.handlers.size).toBe(0);
+				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
+				expect(seen).toEqual([{ kind: "snapshot-request", sessionId: "session-A" }]);
+			});
+		});
+
+		describe("isolation from the native turn", () => {
+			const SCRIPTS: { name: string; scenario: FakeScenario; answers?: (string | undefined)[]; cut?: boolean }[] = [
+				{ name: "success", scenario: { turn: [{ kind: "command", id: "c1", command: SAME, output: ["same\n"] }, { kind: "answer", id: "m1", text: "done" }, { kind: "complete" }] } },
+				{ name: "exit 7", scenario: { turn: [{ kind: "command", id: "c1", command: SAME, exitCode: 7, output: ["boom\n"] }, { kind: "answer", id: "m1", text: "failed" }, { kind: "complete" }] } },
+				{ name: "refused", scenario: { turn: [{ kind: "command", id: "c1", command: SAME, approvals: [{ when: "before" }] }, { kind: "answer", id: "m1", text: "ok" }, { kind: "complete" }] }, answers: ["No, tell Codex what to do instead"] },
+				{ name: "cut then late completion", scenario: { turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "hang" }], afterInterrupt: [{ kind: "sleep", ms: 60 }, { kind: "finishCommand", id: "c1", command: SLEEP, exitCode: 0 }] }, cut: true },
+				{ name: "client death", scenario: { turn: [{ kind: "command", id: "c1", command: SLEEP, incomplete: true }, { kind: "die" }] } },
+			];
+
+			/** Every script on a fresh owner over `events` (none when undefined), reduced to what the native path returned, said and sent. */
+			async function nativeOutcome(events: Bus | undefined) {
+				const out: Record<string, unknown> = {};
+				for (const script of SCRIPTS) {
+					scenario(script.scenario);
+					const from = sent().length;
+					const b = await boot({ events });
+					b.answers.push(...(script.answers ?? []));
+					const record: Record<string, unknown> = {};
+					if (script.cut) {
+						const first = await b.turn("go");
+						const ac = new AbortController();
+						const row = b.exec(first.toolCall!, { signal: ac.signal });
+						await sleep(50);
+						ac.abort();
+						record.row = await row.then((r) => ({ resolved: r }), (e) => ({ rejected: String(e.message) }));
+						record.recall = (await b.turn([userMessage("go"), first.final!], model(), { signal: ac.signal })).final?.stopReason;
+						await vi.waitFor(() => expect(b.notify).toHaveBeenCalledWith(NOTICE.finishedAfterCancel(0, "/bin/sleep 30"), "info"));
+					} else {
+						const r = await b.round([userMessage("go")]);
+						record.call = r.first.toolCall;
+						record.row = r.result;
+						record.next = [r.next?.final?.stopReason, r.next?.text, r.next?.final?.errorMessage];
+					}
+					record.notices = b.notify.mock.calls;
+					record.entries = b.entries;
+					record.dialogs = b.dialogs.map((d) => [d.kind, d.title]);
+					await b.shutdown();
+					record.methods = sent().slice(from).map((m) => m.method ?? "reply");
+					out[script.name] = JSON.parse(JSON.stringify(record));
+				}
+				return out;
+			}
+
+			it("a throwing subscriber, a throwing bus and no bus at all leave every row, notice, entry and protocol message as it was", async () => {
+				const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+				try {
+					const baseline = await nativeOutcome(undefined);
+					expect((baseline.success as any).row).toMatchObject({ details: { itemId: "c1", exitCode: 0, status: "completed" }, isError: false });
+					expect((baseline["exit 7"] as any).row).toMatchObject({ isError: true });
+					expect((baseline.refused as any).row).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.declined }], isError: true });
+					expect((baseline["cut then late completion"] as any).row.rejected).toContain(ROW_STATUS.aborted);
+					expect((baseline["client death"] as any).row).toMatchObject({ content: [{ type: "text", text: ROW_STATUS.stopped }], isError: true });
+
+					expect(await nativeOutcome(createEventBus())).toEqual(baseline);
+
+					let thrown = 0;
+					const throwing = (bus: Bus) => {
+						bus.on(SHELL_DISPLAY_CHANNEL, () => {
+							thrown++;
+							throw new Error("subscriber blew up");
+						});
+						return bus;
+					};
+					expect(await nativeOutcome(throwing(createEventBus()))).toEqual(baseline);
+					const afterPiBus = thrown;
+					expect(afterPiBus).toBeGreaterThan(15);
+					expect(await nativeOutcome(throwing(rawBus()))).toEqual(baseline);
+					expect(thrown).toBeGreaterThan(afterPiBus + 15);
+
+					const broken: Bus = {
+						emit: () => {
+							thrown++;
+							throw new Error("bus blew up");
+						},
+						on: () => {
+							throw new Error("cannot subscribe");
+						},
+					};
+					expect(await nativeOutcome(broken)).toEqual(baseline);
+				} finally {
+					errors.mockRestore();
+				}
+			}, 120_000);
 		});
 	});
 });

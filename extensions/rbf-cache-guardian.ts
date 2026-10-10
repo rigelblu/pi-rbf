@@ -65,14 +65,19 @@ export function getActiveTheme(): any {
 	);
 }
 
-let activeGuardianState: ActiveGuardianState | null = null;
+export const GUARDIAN_STATE_KEY = Symbol.for("rbf.cacheGuardian.activeState");
+export const GUARDIAN_GET_CONTENT_KEY = Symbol.for("rbf.cacheGuardian.getActiveContent");
 
 export function getActiveGuardianState(): ActiveGuardianState | null {
-	return activeGuardianState;
+	return (globalThis as any)[GUARDIAN_STATE_KEY] ?? null;
 }
 
 export function setActiveGuardianState(state: ActiveGuardianState | null): void {
-	activeGuardianState = state;
+	if (state === null) {
+		delete (globalThis as any)[GUARDIAN_STATE_KEY];
+	} else {
+		(globalThis as any)[GUARDIAN_STATE_KEY] = state;
+	}
 }
 
 export function formatCountdown(ms: number, format: "minute" | "exact" = "minute"): string {
@@ -329,15 +334,8 @@ export function patchFooterComponent(): boolean {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return false;
 	}
-	if ((FooterComponent.prototype as any)[FOOTER_PATCHED_KEY]) {
-		return true;
-	}
 
-	const originalRender = FooterComponent.prototype.render;
-	(FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY] = originalRender;
-	(FooterComponent.prototype as any)[FOOTER_PATCHED_KEY] = true;
-
-	(FooterComponent.prototype as any)[Symbol.for("rbf.cacheGuardian.getActiveContent")] = function (this: any): string {
+	(FooterComponent.prototype as any)[GUARDIAN_GET_CONTENT_KEY] = function (this: any): string {
 		const state = getActiveGuardianState();
 		if (!state) return "";
 		const theme = this.session?.theme ?? getActiveTheme();
@@ -348,6 +346,14 @@ export function patchFooterComponent(): boolean {
 			theme,
 		);
 	};
+
+	if ((FooterComponent.prototype as any)[FOOTER_PATCHED_KEY]) {
+		return true;
+	}
+
+	const originalRender = FooterComponent.prototype.render;
+	(FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY] = originalRender;
+	(FooterComponent.prototype as any)[FOOTER_PATCHED_KEY] = true;
 
 	FooterComponent.prototype.render = function (this: any, width: number): string[] {
 		const lines = originalRender.call(this, width);
@@ -372,6 +378,7 @@ export function unpatchFooterComponent(): void {
 	if (typeof FooterComponent === "undefined" || !FooterComponent.prototype) {
 		return;
 	}
+	setActiveGuardianState(null);
 	if ((FooterComponent.prototype as any)[FOOTER_PATCHED_KEY]) {
 		const originalRender = (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
 		if (originalRender) {
@@ -379,7 +386,7 @@ export function unpatchFooterComponent(): void {
 		}
 		delete (FooterComponent.prototype as any)[ORIGINAL_FOOTER_RENDER_KEY];
 		delete (FooterComponent.prototype as any)[FOOTER_PATCHED_KEY];
-		delete (FooterComponent.prototype as any)[Symbol.for("rbf.cacheGuardian.getActiveContent")];
+		delete (FooterComponent.prototype as any)[GUARDIAN_GET_CONTENT_KEY];
 	}
 }
 
