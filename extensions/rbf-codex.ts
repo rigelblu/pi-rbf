@@ -1235,13 +1235,6 @@ export class CodexAgentRoster {
 		return `Agent ${a.threadId.slice(0, n)}`;
 	}
 	private status(a: CodexAgentFact): string { return `${this.fresh.has(a.threadId) ? "" : "Last recorded: "}${AGENT_LABELS[a.status]}`; }
-	preview(width: number): string[] {
-		// Keep active/unknown assignments visible before terminal reports; preserve data order for saved bounds.
-		const terminal = (a: CodexAgentFact) => ["completed", "interrupted", "errored", "shutdown", "notFound"].includes(a.status);
-		const preview = this.agents.sort((a, b) => Number(terminal(a)) - Number(terminal(b)));
-		if (!this.rows.size && !this.unavailable && !this.notSaved && !this.partial) return [];
-		return [` Codex agents · ${this.rows.size} · /agents-codex`, ...preview.slice(0, 4).map(a => ` ${this.name(a)} · ${this.status(a)} — ${a.task ?? "Task not provided"}`), ...(this.rows.size > 4 ? [` +${this.rows.size - 4} more · /agents-codex`] : []), ...(this.unavailable ? [" Saved agent overview is unavailable."] : []), ...(this.partial ? [" Partial overview · display limit"] : []), ...(this.notSaved ? [" Not saved"] : [])].map(s => truncateToWidth(s, Math.max(1, width)));
-	}
 	full(width: number): string[] {
 		const rows = [`Codex agents · ${this.fresh.size ? "Reported activity" : "Last recorded"}`];
 		if (this.unavailable) rows.push("Saved agent overview is unavailable.");
@@ -1397,7 +1390,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			overviewSafe(() => {
 				const ctx = state.ctx;
 				if (ctx?.mode !== "tui") return;
-				ctx.ui.setWidget("rbf-codex-agents", ctx.model?.provider === PROVIDER_ID && (agents.agents.length || agents.unavailable || agents.notSaved || agents.partial) ? () => ({render: (width: number) => agents.preview(width), invalidate() {}}) : undefined);
+				// Removing the old preview also requests the redraw that refreshes the footer.
+				ctx.ui.setWidget("rbf-codex-agents", undefined);
 				overviewRender?.();
 			});
 		}

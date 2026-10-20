@@ -10,8 +10,8 @@ function collab(a: CodexAgentRoster, ids: string[], states: Record<string, strin
 function announce(a: CodexAgentRoster, id: string, kind = "started", name = "Reviewer") { return a.observe("item/started", {threadId:"root",turnId:"root-turn",item:{id:`announce-${++eventId}`,type:"subAgentActivity",kind,agentThreadId:id,agentPath:name ? "/root/"+name : ""}}); }
 
 describe("Codex agent overview", () => {
-	it("preview prioritizes a live fifth assignment over terminal rows without changing saved order", () => {
-		const a=setup();for(let i=0;i<4;i++)collab(a,["done-"+i],{["done-"+i]:"completed"},"spawnAgent","Finished task");collab(a,["active"],{active:"running"},"spawnAgent","LIVE TASK");const preview=a.preview(120);expect(preview[1]).toContain("LIVE TASK");expect(preview).toHaveLength(6);expect(a.snapshot().agents[0].threadId).toBe("done-0");
+	it("full overview retains every assignment beyond four without changing saved order", () => {
+		const a=setup();for(let i=0;i<4;i++)collab(a,["done-"+i],{["done-"+i]:"completed"},"spawnAgent","Finished task");collab(a,["active"],{active:"running"},"spawnAgent","LIVE TASK");const view=a.full(120).join("\n");expect(view).toContain("LIVE TASK");for(let i=0;i<4;i++)expect(view).toContain("done-"+i);expect(a.snapshot().agents[0].threadId).toBe("done-0");
 	});
 	it("duplicate item replay cannot regress a later completed status or assignment", () => {
 		const a=setup();const original={threadId:"root",turnId:"root-turn",item:{id:"original",type:"subAgentActivity",kind:"started",agentThreadId:"a",agentPath:"/root/Reviewer"}};
@@ -33,7 +33,7 @@ describe("Codex agent overview", () => {
 		a.finish();a.begin("root");a.setTurn("new-turn");expect(a.observe("turn/started",{threadId:"child",turn:{id:"early-two"}})).toBe(false);
 	});
 	it("finite turn observation budget remains visible with no agent rows", () => {
-		const a=setup();for(let i=0;i<4098;i++){a.finish();a.begin("root");a.setTurn("turn-"+i);}expect(a.partial).toBe(true);expect(a.agents).toHaveLength(0);expect(a.preview(120).join("\n")).toContain("Partial overview");
+		const a=setup();for(let i=0;i<4098;i++){a.finish();a.begin("root");a.setTurn("turn-"+i);}expect(a.partial).toBe(true);expect(a.agents).toHaveLength(0);expect(a.full(120).join("\n")).toContain("Partial overview");
 	});
 	it("late old root start during new request gap cannot establish a fresh root turn", () => {
 		const a=setup();a.finish();a.begin("root");expect(a.observe("turn/started",{threadId:"root",turn:{id:"root-turn"}})).toBe(false);expect(announce(a,"old-only")).toBe(false);a.setTurn("new-turn");expect(a.agents).toHaveLength(0);
@@ -43,7 +43,7 @@ describe("Codex agent overview", () => {
 		b.begin("root"); b.setTurn("root-turn"); announce(b,"a","interacted"); expect(b.isFresh("a")).toBe(false);
 		collab(b,["a"],{a:"running"}); expect(b.isFresh("a")).toBe(true); expect(b.isFresh("b")).toBe(false);
 		b.observe("thread/started",{thread:{id:"a",agentNickname:"New name"}}); expect(b.agents[0].name).toBe("New name"); expect(b.isFresh("b")).toBe(false);
-		expect(b.preview(120).join("\n")).toContain("Last recorded: Running"); b.begin("root");expect(b.isFresh("a")).toBe(false);
+		expect(b.full(120).join("\n")).toContain("Last recorded: Running"); b.begin("root");expect(b.isFresh("a")).toBe(false);
 	});
 	it("old child/root turn completions cannot settle a re-driven child; turn complete is not assignment completed", () => {
 		const a=setup(); announce(a,"a"); a.observe("turn/started",{threadId:"a",turn:{id:"one"}}); a.observe("turn/started",{threadId:"a",turn:{id:"two"}});
@@ -73,7 +73,7 @@ describe("Codex agent overview", () => {
 		const a=setup();announce(a,"abcdefgh-1","started","\x1b[31mReviewer\x1b[0m\x07");announce(a,"abcdefgh-2","started","");
 		collab(a,["abcdefgh-1"],{},"spawnAgent","Task\n\x1b]0;TITLE\x07"+"漢".repeat(80));
 		expect(JSON.stringify(a.snapshot())).not.toMatch(/\\u001b|\\u0007/);expect(a.agents[0].name).toBe("Reviewer");expect(a.agents[0].task).not.toContain("TITLE");
-		expect(a.full(20).join("\n")).toContain("Observed");expect(a.preview(120).join("\n")).toContain("Agent abcdefgh");
+		expect(a.full(20).join("\n")).toContain("Observed");expect(a.full(120).join("\n")).toContain("Agent abcdefgh");
 		expect(announce(a,"bad\nid")).toBe(false);expect(a.agents).toHaveLength(2);
 	});
 });

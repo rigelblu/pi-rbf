@@ -233,22 +233,42 @@ describe("rbf-codex", () => {
 	}
 
 	describe("sub-agent overview", () => {
+		async function readOverview(b: Awaited<ReturnType<typeof boot>>): Promise<string> {
+			let text = "";
+			(b.ctx.ui as any).custom = vi.fn(async (factory: any) => {
+				const component = factory({requestRender() {}}, fakeTheme, {}, () => {});
+				text = component.render(120).join("\n");
+			});
+			await vi.mocked(b.pi.registerCommand).mock.calls.find(c => c[0] === "agents-codex")![1].handler("", b.ctx as any);
+			return text;
+		}
+
+		it("agent announcements stay behind deliberate overview access", async () => {
+			scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"a",agentPath:"/root/Reviewer"},{kind:"collab",tool:"spawnAgent",prompt:"Check the result",receivers:["b"],states:{b:"running"}},{kind:"answer",id:"m",text:"DONE"},{kind:"complete"}]});
+			const b=await boot({persistAppends:true});
+			const custom=vi.fn();(b.ctx.ui as any).custom=custom;
+			expect((await b.turn("delegate")).text).toBe("DONE");
+			expect(custom).not.toHaveBeenCalled();
+			expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.every(c=>c[1]===undefined)).toBe(true);
+			expect(b.entries.find(e=>e.customType==="rbf-codex-agents/v1")?.data).toMatchObject({agents:[{threadId:"a",name:"Reviewer"},{threadId:"b",task:"Check the result"}]});
+		});
+
 		it("malformed unrelated branch entries and failed lookup cannot retain the source roster", async () => {
 			const stamp="2026-10-20T14:00:00.000Z";const b=await boot({branch:[{type:"custom",customType:ENTRY_TYPE,data:{threadId:"old",cwd:process.cwd(),sessionId:"session-A"}},{type:"custom",customType:"rbf-codex-agents/v1",data:{version:1,rootThreadId:"old",observedAt:stamp,partial:false,agents:[{threadId:"old-child",name:"OldBranchOnly",status:"running",observedAt:stamp}]}}]});
 			await b.handlers.get("session_before_tree")?.({preparation:{}},b.ctx);b.branch.splice(0,b.branch.length,{type:"custom",customType:ENTRY_TYPE,data:{threadId:"new",cwd:process.cwd(),sessionId:"session-A"}},{type:"custom",customType:42} as any);await b.handlers.get("session_tree")?.({},b.ctx);expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.at(-1)?.[1]).toBeUndefined();
-			(b.ctx.sessionManager as any).getBranch=()=>{throw Error("bad branch");};await b.handlers.get("session_tree")?.({},b.ctx);const widget=vi.mocked(b.ctx.ui.setWidget).mock.calls.at(-1)?.[1];expect((widget as any)({},fakeTheme).render(120).join("\n")).toContain("unavailable");expect((widget as any)({},fakeTheme).render(120).join("\n")).not.toContain("OldBranchOnly");
+			(b.ctx.sessionManager as any).getBranch=()=>{throw Error("bad branch");};await b.handlers.get("session_tree")?.({},b.ctx);const view=await readOverview(b);expect(view).toContain("unavailable");expect(view).not.toContain("OldBranchOnly");
 		});
 
 		it("pending source flush precedes branch mutation and late observer callbacks cannot append on the replacement", async () => {
 			scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"a",agentPath:"/root/Reviewer"},{kind:"sleep",ms:500},{kind:"subAgent",activity:"started",agentThreadId:"b",agentPath:"/root/Builder"},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
-			const b=await boot({persistAppends:true});const running=b.turn("delegate");await vi.waitFor(()=>expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.some(c=>typeof c[1]==="function")).toBe(true));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);
+			const b=await boot({persistAppends:true});const running=b.turn("delegate");await vi.waitFor(async()=>expect(await readOverview(b)).toContain("Reviewer [a]"));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);
 			await b.handlers.get("session_before_tree")?.({preparation:{}},b.ctx);expect(b.branch.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);b.branch.splice(0);await b.handlers.get("session_tree")?.({},b.ctx);await running;await new Promise(r=>setTimeout(r,300));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);expect(b.branch.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);
 		});
 
 		it("newest malformed/future overview is unavailable instead of absent or older fallback", async () => {
 			for(const entry of [{type:"custom",customType:"rbf-codex-agents/v1"},{type:"custom",customType:"rbf-codex-agents/v2",data:{version:2}}]) {
 				const b=await boot({branch:[{type:"custom",customType:ENTRY_TYPE,data:{threadId:"root",cwd:process.cwd(),sessionId:"session-A"}},entry]});
-				const widget=vi.mocked(b.ctx.ui.setWidget).mock.calls.at(-1)?.[1];expect(typeof widget).toBe("function");expect((widget as any)({},fakeTheme).render(120).join("\n")).toContain("Saved agent overview is unavailable.");
+				expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.every(c=>c[1]===undefined)).toBe(true);expect(await readOverview(b)).toContain("Saved agent overview is unavailable.");
 			}
 		});
 		it("overlay End and resize expose the final task; model replacement closes without replacing editor", async () => {
@@ -263,7 +283,7 @@ describe("rbf-codex", () => {
 		});
 		it("250ms burst timer coalesces unchanged reports without another root-end snapshot", async () => {
 			scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"a",agentPath:"/root/Reviewer"},{kind:"collab",tool:"wait",receivers:["a"],states:{a:"running"}},{kind:"sleep",ms:650},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
-			const b=await boot({persistAppends:true});const running=b.turn("delegate");await vi.waitFor(()=>expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.some(c=>typeof c[1]==="function")).toBe(true));
+			const b=await boot({persistAppends:true});const running=b.turn("delegate");await vi.waitFor(async()=>expect(await readOverview(b)).toContain("Reviewer [a]"));
 			expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);await new Promise(r=>setTimeout(r,300));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);await running;expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);
 		});
 
@@ -272,7 +292,7 @@ describe("rbf-codex", () => {
 				scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"agent-a",agentPath:"/root/Reviewer"},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
 				writeFileSync(logPath, ""); const b=await boot({mode});
 				if(fail){vi.mocked(b.ctx.ui.setWidget).mockImplementation(()=>{throw Error("widget");});const original=vi.mocked(b.pi.appendEntry).getMockImplementation()!;vi.mocked(b.pi.appendEntry).mockImplementation((type,data)=>{if(type==="rbf-codex-agents/v1")throw Error("disk");return original(type,data);});}
-				expect((await b.turn("delegate")).text).toBe("DONE");await b.shutdown();
+				expect((await b.turn("delegate")).text).toBe("DONE");if(mode==="tui"&&fail)expect(await readOverview(b)).toContain("Not saved");await b.shutdown();
 				return sent().filter(m=>m.method).map(({method,params})=>({method,params}));
 			};
 			const baseline=await run("print");expect(await run("tui",true)).toEqual(baseline);expect(await run("tui")).toEqual(baseline);
@@ -285,7 +305,7 @@ describe("rbf-codex", () => {
 			const widgets=vi.mocked(b.ctx.ui.setWidget).mock.calls;expect(widgets.at(-1)?.[1]).toBeUndefined();
 		});
 
-		it("shows announced names and saves branch-local recorded facts without extra native requests", async () => {
+		it("opens announced names on request and saves branch-local recorded facts without extra native requests", async () => {
 			scenario({ turn: [
 				{kind:"subAgent",activity:"started",agentThreadId:"agent-a",agentPath:"/root/Reviewer"},
 				{kind:"collab",tool:"wait",receivers:["agent-b"],states:{"agent-b":"pendingInit"}},
@@ -294,7 +314,8 @@ describe("rbf-codex", () => {
 			const b=await boot({persistAppends:true});
 			expect((await b.turn("delegate")).text).toBe("PARENT DONE");
 			const calls=vi.mocked(b.ctx.ui.setWidget).mock.calls;
-			expect(calls.some(c=>typeof c[1] === "function" && c[1]({} as any, fakeTheme as any).render(120).join("\n").includes("Reviewer"))).toBe(true);
+			expect(calls.every(c=>c[1]===undefined)).toBe(true);
+			expect(await readOverview(b)).toContain("Reviewer [agent-a]");
 			const saved=b.entries.filter(e=>e.customType==="rbf-codex-agents/v1");
 			expect(saved.length).toBeGreaterThan(0);
 			expect(saved.at(-1)?.data).toMatchObject({version:1,agents:[{threadId:"agent-a",name:"Reviewer",status:"running"},{threadId:"agent-b",status:"pendingInit"}]});
