@@ -19,7 +19,7 @@ export type FakeTurnEvent =
 	/** Complete a command started with `incomplete` earlier, on the current turn (a root row held open while a child works). */
 	| { kind: "finishCommand"; id: string; command: string; exitCode?: number; aggregatedOutput?: string; completion?: Record<string, unknown>; omit?: string[] }
 	/** A `collabAgentToolCall` on the current turn; draws nothing. A code-mode model announces a child only here: `receivers` on the completion, `states` per child (probe `subapproval-luna.jsonl` and Tomek's sol rollouts, 2026-09-15). */
-	| { kind: "collab"; tool?: string; receivers?: string[]; states?: Record<string, string> }
+	| { kind: "collab"; tool?: string; prompt?: string; receivers?: string[]; states?: Record<string, string> }
 	/** Timing controls for interleaved turns: pause, or wait until Pi has answered this many server requests in this process. */
 	| { kind: "sleep"; ms: number }
 	| { kind: "awaitReplies"; count: number }
@@ -241,7 +241,7 @@ async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
 				break;
 			case "collab": {
 				const agentsStates = Object.fromEntries(Object.entries(ev.states ?? {}).map(([id, status]) => [id, { status, message: null }]));
-				const item = { id: `collab-${++childCounter}`, type: "collabAgentToolCall", tool: ev.tool ?? "wait", status: "completed", senderThreadId: THREAD, receiverThreadIds: ev.receivers ?? [], prompt: null, model: null, reasoningEffort: null, agentsStates };
+				const item = { id: `collab-${++childCounter}`, type: "collabAgentToolCall", tool: ev.tool ?? "wait", status: "completed", senderThreadId: THREAD, receiverThreadIds: ev.receivers ?? [], prompt: ev.prompt ?? null, model: null, reasoningEffort: null, agentsStates };
 				notify("item/started", { threadId: THREAD, turnId, item: { ...item, status: "inProgress", receiverThreadIds: ev.tool === "spawnAgent" ? [] : (ev.receivers ?? []), agentsStates: {} } });
 				notify("item/completed", { threadId: THREAD, turnId, item });
 				break;

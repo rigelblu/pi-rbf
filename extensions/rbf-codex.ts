@@ -15,10 +15,10 @@ import { literalMcpLabel, mcpDisplayMetadata, type McpDisplay } from "./lib/mcp-
 // question (an MCP elicitation) is answered from the same dialog. A sub-agent's items and
 // requests reach the same rows and dialogs, tagged with the agent's name, once Codex has
 // announced its thread. A turn running when Pi exits is not recovered.
-import { keyHint, parseArgs, renderDiff, truncateToVisualLines, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
+import { FooterComponent, keyHint, parseArgs, renderDiff, truncateToVisualLines, type ExtensionAPI, type ExtensionContext, type ProviderModelConfig, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AssistantMessage, AssistantMessageEventStream, Context, Model, ModelThinkingLevel, RefreshModelsContext, SimpleStreamOptions, ToolCall } from "@earendil-works/pi-ai";
-import { Box, Container, Editor, Spacer, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { Box, Container, Editor, Spacer, Text, truncateToWidth, stripTerminalSequences, wrapTextWithAnsi, matchesKey, Key, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -1083,6 +1083,281 @@ type ProjectedEvent =
 	| { kind: "final"; text: string }
 	| { kind: "end"; status: string; error?: string };
 
+// ── passive Codex agent overview (pi-10.11) ───────────────────────────────────
+export const AGENTS_ENTRY_TYPE = "rbf-codex-agents/v1";
+export const AGENTS_MAX_BYTES = 256 * 1024;
+const AGENTS_MAX_ROWS = 128;
+const AGENT_LABELS = { unknown: "Status not provided", pendingInit: "Starting", running: "Running", interrupted: "Interrupted", completed: "Completed", errored: "Error", shutdown: "Closed", notFound: "Unavailable", turnComplete: "Turn complete" } as const;
+type AgentStatus = keyof typeof AGENT_LABELS;
+export type CodexAgentFact = { threadId: string; parentThreadId?: string; name?: string; task?: string; status: AgentStatus; observedAt: string };
+export type CodexAgentSnapshot = { version: 1; rootThreadId: string; observedAt: string; agents: CodexAgentFact[]; partial: boolean };
+const agentRecord = (v: unknown): Rec => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Rec : {};
+const agentId = (v: unknown): v is string => typeof v === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/.test(v);
+const agentText = (v: unknown, max: number): string | undefined => {
+	if (typeof v !== "string") return undefined;
+	const clean = stripTerminalSequences(v).replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
+	return Array.from(clean).slice(0, max).join("") || undefined;
+};
+const agentStatus = (v: unknown): v is AgentStatus => typeof v === "string" && Object.hasOwn(AGENT_LABELS, v);
+const agentDate = (v: unknown): v is string => typeof v === "string" && v.length <= 30 && Number.isFinite(Date.parse(v)) && new Date(v).toISOString() === v;
+
+/** Display facts only. No client, tool dispatch, request replies, or execution admission lives here. */
+export class CodexAgentRoster {
+	rootThreadId = "";
+	unavailable = false;
+	partial = false;
+	notSaved = false;
+	private rows = new Map<string, CodexAgentFact>();
+	private fresh = new Set<string>();
+	private announced = new Set<string>();
+	private turns = new Map<string, string>();
+	private earlyTurns = new Map<string, string>();
+	private seenItems = new Set<string>();
+	private retiredTurns = new Set<string>();
+	private exhausted = false;
+	private rootTurnId = "";
+	private active = false;
+	constructor(private readonly clock: () => number = Date.now) {}
+	get agents(): CodexAgentFact[] { return [...this.rows.values()].map(a => ({ ...a })); }
+	isFresh(id: string): boolean { return this.fresh.has(id); }
+	private timestamp(): string { return new Date(this.clock()).toISOString(); }
+	snapshot(): CodexAgentSnapshot { return { version: 1, rootThreadId: this.rootThreadId, observedAt: this.timestamp(), agents: this.agents, partial: this.partial }; }
+	restore(root: string, data?: unknown): void {
+		this.rootThreadId = agentId(root) ? root : "";
+		this.retiredTurns.clear(); this.exhausted = false; this.rootTurnId = "";
+		this.rows.clear(); this.fresh.clear(); this.announced.clear(); this.turns.clear(); this.earlyTurns.clear(); this.seenItems.clear(); this.active = false;
+		this.unavailable = false; this.partial = false; this.notSaved = false;
+		if (data === undefined) return;
+		try {
+			if (Buffer.byteLength(JSON.stringify(data), "utf8") > AGENTS_MAX_BYTES) throw new Error("size");
+			const s = agentRecord(data);
+			if (s.version !== 1 || !agentId(s.rootThreadId) || !agentDate(s.observedAt) || typeof s.partial !== "boolean" || !Array.isArray(s.agents) || s.agents.length > AGENTS_MAX_ROWS) throw new Error("shape");
+			if (s.rootThreadId !== this.rootThreadId) return; // inherited data belongs to a different binding
+			const parsed = new Map<string, CodexAgentFact>();
+			for (const value of s.agents) {
+				const a = agentRecord(value);
+				if (!agentId(a.threadId) || a.threadId === this.rootThreadId || parsed.has(a.threadId) || !agentStatus(a.status) || !agentDate(a.observedAt) || (a.parentThreadId !== undefined && !agentId(a.parentThreadId))) throw new Error("agent");
+				if ((a.name !== undefined && (typeof a.name !== "string" || a.name !== agentText(a.name, 128))) || (a.task !== undefined && (typeof a.task !== "string" || a.task !== agentText(a.task, 1024)))) throw new Error("text");
+				parsed.set(a.threadId, { threadId: a.threadId, ...(a.parentThreadId ? { parentThreadId: a.parentThreadId } : {}), ...(a.name ? { name: a.name } : {}), ...(a.task ? { task: a.task } : {}), status: a.status, observedAt: a.observedAt });
+			}
+			this.rows = parsed; this.partial = s.partial;
+		} catch { this.unavailable = true; }
+	}
+	begin(root: string, ended: Iterable<string> = []): boolean {
+		const changed = this.rootThreadId !== root;
+		const hadRoot = !!this.rootThreadId;
+		if (changed) this.restore(root);
+		this.finish(); for (const id of ended) this.retire(id); this.active = !this.exhausted; this.rootTurnId = "";
+		return (changed && hadRoot) || this.exhausted;
+	}
+	private retire(id: string): void {
+		if (!id || this.retiredTurns.has(id)) return;
+		if (this.retiredTurns.size >= 4096) { this.exhausted = true; this.partial = true; this.active = false; return; }
+		this.retiredTurns.add(id);
+	}
+	finish(): void { this.retire(this.rootTurnId); for (const id of this.turns.values()) this.retire(id); for (const id of this.earlyTurns.values()) this.retire(id); this.active = false; this.fresh.clear(); this.announced.clear(); this.turns.clear(); this.earlyTurns.clear(); this.seenItems.clear(); }
+	setTurn(id: string): void { if (this.active && agentId(id) && !this.retiredTurns.has(id)) this.rootTurnId = id; }
+	private put(id: string, patch: Partial<CodexAgentFact>, status?: AgentStatus): void {
+		if (!agentId(id) || id === this.rootThreadId) return;
+		const old = this.rows.get(id);
+		if (!old && this.rows.size >= AGENTS_MAX_ROWS) { this.partial = true; return; }
+		const next: CodexAgentFact = { threadId: id, status: "unknown", observedAt: this.timestamp(), ...old, ...patch, ...(status ? { status } : {}) };
+		const changed = !old || next.name !== old.name || next.task !== old.task || next.parentThreadId !== old.parentThreadId || next.status !== old.status || (!!status && !this.fresh.has(id));
+		if (!changed) return;
+		next.observedAt = this.timestamp();
+		this.rows.set(id, next); this.unavailable = false;
+		if (status) this.fresh.add(id);
+		// Bound both the visible retained set and its exact serialized representation.
+		while (Buffer.byteLength(JSON.stringify(this.snapshot()), "utf8") > AGENTS_MAX_BYTES && this.rows.size) {
+			const last = [...this.rows.keys()].at(-1)!;
+			this.rows.delete(last); this.fresh.delete(last); this.announced.delete(last); this.turns.delete(last); this.partial = true;
+		}
+	}
+	observe(method: string | undefined, p: Rec): boolean {
+		if (!this.active || !method || !["thread/started", "turn/started", "turn/completed", "item/started", "item/completed"].includes(method)) return false;
+		if ((method === "item/started" || method === "item/completed") && !["subAgentActivity", "collabAgentToolCall"].includes(String(agentRecord(p.item).type))) return false;
+		if (method === "turn/started" && this.retiredTurns.has(String(agentRecord(p.turn).id))) return false;
+		const before = JSON.stringify([this.agents, [...this.fresh], this.partial]);
+		const tid = p.threadId;
+		if (method === "thread/started") {
+			const t = agentRecord(p.thread);
+			if (agentId(t.id) && this.announced.has(t.id)) this.put(t.id, { ...(agentText(t.agentNickname, 128) ? { name: agentText(t.agentNickname, 128) } : {}) });
+		} else if (method === "turn/started" && agentId(tid) && tid !== this.rootThreadId) {
+			const id = agentRecord(p.turn).id;
+			if (agentId(id)) {
+				if (this.announced.has(tid)) { const old = this.turns.get(tid); if (old && old !== id) this.retire(old); this.turns.set(tid, id); this.put(tid, {}, "running"); }
+				else if (this.earlyTurns.has(tid) || this.earlyTurns.size < AGENTS_MAX_ROWS) { const old = this.earlyTurns.get(tid); if (old && old !== id) this.retire(old); this.earlyTurns.set(tid, id); }
+			}
+		} else {
+			if (tid === this.rootThreadId && method === "turn/started" && !this.rootTurnId) this.setTurn(String(agentRecord(p.turn).id ?? ""));
+			const root = tid === this.rootThreadId && !!this.rootTurnId && (p.turnId === this.rootTurnId || agentRecord(p.turn).id === this.rootTurnId);
+			const child = agentId(tid) && this.announced.has(tid) && !!this.turns.get(tid) && (p.turnId === this.turns.get(tid) || agentRecord(p.turn).id === this.turns.get(tid));
+			if (!root && !child) return false;
+			if (method === "turn/completed" && child) {
+				const t = agentRecord(p.turn); this.put(tid as string, {}, t.status === "completed" ? "turnComplete" : t.status === "interrupted" ? "interrupted" : t.status === "failed" ? "errored" : undefined); this.retire(String(t.id)); this.turns.delete(tid as string);
+			} else if (method === "item/started" || method === "item/completed") {
+				const item = agentRecord(p.item);
+				if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") {
+					if (!agentId(item.id)) return false;
+					const key = JSON.stringify([tid, root ? this.rootTurnId : this.turns.get(String(tid)), method, item.id]);
+					if (this.seenItems.has(key)) return false;
+					if (this.seenItems.size >= 4096) { this.partial = true; return before !== JSON.stringify([this.agents, [...this.fresh], this.partial]); }
+					this.seenItems.add(key);
+				}
+				const admit = (id: unknown) => {
+					if (!agentId(id) || id === this.rootThreadId) return false;
+					this.put(id, { parentThreadId: String(tid) });
+					if (!this.rows.has(id)) return false;
+					this.announced.add(id);
+					const early = this.earlyTurns.get(id); if (early) { this.turns.set(id, early); this.earlyTurns.delete(id); }
+					return true;
+				};
+				if (item.type === "subAgentActivity" && method === "item/started" && admit(item.agentThreadId)) {
+					const name = agentText(agentName(typeof item.agentPath === "string" ? item.agentPath : undefined), 128);
+					this.put(item.agentThreadId as string, name ? { name } : {}, item.kind === "started" ? "running" : item.kind === "completed" ? "completed" : item.kind === "interrupted" ? "interrupted" : undefined);
+				} else if (item.type === "collabAgentToolCall") {
+					const states = agentRecord(item.agentsStates);
+					for (const id of Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []) {
+						if (!admit(id)) continue;
+						const task = method === "item/completed" && item.status === "completed" && (item.tool === "spawnAgent" || item.tool === "followupTask") ? agentText(item.prompt, 1024) : undefined;
+						const st = agentRecord(states[id as string]).status;
+						this.put(id as string, task ? { task } : {}, agentStatus(st) && st !== "unknown" && st !== "turnComplete" ? st : undefined);
+					}
+				}
+			}
+		}
+		return before !== JSON.stringify([this.agents, [...this.fresh], this.partial]);
+	}
+	private name(a: CodexAgentFact): string {
+		if (a.name) return a.name;
+		let n = Math.min(8, a.threadId.length);
+		while (this.agents.some(b => b.threadId !== a.threadId && b.threadId.slice(0, n) === a.threadId.slice(0, n))) n++;
+		return `Agent ${a.threadId.slice(0, n)}`;
+	}
+	private status(a: CodexAgentFact): string { return `${this.fresh.has(a.threadId) ? "" : "Last recorded: "}${AGENT_LABELS[a.status]}`; }
+	preview(width: number): string[] {
+		// Keep active/unknown assignments visible before terminal reports; preserve data order for saved bounds.
+		const terminal = (a: CodexAgentFact) => ["completed", "interrupted", "errored", "shutdown", "notFound"].includes(a.status);
+		const preview = this.agents.sort((a, b) => Number(terminal(a)) - Number(terminal(b)));
+		if (!this.rows.size && !this.unavailable && !this.notSaved && !this.partial) return [];
+		return [` Codex agents · ${this.rows.size} · /agents-codex`, ...preview.slice(0, 4).map(a => ` ${this.name(a)} · ${this.status(a)} — ${a.task ?? "Task not provided"}`), ...(this.rows.size > 4 ? [` +${this.rows.size - 4} more · /agents-codex`] : []), ...(this.unavailable ? [" Saved agent overview is unavailable."] : []), ...(this.partial ? [" Partial overview · display limit"] : []), ...(this.notSaved ? [" Not saved"] : [])].map(s => truncateToWidth(s, Math.max(1, width)));
+	}
+	full(width: number): string[] {
+		const rows = [`Codex agents · ${this.fresh.size ? "Reported activity" : "Last recorded"}`];
+		if (this.unavailable) rows.push("Saved agent overview is unavailable.");
+		else if (!this.rows.size) rows.push("No agent activity recorded on this branch.");
+		this.agents.forEach((a, n) => {
+			rows.push(...wrapTextWithAnsi(`${n + 1}. ${this.name(a)} [${a.threadId}] · ${this.status(a)}`, Math.max(1, width)));
+			rows.push(...wrapTextWithAnsi(`   Observed ${a.observedAt}`, Math.max(1, width)), ...wrapTextWithAnsi(`   ${a.task ?? "Task not provided"}`, Math.max(1, width)));
+		});
+		if (this.partial) rows.push("Partial overview · display limit");
+		if (this.notSaved) rows.push("Not saved");
+		return rows.map(s => truncateToWidth(s, Math.max(1, width)));
+	}
+}
+
+// Use the same registry protocol as the shell/todo badges; this extension also works alone.
+const AGENTS_FOOTER_REGISTRY = Symbol.for("@earendil-works/pi-rbf:footer-registry");
+type AgentFooterHook = { id: string; reset?: () => void; render(this: any, lines: string[], width: number): string[]; handleMouse(this: any, event: TuiMouseEvent): TuiMouseEventResult | undefined };
+type AgentFooterRegistry = { hooks: Map<string, AgentFooterHook>; originalRender: (width: number) => string[]; originalHandleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined; installedRender?: (this: any, width: number) => string[]; installedHandleMouse?: (this: any, event: TuiMouseEvent) => TuiMouseEventResult | undefined; isHandlingMouse?: boolean };
+
+/** OSC22 uses CSS shapes on these direct hosts; keep highlight-only fallback elsewhere. */
+export function createCodexAgentPointer(env: NodeJS.ProcessEnv = process.env, tty: boolean | undefined = process.stdout.isTTY, write: (data: string) => void = data => { process.stdout.write(data); }) {
+	const supported = !!tty && !env.TMUX && !env.STY && (env.TERM_PROGRAM === "ghostty" || env.TERM_PROGRAM === "cmux" || env.TERM === "xterm-ghostty" || env.TERM === "xterm-kitty" || !!env.KITTY_WINDOW_ID);
+	let active = false;
+	return (inside: boolean) => {
+		if (!supported || inside === active) return;
+		try { write("\x1b]22;" + (inside ? "pointer" : "text") + "\x1b\\"); active = inside; } catch {}
+	};
+}
+
+export function installCodexAgentsFooter(visible: () => boolean, open: () => void, getTheme: () => Pick<Theme, "fg" | "bold"> | undefined, pointer?: (inside: boolean) => void) {
+	const proto = FooterComponent.prototype as typeof FooterComponent.prototype & { [AGENTS_FOOTER_REGISTRY]?: AgentFooterRegistry; handleMouse?: AgentFooterRegistry["originalHandleMouse"] };
+	let registry = proto[AGENTS_FOOTER_REGISTRY];
+	if (!registry) {
+		const created: AgentFooterRegistry = { hooks: new Map(), originalRender: proto.render, originalHandleMouse: proto.handleMouse };
+		created.installedRender = function(width) {
+			let lines = created.originalRender.call(this, width);
+			for (const hook of created.hooks.values()) { try { lines = hook.render.call(this, lines, width); } catch {} }
+			return lines;
+		};
+		created.installedHandleMouse = function(event) {
+			if (created.isHandlingMouse) return;
+			created.isHandlingMouse = true;
+			try {
+				const original = created.originalHandleMouse?.call(this, event);
+				if (original?.handled) return original;
+				for (const hook of created.hooks.values()) { try { const result = hook.handleMouse.call(this, event); if (result?.handled) return result; } catch {} }
+				return original;
+			} finally { created.isHandlingMouse = false; }
+		};
+		registry = proto[AGENTS_FOOTER_REGISTRY] = created;
+		proto.render = created.installedRender;
+		proto.handleMouse = created.installedHandleMouse;
+	}
+	let hovered = false, screenY: number | undefined;
+	let bounds: { start: number; end: number } | undefined;
+	const setHovered = (inside: boolean) => { if (hovered === inside) return; hovered = inside; try { pointer?.(inside); } catch {} };
+	const reset = () => { setHovered(false); bounds = undefined; screenY = undefined; };
+	const hook: AgentFooterHook = {
+		id: "codex-agents",
+		reset,
+		render(lines, width) {
+			bounds = undefined;
+			if (!visible() || !lines[1]) { reset(); return lines; }
+			const stats = lines[1], padding = stats.match(/^(.*?)(\s{2,})(.*)$/);
+			const left = padding ? padding[1] : stats, right = padding?.[3] ?? "";
+			const start = visibleWidth(left) + 3, end = start + 6;
+			// An incomplete label must not leave a stale or invisible mouse target.
+			if (end > width) { reset(); return lines; }
+			const theme = getTheme();
+			const label = hovered ? (theme?.bold?.("\x1b[7magents\x1b[27m") ?? "\x1b[7magents\x1b[27m") : (theme?.fg?.("accent", "agents") ?? "agents");
+			const added = left + " " + (theme?.fg?.("dim", "· ") ?? "· ") + label;
+			const remaining = width - visibleWidth(added) - 2;
+			const model = remaining > 0 ? truncateToWidth(right, remaining, "") : "";
+			bounds = { start, end };
+			const result = [...lines];
+			result[1] = added + (model ? " ".repeat(Math.max(2, width - visibleWidth(added) - visibleWidth(model))) + model : "");
+			return result;
+		},
+		handleMouse(event) {
+			if (!visible() || !bounds) { reset(); return; }
+			screenY = event.screenY - event.y + 1;
+			const inside = event.y === 1 && event.x >= bounds.start && event.x < bounds.end;
+			if (event.type === "move") {
+				const changed = hovered !== inside; setHovered(inside);
+				return changed ? { handled: true, render: true } : inside ? { handled: true } : undefined;
+			}
+			if (inside && event.button === "left") {
+				if (event.type === "press") return { handled: true };
+				if (event.type === "click") { setHovered(false); open(); return { handled: true, render: true }; }
+			}
+		},
+	};
+	registry.hooks.get(hook.id)?.reset?.();
+	registry.hooks.set(hook.id, hook);
+	return {
+		reset,
+		pointerInput(data: string): boolean {
+			const event = /^\x1b\[<\d+;(\d+);(\d+)[Mm]$/.exec(data);
+			if (!hovered || !event) return false;
+			const outside = !bounds || Number(event[2]) - 1 !== screenY || Number(event[1]) - 1 < bounds.start || Number(event[1]) - 1 >= bounds.end;
+			if (outside) setHovered(false);
+			return outside;
+		},
+		dispose() {
+			reset();
+			if (registry!.hooks.get(hook.id) !== hook) return;
+			registry!.hooks.delete(hook.id);
+			if (!registry!.hooks.size && proto.render === registry!.installedRender && proto.handleMouse === registry!.installedHandleMouse) {
+				proto.render = registry!.originalRender;
+				if (registry!.originalHandleMouse) proto.handleMouse = registry!.originalHandleMouse; else delete proto.handleMouse;
+				delete proto[AGENTS_FOOTER_REGISTRY];
+			}
+		},
+	};
+}
+
 // ── the extension ────────────────────────────────────────────────────────────
 export function createRbfCodex(options: RbfCodexOptions = {}) {
 	const command = options.command ?? DEFAULT_COMMAND;
@@ -1106,6 +1381,100 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			runningCompact: null as { threadId: string; navigatedDuringRun: boolean; finished: boolean } | null,
 			recentCompactTerminal: null as { at: number; outcome: "completed" | "failed" | "unknown"; reason?: string; replayed: boolean } | null,
 		};
+
+		const agents = new CodexAgentRoster(now);
+		let agentsFooter: ReturnType<typeof installCodexAgentsFooter> | undefined;
+		let footerInputOff: (() => void) | undefined;
+		let overviewGeneration = 0;
+		let overviewTimer: ReturnType<typeof setTimeout> | undefined;
+		let overviewDirty = false;
+		let dialogDepth = 0;
+		let overviewClose: (() => void) | undefined;
+		let overviewSettled: Promise<void> | undefined;
+		let overviewRender: (() => void) | undefined;
+		const overviewSafe = (fn: () => void) => { try { fn(); } catch {} };
+		function presentAgents(): void {
+			overviewSafe(() => {
+				const ctx = state.ctx;
+				if (ctx?.mode !== "tui") return;
+				ctx.ui.setWidget("rbf-codex-agents", ctx.model?.provider === PROVIDER_ID && (agents.agents.length || agents.unavailable || agents.notSaved || agents.partial) ? () => ({render: (width: number) => agents.preview(width), invalidate() {}}) : undefined);
+				overviewRender?.();
+			});
+		}
+		function flushAgents(): void {
+			if (overviewTimer) clearTimeout(overviewTimer);
+			overviewTimer = undefined;
+			if (!overviewDirty || !agents.rootThreadId || state.ctx?.mode !== "tui") return;
+			overviewDirty = false;
+			try { pi.appendEntry(AGENTS_ENTRY_TYPE, agents.snapshot()); agents.notSaved = false; }
+			catch { agents.notSaved = true; }
+			presentAgents();
+		}
+		function changedAgents(persist = true): void {
+			presentAgents();
+			if (!persist || state.ctx?.mode !== "tui") return;
+			overviewDirty = true;
+			if (!overviewTimer) {
+				const generation = overviewGeneration;
+				overviewTimer = setTimeout(() => { if (generation === overviewGeneration) flushAgents(); }, 250);
+			}
+		}
+		function leaveAgents(): void {
+			overviewSafe(() => { agentsFooter?.reset(); agents.finish(); flushAgents(); overviewGeneration++; overviewClose?.(); overviewRender = undefined; presentAgents(); });
+		}
+		function restoreAgents(ctx: ExtensionContext): void {
+			overviewSafe(() => {
+				agentsFooter?.reset();
+				if (overviewTimer) clearTimeout(overviewTimer);
+				overviewTimer = undefined; overviewDirty = false; overviewGeneration++;
+				agents.restore("", null); // failed branch lookup must never retain the source roster
+				const branch = ctx.sessionManager.getBranch();
+				const binding = newestEntries(ctx).thread;
+				const entry = [...branch].reverse().find(e => e.type === "custom" && typeof (e as {customType?: unknown}).customType === "string" && ((e as {customType: string}).customType).startsWith("rbf-codex-agents/")) as { customType?: string; data?: unknown } | undefined;
+				agents.restore(binding?.threadId ?? "", entry ? (entry.customType !== AGENTS_ENTRY_TYPE || entry.data === undefined ? null : entry.data) : undefined);
+			});
+			presentAgents();
+		}
+		async function openAgents(ctx: ExtensionContext): Promise<void> {
+			agentsFooter?.reset();
+			if (ctx.mode !== "tui" || ctx.model?.provider !== PROVIDER_ID) return;
+			if (dialogDepth) { ctx.ui.notify("Finish the Codex dialog before opening the agent overview.", "warning"); return; }
+			if (overviewSettled) return;
+			let offset = 0;
+			const generation = overviewGeneration;
+			try {
+				overviewSettled = ctx.ui.custom<void>((tui, theme, _keys, done) => {
+					let closed = false;
+					const close = () => { if (!closed) { closed = true; done(); } };
+					overviewClose = close; overviewRender = () => tui.requestRender();
+					let page = 10, count = 0;
+					return {
+						render(width: number) {
+							const rows = agents.full(width); page = Math.max(1, Math.floor((process.stdout.rows ?? 24) * 0.8) - 1); count = rows.length;
+							offset = Math.max(0, Math.min(offset, count - page));
+							return [...rows.slice(offset, offset + page), theme.fg("dim", truncateToWidth("↑↓ scroll · PgUp/PgDn page · Home/End · Esc/Enter close", width))];
+						},
+						invalidate() {},
+						handleInput(data: string) {
+							if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) { close(); return; }
+							if (matchesKey(data, Key.up)) offset--;
+							else if (matchesKey(data, Key.down)) offset++;
+							else if (matchesKey(data, Key.pageUp)) offset -= page;
+							else if (matchesKey(data, Key.pageDown)) offset += page;
+							else if (matchesKey(data, Key.home)) offset = 0;
+							else if (matchesKey(data, Key.end)) offset = count;
+							tui.requestRender();
+						},
+						dispose: close,
+					};
+				}, { overlay: true, overlayOptions: { width: "100%", maxHeight: "80%" } });
+				await overviewSettled;
+			} catch {} finally {
+				if (generation === overviewGeneration) { overviewClose = undefined; overviewRender = undefined; }
+				overviewSettled = undefined;
+			}
+		}
+		pi.registerCommand("agents-codex", { description: "See Codex agents and their last reported assignments/statuses", handler: async (_args, ctx) => openAgents(ctx) });
 
 		const notify = (text: string, type: "info" | "warning" | "error" = "info") => {
 			if (state.ctx?.mode === "tui") state.ctx.ui.notify(text, type);
@@ -1234,12 +1603,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			/** A steer Codex refused because the turn ended; it becomes the next turn's prompt when this one drains. */
 			unsent: UserInputItem[] | undefined;
 
+			readonly overviewGeneration = overviewGeneration;
 			constructor(
 				readonly client: AppServerClient,
 				readonly threadId: string,
 			) {
 				this.unsubscribe = client.subscribe((m) => {
 					try {
+						overviewSafe(() => { if (this.overviewGeneration === overviewGeneration && state.ctx?.mode === "tui" && m.id === undefined && agents.observe(m.method, (m.params ?? {}) as Rec)) changedAgents(); });
 						this.project(m);
 					} catch (e) {
 						// One malformed notification must never escape readline's event and take Pi down.
@@ -1305,6 +1676,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			private end(end: { status: string; error?: string }): void {
 				if (this.ended) return;
 				this.ended = end;
+				overviewSafe(() => { if (this.overviewGeneration === overviewGeneration) { agents.finish(); flushAgents(); presentAgents(); } });
 				if (this.turnId) this.client.endedTurns.add(this.turnId);
 				for (const child of this.children.values()) if (child.turnId) this.client.endedTurns.add(child.turnId);
 				this.unsubscribe();
@@ -1708,6 +2080,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			const codexId = codexModelId(model.id);
 			if (codexId) turnParams.model = codexId;
 			// Subscribe before sending: readline hands over every line of one stdout chunk at once, so a notification can share a chunk with the response.
+			overviewSafe(() => { const reset = agents.begin(threadId, client.endedTurns); changedAgents(reset); });
 			const turn = new ActiveTurn(client, threadId);
 			state.activeTurn = turn;
 			let started: Rec;
@@ -1723,10 +2096,12 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				}
 			} catch (e) {
 				turn.dispose();
+				overviewSafe(() => { agents.finish(); flushAgents(); presentAgents(); });
 				if (state.activeTurn === turn) state.activeTurn = null;
 				throw e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e;
 			}
 			turn.turnId = String(rec(started.turn).id);
+			overviewSafe(() => agents.setTurn(turn.turnId!));
 			return turn;
 		}
 
@@ -1970,6 +2345,13 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 
 		/** Opens the dialog(s) for one request and answers it exactly once. */
 		async function answerRequest(turn: ActiveTurn, req: PendingRequest, ctx: ExtensionContext): Promise<Answer> {
+			dialogDepth++;
+			try {
+				try { overviewClose?.(); await overviewSettled; } catch {}
+				return await answerRequestBody(turn, req, ctx);
+			} finally { dialogDepth--; }
+		}
+		async function answerRequestBody(turn: ActiveTurn, req: PendingRequest, ctx: ExtensionContext): Promise<Answer> {
 			const client = turn.client;
 			const kind = req.kind;
 			if (!ctx.hasUI) {
@@ -2531,6 +2913,12 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				if (registeredMcpTool) mcpDisplay?.start(sessionId, registeredMcpTool);
 			}
 			state.ctx = ctx;
+			agentsFooter?.dispose(); footerInputOff?.();
+			if (ctx.mode === "tui") overviewSafe(() => {
+				agentsFooter = installCodexAgentsFooter(() => state.ctx?.mode === "tui" && state.ctx.model?.provider === PROVIDER_ID && !!(agents.agents.length || agents.unavailable || agents.partial || agents.notSaved), () => { const current = state.ctx; if (current && !state.shuttingDown) void openAgents(current).catch(() => {}); }, () => state.ctx?.ui.theme, createCodexAgentPointer());
+				footerInputOff = ctx.ui.onTerminalInput?.(data => { if (agentsFooter?.pointerInput(data)) presentAgents(); return undefined; });
+			});
+			restoreAgents(ctx);
 			state.client = null;
 			state.shuttingDown = false;
 			state.noticedPolicy = false;
@@ -2556,6 +2944,9 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			if (last?.message?.role === "user" || (last?.message?.role === "assistant" && last.message.stopReason === "toolUse")) notify(NOTICE.interrupted, "warning");
 		});
 		const closeChild = async () => {
+			leaveAgents();
+			overviewSafe(() => { agentsFooter?.dispose(); footerInputOff?.(); });
+			agentsFooter = undefined; footerInputOff = undefined;
 			state.shuttingDown = true;
 			state.recentCompactTerminal = null;
 			if (state.checkingCompact) {
@@ -2588,6 +2979,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return { cancel: true };
 		});
 		pi.on("session_tree", async (_event, _ctx) => {
+			state.ctx = _ctx; restoreAgents(_ctx);
 			const terminal = state.recentCompactTerminal;
 			if (terminal && !terminal.replayed && now() - terminal.at < 1500) {
 				terminal.replayed = true;
@@ -2614,10 +3006,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		});
 		pi.on("session_before_tree", async (event, ctx) => {
+			leaveAgents();
 			if (isBoundBranch(ctx) && event.preparation.userWantsSummary) return { summary: { summary: NOTICE.treeSummary } };
 			return {};
 		});
 		pi.on("model_select", async (event, ctx) => {
+			state.ctx = ctx; agentsFooter?.reset();
+			overviewSafe(() => { overviewClose?.(); overviewRender = undefined; });
+			presentAgents();
 			if (event.model.provider !== PROVIDER_ID || event.previousModel?.provider === PROVIDER_ID) return;
 			const hasAnswer = ctx.sessionManager.getBranch().some((e) => e.type === "message" && (e as { message?: { role: string } }).message?.role === "assistant");
 			if (hasAnswer) notify(NOTICE.coldStart);

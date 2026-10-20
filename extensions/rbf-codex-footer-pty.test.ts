@@ -1,0 +1,30 @@
+import { spawnSync } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { replayScreen } from "./test-support/rbf-pty-screen.ts";
+const ROOT = resolve(import.meta.dirname, "..");
+const DRIVER = join(import.meta.dirname, "test-support/rbf-row-gate-drive.py");
+const EXT = join(import.meta.dirname, "test-support/rbf-codex-agents-extension.ts");
+const OWNER = join(import.meta.dirname, "rbf-background-tasks.ts");
+const HOSTS = process.env.RBF_FOOTER_PI ? [process.env.RBF_FOOTER_PI] : [join(ROOT,"node_modules/.bin/pi"), "/Users/tomhosiawa/Library/pnpm/bin/pi"];
+const submit = (s: string) => [{paste:s},{key:"enter"}];
+describe("Codex agents footer in actual Pi", () => {
+ for (const host of HOSTS) for (const cols of [80,120]) it(host + " hover/click, shell coexistence and draft at " + cols, () => {
+  const dir = "/Volumes/tom-ssd/tmp/pi-10.11-footer/native/" + Date.now() + "-" + cols;
+  const agent = join(dir,"agent"), sessions = join(dir,"sessions"); for (const p of [dir,agent,sessions]) mkdirSync(p,{recursive:true});
+  writeFileSync(join(agent,"settings.json"), JSON.stringify({defaultProvider:"codex-harness",defaultModel:"codex",defaultThinkingLevel:"medium"}));
+  const stamp="2026-10-20T14:00:00.000Z", session=join(sessions,"recorded.jsonl");
+  const entries=[{type:"session",version:3,id:"footer-fixture",timestamp:stamp,cwd:dir},{type:"custom",id:"00000001",parentId:null,timestamp:stamp,customType:"rbf-codex-thread/v1",data:{threadId:"thread-fake-1",cwd:dir,sessionId:"footer-fixture"}},{type:"custom",id:"00000002",parentId:"00000001",timestamp:stamp,customType:"rbf-codex-agents/v1",data:{version:1,rootThreadId:"thread-fake-1",observedAt:stamp,partial:false,agents:[{threadId:"agent-a",name:"Reviewer",task:"Check cancellation and reopening",status:"completed",observedAt:stamp},{threadId:"agent-b",name:"Builder",task:"Implement the small fix",status:"running",observedAt:stamp}]}}];
+  writeFileSync(session,entries.map(e=>JSON.stringify(e)).join("\n")+"\n");
+  const raw=join(dir,"terminal.raw");
+  const steps=[{wait:"Builder"},{sleep:.5},...submit("!sleep 30"),{sleep:.8},{key:"ctrl-b"},{sleep:.6},{paste:"draft text"},{bytes:"\x1b[D\x1b[D\x1b[D"},{sleep:.3},{snapshot:"before"},{locate:{name:"badge",text:"· agents",columnText:"agents"}},{bytes:"\x1b[<35;{badgeX};{badge}M"},{sleep:.3},{snapshot:"hover"},{bytes:"\x1b[<0;{badgeX};{badge}M"},{bytes:"\x1b[<0;{badgeX};{badge}m"},{sleep:.4},{snapshot:"overlay"},{key:"escape"},{sleep:.3},{snapshot:"closed"},{paste:"X"},{key:"enter"},{wait:"FAKE_DONE"},{sleep:.3},{locate:{name:"shell",text:"1 shell",columnText:"1 shell"}},{bytes:"\x1b[<35;{shellX};{shell}M"},{bytes:"\x1b[<0;{shellX};{shell}M"},{bytes:"\x1b[<0;{shellX};{shell}m"},{wait:"Shell details"},{sleep:.3},{snapshot:"shells"},{key:"escape"},{sleep:.3},...submit("/cancel"),{sleep:.6},...submit("/reload"),{sleep:1},...submit("/agents-codex"),{sleep:.3},{snapshot:"reloaded"},{key:"escape"}];
+  const plan={cwd:dir,argv:[host,"--no-extensions","--no-skills","--no-prompt-templates","-e",EXT,"-e",OWNER,"--session",session,"--session-dir",sessions,"--tui-mode","fullscreen"],env:{TERM_PROGRAM:cols===120?"ghostty":"Apple_Terminal",KITTY_WINDOW_ID:"",TMUX:"",STY:"",PI_CODING_AGENT_DIR:agent,RBF_FAKE_SCENARIO:JSON.stringify({retainHistory:true,turn:[{kind:"answer",id:"done",text:"FAKE_DONE"},{kind:"complete"}]}),RBF_FAKE_LOG:join(dir,"native.jsonl"),RBF_FAKE_HISTORY:join(dir,"history.json")},cols,rows:38,timeout:25,out:raw,steps};
+  writeFileSync(join(dir,"plan.json"),JSON.stringify(plan,null,2)); const result=spawnSync("python3",[DRIVER],{input:JSON.stringify(plan),encoding:"utf8",timeout:30000}); const bytes=readFileSync(raw); writeFileSync(join(dir,"result.json"),JSON.stringify({code:result.status,stderr:result.stderr,marks:result.stdout},null,2)); expect(result.status,dir+" "+result.stderr).toBe(0);
+  const shapes=bytes.toString("utf8").match(/\x1b\]22;(pointer|text)\x1b\\/g)??[];expect(shapes).toEqual(cols===120?["\x1b]22;pointer\x1b\\","\x1b]22;text\x1b\\"]:[]);
+  const marks=JSON.parse(result.stdout);const screen=(mark:string)=>{const s=replayScreen(bytes.subarray(0,marks[mark]),cols,38);writeFileSync(join(dir,mark+".txt"),s.lines.join("\n"));return s;};
+  const before=screen("before");expect(before.lines.join("\n")).toContain("1 shell");const y=before.lines.findIndex(l=>l.includes("· agents"));expect(y).toBeGreaterThan(0);const x=before.lines[y].indexOf("agents");expect(screen("hover").cells[y][x].inverse).toBe(true);expect(screen("hover").cells[y][x].bold).toBe(true);const sx=before.lines[y].indexOf("1 shell");expect(before.cells[y][x].fg).toBe(before.cells[y][sx].fg);
+  const view=screen("overlay").lines.join("\n");expect(view).toContain("Reviewer [agent-a]");expect(view).toContain("Check cancellation and reopening");expect(view).toContain("Builder [agent-b]");expect(screen("closed").lines.join("\n")).toContain("draft text");expect(screen("shells").lines.join("\n")).toContain("Shell details");expect(screen("reloaded").lines.join("\n")).toContain("Last recorded: Running");
+  const calls=readFileSync(join(dir,"native.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(calls.filter(c=>c.method==="turn/start")).toHaveLength(1);expect(calls.find(c=>c.method==="turn/start").params.input[0].text.endsWith("draft tXext")).toBe(true);console.log("footer native receipt: "+dir);
+ },35000);
+});

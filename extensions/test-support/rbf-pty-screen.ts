@@ -8,7 +8,7 @@ export type Screen = { cells: Cell[][]; lines: string[] };
 /** The terminal's size from byte `at` on, for a run that resized it. */
 export type Resize = { at: number; cols: number; rows: number };
 
-const TOKEN = /\x1b\[([0-9;?<>=]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78DEMc]|([\x00-\x1a\x1c-\x1f])|([^\x00-\x1f]+)/gy;
+const TOKEN = /\x1b\[([0-9;?<>=]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b_[^\x1b]*(?:\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78DEMc]|([\x00-\x1a\x1c-\x1f])|([^\x00-\x1f]+)/gy;
 
 export function replayScreen(raw: Buffer, cols: number, rows: number, resizes: Resize[] = []): Screen {
 	const blank = (): Cell => ({ ch: " ", fg: "", bg: "", bold: false, dim: false, inverse: false });

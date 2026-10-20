@@ -34,6 +34,7 @@ function makePi(opts?: { getThinkingLevel?: () => string; events?: unknown }) {
 	const pi = {
 		on: vi.fn((event: string, handler: Handler) => handlers.set(event, handler)),
 		appendEntry: vi.fn((customType: string, data: unknown) => entries.push({ customType, data })),
+		registerCommand: vi.fn(),
 		registerTool: vi.fn((tool: Tool) => tools.set(tool.name, tool)),
 		registerProvider: vi.fn((name: string, config: ProviderConfig) => {
 			provider = { name, config };
@@ -69,6 +70,7 @@ function makeCtx(opts: {
 	const branch = opts.branch ?? [];
 	const notify = vi.fn();
 	const setWorkingMessage = vi.fn();
+	const setWidget = vi.fn();
 	/** Scripted dialog answers, in order; `undefined` is Escape. */
 	const answers: (string | undefined)[] = [];
 	const dialogs: { kind: "select" | "input"; title: string; options?: string[]; signal?: AbortSignal }[] = [];
@@ -90,7 +92,7 @@ function makeCtx(opts: {
 	const ctx = {
 		mode,
 		hasUI: mode === "tui",
-		ui: { notify, setWorkingMessage, select, input },
+		ui: { notify, setWorkingMessage, setWidget, select, input },
 		get model() {
 			return currentModel;
 		},
@@ -229,6 +231,77 @@ describe("rbf-codex", () => {
 		};
 		return { ...fx, ...c, turn, shutdown, exec, round, editor, submit };
 	}
+
+	describe("sub-agent overview", () => {
+		it("malformed unrelated branch entries and failed lookup cannot retain the source roster", async () => {
+			const stamp="2026-10-20T14:00:00.000Z";const b=await boot({branch:[{type:"custom",customType:ENTRY_TYPE,data:{threadId:"old",cwd:process.cwd(),sessionId:"session-A"}},{type:"custom",customType:"rbf-codex-agents/v1",data:{version:1,rootThreadId:"old",observedAt:stamp,partial:false,agents:[{threadId:"old-child",name:"OldBranchOnly",status:"running",observedAt:stamp}]}}]});
+			await b.handlers.get("session_before_tree")?.({preparation:{}},b.ctx);b.branch.splice(0,b.branch.length,{type:"custom",customType:ENTRY_TYPE,data:{threadId:"new",cwd:process.cwd(),sessionId:"session-A"}},{type:"custom",customType:42} as any);await b.handlers.get("session_tree")?.({},b.ctx);expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.at(-1)?.[1]).toBeUndefined();
+			(b.ctx.sessionManager as any).getBranch=()=>{throw Error("bad branch");};await b.handlers.get("session_tree")?.({},b.ctx);const widget=vi.mocked(b.ctx.ui.setWidget).mock.calls.at(-1)?.[1];expect((widget as any)({},fakeTheme).render(120).join("\n")).toContain("unavailable");expect((widget as any)({},fakeTheme).render(120).join("\n")).not.toContain("OldBranchOnly");
+		});
+
+		it("pending source flush precedes branch mutation and late observer callbacks cannot append on the replacement", async () => {
+			scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"a",agentPath:"/root/Reviewer"},{kind:"sleep",ms:500},{kind:"subAgent",activity:"started",agentThreadId:"b",agentPath:"/root/Builder"},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
+			const b=await boot({persistAppends:true});const running=b.turn("delegate");await vi.waitFor(()=>expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.some(c=>typeof c[1]==="function")).toBe(true));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);
+			await b.handlers.get("session_before_tree")?.({preparation:{}},b.ctx);expect(b.branch.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);b.branch.splice(0);await b.handlers.get("session_tree")?.({},b.ctx);await running;await new Promise(r=>setTimeout(r,300));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);expect(b.branch.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);
+		});
+
+		it("newest malformed/future overview is unavailable instead of absent or older fallback", async () => {
+			for(const entry of [{type:"custom",customType:"rbf-codex-agents/v1"},{type:"custom",customType:"rbf-codex-agents/v2",data:{version:2}}]) {
+				const b=await boot({branch:[{type:"custom",customType:ENTRY_TYPE,data:{threadId:"root",cwd:process.cwd(),sessionId:"session-A"}},entry]});
+				const widget=vi.mocked(b.ctx.ui.setWidget).mock.calls.at(-1)?.[1];expect(typeof widget).toBe("function");expect((widget as any)({},fakeTheme).render(120).join("\n")).toContain("Saved agent overview is unavailable.");
+			}
+		});
+		it("overlay End and resize expose the final task; model replacement closes without replacing editor", async () => {
+			const stamp="2026-10-20T14:00:00.000Z";const agents=Array.from({length:30},(_,i)=>({threadId:"agent-"+i,status:"running",task:"TASK-"+i,observedAt:stamp}));
+			const b=await boot({branch:[{type:"custom",customType:ENTRY_TYPE,data:{threadId:"root",cwd:process.cwd(),sessionId:"session-A"}},{type:"custom",customType:"rbf-codex-agents/v1",data:{version:1,rootThreadId:"root",agents,observedAt:stamp,partial:false}}]});
+			let component:any,closed=false; (b.ctx.ui as any).custom=vi.fn((factory:any)=>new Promise<void>(resolve=>{component=factory({requestRender(){}},fakeTheme,{},()=>{closed=true;resolve();});}));
+			const open=vi.mocked(b.pi.registerCommand).mock.calls.find(c=>c[0]==="agents-codex")![1].handler("",b.ctx as any);
+			const old=Object.getOwnPropertyDescriptor(process.stdout,"rows");
+			try {for(const rows of [50,38,20]) {Object.defineProperty(process.stdout,"rows",{value:rows,configurable:true});component.render(80);component.handleInput("\x1b[F");const lines=component.render(80);expect(lines.length).toBeLessThanOrEqual(Math.floor(rows*.8));expect(lines.join("\n")).toContain("TASK-29");}}
+			finally {if(old)Object.defineProperty(process.stdout,"rows",old);else delete (process.stdout as any).rows;}
+			const previous=b.ctx.model;b.ctx.model={...model(),provider:"other"};await b.handlers.get("model_select")?.({model:b.ctx.model,previousModel:previous},b.ctx);await open;expect(closed).toBe(true);
+		});
+		it("250ms burst timer coalesces unchanged reports without another root-end snapshot", async () => {
+			scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"a",agentPath:"/root/Reviewer"},{kind:"collab",tool:"wait",receivers:["a"],states:{a:"running"}},{kind:"sleep",ms:650},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
+			const b=await boot({persistAppends:true});const running=b.turn("delegate");await vi.waitFor(()=>expect(vi.mocked(b.ctx.ui.setWidget).mock.calls.some(c=>typeof c[1]==="function")).toBe(true));
+			expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(0);await new Promise(r=>setTimeout(r,300));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);await running;expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);
+		});
+
+		it("overview isolation: failing widget and persistence leave the native request sequence unchanged", async () => {
+			const run=async(mode: "tui"|"print",fail=false)=>{
+				scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"agent-a",agentPath:"/root/Reviewer"},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
+				writeFileSync(logPath, ""); const b=await boot({mode});
+				if(fail){vi.mocked(b.ctx.ui.setWidget).mockImplementation(()=>{throw Error("widget");});const original=vi.mocked(b.pi.appendEntry).getMockImplementation()!;vi.mocked(b.pi.appendEntry).mockImplementation((type,data)=>{if(type==="rbf-codex-agents/v1")throw Error("disk");return original(type,data);});}
+				expect((await b.turn("delegate")).text).toBe("DONE");await b.shutdown();
+				return sent().filter(m=>m.method).map(({method,params})=>({method,params}));
+			};
+			const baseline=await run("print");expect(await run("tui",true)).toEqual(baseline);expect(await run("tui")).toEqual(baseline);
+		});
+		it("coalescing and flush: duplicate reports/output create one snapshot and tree restores only selected branch", async () => {
+			scenario({turn:[{kind:"subAgent",activity:"started",agentThreadId:"agent-a",agentPath:"/root/Reviewer"},{kind:"subAgent",activity:"started",agentThreadId:"agent-a",agentPath:"/root/Reviewer"},{kind:"reasoning",delta:"output only"},{kind:"answer",id:"a",text:"DONE"},{kind:"complete"}]});
+			const b=await boot({persistAppends:true});await b.turn("delegate");expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(1);
+			await b.handlers.get("session_before_tree")?.({preparation:{}},b.ctx);const saved=b.entries.filter(e=>e.customType==="rbf-codex-agents/v1").length;
+			b.branch.splice(0);await b.handlers.get("session_tree")?.({},b.ctx);await new Promise(r=>setTimeout(r,300));expect(b.entries.filter(e=>e.customType==="rbf-codex-agents/v1")).toHaveLength(saved);
+			const widgets=vi.mocked(b.ctx.ui.setWidget).mock.calls;expect(widgets.at(-1)?.[1]).toBeUndefined();
+		});
+
+		it("shows announced names and saves branch-local recorded facts without extra native requests", async () => {
+			scenario({ turn: [
+				{kind:"subAgent",activity:"started",agentThreadId:"agent-a",agentPath:"/root/Reviewer"},
+				{kind:"collab",tool:"wait",receivers:["agent-b"],states:{"agent-b":"pendingInit"}},
+				{kind:"answer",id:"a",text:"PARENT DONE"},{kind:"complete"}
+			] });
+			const b=await boot({persistAppends:true});
+			expect((await b.turn("delegate")).text).toBe("PARENT DONE");
+			const calls=vi.mocked(b.ctx.ui.setWidget).mock.calls;
+			expect(calls.some(c=>typeof c[1] === "function" && c[1]({} as any, fakeTheme as any).render(120).join("\n").includes("Reviewer"))).toBe(true);
+			const saved=b.entries.filter(e=>e.customType==="rbf-codex-agents/v1");
+			expect(saved.length).toBeGreaterThan(0);
+			expect(saved.at(-1)?.data).toMatchObject({version:1,agents:[{threadId:"agent-a",name:"Reviewer",status:"running"},{threadId:"agent-b",status:"pendingInit"}]});
+			expect(methods().filter(m=>m==="turn/start")).toHaveLength(1);
+			expect(methods().some(m=>m==="thread/read"||m==="thread/list")).toBe(false);
+		});
+	});
 
 	describe("registration", () => {
 		it("registers with api, baseUrl, apiKey, streamSimple, refreshModels, and the bootstrap model", async () => {
