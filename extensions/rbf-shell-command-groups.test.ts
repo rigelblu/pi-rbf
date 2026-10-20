@@ -1534,7 +1534,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				const item=(id:string)=>kind==="command"?{kind,id,command:"printf fixture",cwd:work,output:["fixture"]}:{kind,id,server:"arbitrary",tool:"invoke",arguments:{},result:{content:[]}};
 				process.env.RBF_FAKE_SCENARIO=JSON.stringify({threadIds:replaceClient?["actual-root"]:["actual-root-A","actual-root-B"],turn:[item(replaceClient?"duplicate":"a"),{kind:"complete"}],laterTurns:[item("b"),{kind:"complete"}]});
 				const seen:any[]=[];s.events.on(SHELL_DISPLAY_CHANNEL,(message)=>seen.push(message));
-				const pi:any={events:s.events,on:(name:string,handler:any)=>handlers.set(name,handler),appendEntry(){},registerTool:(tool:any)=>s.definitions.set(tool.name,tool),registerProvider:(_name:string,config:any)=>{provider=config;},getThinkingLevel:()=>"medium"};
+				const pi:any={events:s.events,on:(name:string,handler:any)=>handlers.set(name,handler),appendEntry(){},registerCommand(){},registerTool:(tool:any)=>s.definitions.set(tool.name,tool),registerProvider:(_name:string,config:any)=>{provider=config;},getThinkingLevel:()=>"medium"};
 				const ctx:any={...s.ctx,model:BOOTSTRAP_MODEL,isIdle:()=>true,hasPendingMessages:()=>false,ui:{notify(){},setWorkingMessage(){}},sessionManager:{getSessionId:()=>SESSION,getCwd:()=>work,getBranch:()=>[],getLeafId:()=>"leaf"}};
 				createRbfCodex({argv:[],command:{bin:process.execPath,args:[resolve(import.meta.dirname,"test-support/rbf-codex-fake-app-server.ts")]}})(pi);
 				try{
