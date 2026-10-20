@@ -1,3 +1,4 @@
+import { literalMcpLabel, mcpDisplayMetadata, type McpDisplay } from "./lib/mcp-display.js";
 import { InteractiveMode, parseArgs, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Container, MouseRegion, visibleWidth } from "@earendil-works/pi-tui";
@@ -5,8 +6,23 @@ import { Box, Container, MouseRegion, visibleWidth } from "@earendil-works/pi-tu
 // The first half of this file is the rules: what a fact proves, which rows group, what a header says. It touches no host.
 // The second half, from "the view" on, puts those rules on screen through Pi's transcript container.
 
-/** Which execution owner a shell row belongs to: Pi's wrapped agent bash, or a Codex command item. */
-export type ShellSource = "pi-bash" | "codex-command";
+/** The admitted native row kind. MCP lifecycle and process evidence remain separate. */
+export type ShellSource = "pi-bash" | "codex-command" | "pi-mcp" | "codex-mcp";
+export type McpState = "pending" | "active" | "returned" | "failed" | "unknown";
+export type McpIdentity = { server: string; tool?: string; display?: McpDisplay };
+export type McpEvidence = { state: McpState; conflicted?: boolean };
+
+/** Only the native invocation lifecycle is known. Active never asserts remote dispatch. */
+export function reduceMcpEvidence(previous: McpEvidence, fact: "start" | "returned" | "failed" | "lost"): McpEvidence {
+	if (previous.conflicted) return previous;
+	if (fact === "returned" || fact === "failed") {
+		if ((previous.state === "returned" || previous.state === "failed") && previous.state !== fact) return { state: "unknown", conflicted: true };
+		return previous.state === fact ? previous : { state: fact };
+	}
+	if (fact === "start" && previous.state === "pending") return { state: "active" };
+	if (fact === "lost" && (previous.state === "pending" || previous.state === "active")) return { state: "unknown" };
+	return previous;
+}
 
 /**
  * What the execution owner can vouch for. `succeeded` and `failed` need the owner's terminal evidence.
@@ -18,13 +34,17 @@ export type ExecutionEvidence =
 
 export type EvidenceState = ExecutionEvidence["state"];
 
-/** One standalone agent shell invocation. The view feeds every field; nothing here is read from command output. */
+/** One standalone native invocation. The view feeds every field; nothing is inferred from output text. */
 export type ShellMember = {
 	sessionId: string;
 	toolCallId: string;
 	source: ShellSource;
 	/** Codex only. A root row stores `""`. */
 	threadId?: string;
+	/** Live captured client scope; never serialized into tool arguments. */
+	clientGeneration?: string;
+	admissionGeneration?: string;
+	mcp?: { identity: McpIdentity; evidence: McpEvidence };
 	agentPath?: string;
 	cwd: string;
 	/** Pi's own row. The group draws it and never copies its output. */
@@ -54,8 +74,8 @@ export type ShellGroup = {
 };
 
 /** The id a member is known by everywhere: its session, source and call id. A Codex item id alone is not one. */
-export function memberId(member: Pick<ShellMember, "sessionId" | "source" | "toolCallId">): string {
-	return `${member.sessionId}\u0000${member.source}\u0000${member.toolCallId}`;
+export function memberId(member: Pick<ShellMember, "sessionId" | "source" | "toolCallId" | "clientGeneration" | "threadId">): string {
+	return `${member.sessionId}\u0000${member.source}\u0000${member.toolCallId}${member.clientGeneration ? `\u0000${JSON.stringify([member.clientGeneration, member.threadId])}` : ""}`;
 }
 
 // ── evidence ──
@@ -231,11 +251,12 @@ export function replayEvidence(source: ShellSource, record: ReplayRecord | undef
 /** One row of the transcript in drawn order: a grouped shell call, or anything else. `visible` is false for a row that draws no line, as a tool-only assistant placeholder does. */
 export type TranscriptRow = { kind: "shell"; member: ShellMember } | { kind: "content"; visible: boolean };
 
-/** Two adjacent calls share a group only within one session, source, agent and working directory. */
+/** Adjacent calls share a group within one presentation owner family, captured client/thread, agent and directory. */
 function sameRun(a: ShellMember, b: ShellMember): boolean {
 	return (
 		a.sessionId === b.sessionId &&
-		a.source === b.source &&
+		a.source.startsWith("codex-") === b.source.startsWith("codex-") &&
+		a.clientGeneration === b.clientGeneration &&
 		(a.threadId ?? "") === (b.threadId ?? "") &&
 		(a.agentPath ?? "") === (b.agentPath ?? "") &&
 		a.cwd === b.cwd
@@ -348,6 +369,8 @@ export type FactMessage = {
 	toolCallId: string;
 	revision: number;
 	fact: OwnerFact;
+	clientGeneration?: string;
+	threadId?: string;
 };
 
 /**
@@ -358,7 +381,7 @@ export type FactMessage = {
 export function applyEvidence(view: ShellView, message: FactMessage): boolean {
 	const id = memberId(message);
 	const member = view.members.get(id);
-	if (!member || view.owners.get(message.source) !== message.ownerGeneration) return false;
+	if (!member || member.mcp || view.owners.get(message.source) !== message.ownerGeneration) return false;
 	if (member.ownerGeneration === message.ownerGeneration && message.revision <= (member.revision ?? -Infinity)) return false;
 	member.ownerGeneration = message.ownerGeneration;
 	member.revision = message.revision;
@@ -377,7 +400,7 @@ export function applyEvidence(view: ShellView, message: FactMessage): boolean {
 export type ColorRole = "toolTitle" | "muted" | "dim" | "error";
 export type Span = { text: string; role: ColorRole };
 /** One piece of a header or identity line. A line breaks between fields before it breaks inside one. */
-export type Field = Span[];
+export type Field = Span[] & { separator?: string };
 /** One drawn line: `column` spaces, then the spans. */
 export type WrappedLine = { column: number; spans: Span[] };
 
@@ -415,7 +438,7 @@ const ALONE: Partial<Record<Tally, string>> = { background: "background", cancel
  * The group header as fields: the mark and count first, then one field per status. The one site for header copy.
  * No members give no fields, so nothing is drawn.
  */
-export function formatHeader(members: readonly ShellMember[], expanded: boolean): Field[] {
+function formatShellHeader(members: readonly ShellMember[], expanded: boolean): Field[] {
 	const n = members.length;
 	if (n === 0) return [];
 	const counts = new Map<Tally, number>();
@@ -449,6 +472,84 @@ export function formatHeader(members: readonly ShellMember[], expanded: boolean)
 	return fields;
 }
 
+/** Stable exact category identity; app names are labels, never keys. */
+function mcpKey(member: ShellMember): string {
+	const { server, tool, display } = member.mcp!.identity;
+	return JSON.stringify(member.source === "pi-mcp" ? ["pi", server] : display?.connectorId || display?.pluginId ? ["codex", server, display.connectorId, display.pluginId] : ["codex", server, tool]);
+}
+
+/** Shell-only copy stays identical. Mixed runs have one clause per category, in first-invocation order. */
+export function formatHeader(members: readonly ShellMember[], expanded: boolean): Field[] {
+	if (!members.some((member) => member.mcp)) return formatShellHeader(members, expanded);
+	const categories = new Map<string, ShellMember[]>();
+	for (const member of members) {
+		const key = member.mcp ? mcpKey(member) : "shell";
+		if (!categories.has(key)) categories.set(key, []);
+		categories.get(key)!.push(member);
+	}
+	const labels = new Map<string, string>();
+	for (const [key, group] of categories) {
+		const identity = group[0]!.mcp?.identity;
+		if (identity) labels.set(key, literalMcpLabel(identity.display?.appName || (group[0]!.source === "pi-mcp" ? identity.server : `${identity.server}/${identity.tool ?? ""}`)));
+	}
+	const duplicateKeys = () => {
+		const counts = new Map<string, number>();
+		for (const label of labels.values()) counts.set(label, (counts.get(label) ?? 0) + 1);
+		return [...labels].filter(([, label]) => counts.get(label)! > 1).map(([key]) => key);
+	};
+	const sameNames = new Set(duplicateKeys());
+	for (const key of sameNames) {
+		const identity = categories.get(key)![0]!.mcp!.identity;
+		labels.set(key, `${labels.get(key)} [${literalMcpLabel(identity.server)}/${literalMcpLabel(identity.tool ?? "")}]`);
+	}
+	const samePairs = new Set(duplicateKeys().filter((key) => sameNames.has(key)));
+	for (const key of samePairs) {
+		const display = categories.get(key)![0]!.mcp!.identity.display;
+		labels.set(key, `${labels.get(key)}${display?.connectorId ? ` [connector: ${literalMcpLabel(display.connectorId)}]` : ""}${display?.pluginId ? ` [plugin: ${literalMcpLabel(display.pluginId)}]` : ""}`);
+	}
+	// Delimiters inside raw values must not leave two distinct identities with an identical visible label.
+	const originalLabels = new Map(labels);
+	for (;;) {
+		const collisions = duplicateKeys();
+		if (!collisions.length) break;
+		// A supplied label can imitate a disambiguator. Exact structured identity first is injective;
+		// each collision promotes at least one more category, so even adversarial labels terminate.
+		for (const key of collisions) {
+			labels.set(key, `identity: ${literalMcpLabel(key)} [name: ${originalLabels.get(key)}]`);
+		}
+	}
+
+	const fields: Field[] = [];
+	for (const [key, group] of categories) {
+		let clause: Field[];
+		if (key === "shell") {
+			clause = formatShellHeader(group, expanded).map((field) => field.map((span) => ({ ...span })));
+			clause[0]![0]!.text = clause[0]![0]!.text.slice(2);
+		} else {
+			const n = group.length;
+			const complete = group.every((member) => ["returned", "failed"].includes(member.mcp!.evidence.state));
+			const label = labels.get(key)!;
+			// Quote reserved summary punctuation in the final label, including identity suffixes.
+			const literalLabel = /[;·"]/.test(label) ? JSON.stringify(label) : label;
+			clause = [[{ text: complete ? `called ${literalLabel} ${n} ${n === 1 ? "time" : "times"}` : `${literalLabel}: ${n} ${n === 1 ? "call" : "calls"}`, role: "toolTitle" }]];
+			for (const state of ["active", "failed", "error", "pending", "unknown"] as const) {
+				const count = group.filter((member) => {
+					const tally = member.mcp!.evidence.state === "unknown" && member.rowError ? "error" : member.mcp!.evidence.state;
+					return tally === state;
+				}).length;
+				if (!count) continue;
+				if (state === "error" && n === 1) { clause.push([{ text: "error", role: "error" }], [{ text: "status unknown", role: "muted" }]); continue; }
+				const text = state === "error" ? `${count} ${count === 1 ? "error" : "errors"} (status unknown)` : state === "unknown" && count === n ? "status unknown" : n === 1 && state !== "failed" ? state : `${count} ${state}`;
+				clause.push([{ text, role: state === "failed" || state === "error" ? "error" : "muted" }]);
+			}
+		}
+		if (fields.length) clause[0]!.separator = "; ";
+		else clause[0]!.unshift({ text: expanded ? "▾ " : "▸ ", role: "toolTitle" });
+		fields.push(...clause);
+	}
+	return fields;
+}
+
 /** One line per member in the background, in member order: the Pi task id, or the Codex item still running after an interruption. */
 export function identityLines(members: readonly ShellMember[]): Field[][] {
 	const lines: Field[][] = [];
@@ -470,10 +571,11 @@ export function identityLines(members: readonly ShellMember[]): Field[][] {
  * - `No recorded result`: the member is unknown, its call is no longer open, and no result is recorded. An open call has no result yet
  */
 export function memberLines(members: readonly ShellMember[]): string[][] {
-	const known = members.filter((member) => member.executionEvidence.state !== "unknown").length;
+	const state = (member: ShellMember) => member.mcp?.evidence.state ?? member.executionEvidence.state;
+	const known = members.filter((member) => state(member) !== "unknown").length;
 	return members.map((member) => {
 		const lines: string[] = [];
-		if (member.executionEvidence.state !== "unknown") return lines;
+		if (state(member) !== "unknown") return lines;
 		if (!member.rowError && known > 0) lines.push("Status unknown");
 		if (!member.callOpen && !member.hasResult) lines.push("No recorded result");
 		return lines;
@@ -517,10 +619,11 @@ export function wrapFields(fields: readonly Field[], width: number, firstColumn 
 	};
 	const widthOf = (spans: Span[]) => spans.reduce((sum, span) => sum + cells(span.text), 0);
 	for (const field of fields) {
+		const separator = field.separator ?? SEPARATOR;
 		const fieldCells = widthOf(field);
-		if (line && line.spans.length > 0 && used + SEPARATOR.length + fieldCells <= width) {
-			line.spans.push({ text: SEPARATOR, role: "dim" }, ...field);
-			used += SEPARATOR.length + fieldCells;
+		if (line && line.spans.length > 0 && used + separator.length + fieldCells <= width) {
+			line.spans.push({ text: separator, role: "dim" }, ...field);
+			used += separator.length + fieldCells;
 			continue;
 		}
 		let at = newLine();
@@ -564,7 +667,7 @@ export function wrapFields(fields: readonly Field[], width: number, firstColumn 
 /** The private channel the two execution owners publish on. */
 export const SHELL_DISPLAY_CHANNEL = "rbf:shell-display:v1";
 /** Said once per attachment when the groups can't attach or a projection fault detaches them. Pi prefixes it with `Warning: `. */
-export const UNAVAILABLE_WARNING = "Shell command groups unavailable; showing native tool rows.";
+export const UNAVAILABLE_WARNING = "Tool call groups unavailable; showing native tool rows.";
 
 /** Where the live view sits. The wrappers below look it up on every call, so a wrapper left under someone else's patch after a reload reaches the new view, or nothing. */
 export const VIEW_KEY = Symbol.for("rbf.shellCommandGroups.view");
@@ -681,7 +784,7 @@ const NO_ACTION = {};
  * The view for one extension instance: it learns the live `InteractiveMode`, listens to the owners, and draws groups.
  * `call` is what every wrapper reaches. Until an instance is captured, and after a fault, every call goes straight to Pi.
  */
-export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
+export function createShellGroupsView(pi: Pick<ExtensionAPI, "events"> & Partial<Pick<ExtensionAPI, "getAllTools">>) {
 	let view = createShellView();
 	let inert = false;
 	let stopped = false;
@@ -698,9 +801,16 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	let restored = new WeakSet<object>();
 	let rowOf = new Map<string, any>();
 	let idOf = new Map<any, string>();
-	let idOfCall = new Map<string, string>();
+	let idOfCall = new Map<string, string[]>();
 	/** One candidate member per row, so a frame that changes nothing allocates nothing. */
 	let candidates = new WeakMap<object, ShellMember>();
+	type Membership = { sessionId: string; source: ShellSource; ownerGeneration: string; toolCallId: string; itemId: string; clientGeneration: string; threadId: string; agentPath: string; cwd: string };
+	let memberships = new WeakMap<object, Membership>();
+	let invalidBindings = new WeakSet<object>();
+	let requestedBindings = new WeakSet<object>();
+	let nativeAnnouncements = new WeakMap<object, Announcement>();
+	type McpFinal = { isError: boolean; itemId?: string; invalidItemId?: boolean };
+	let nativeFinals = new WeakMap<object, McpFinal>();
 	let signature: unknown[] = [];
 	let layout: Layout | undefined;
 	let armed: Armed | undefined;
@@ -749,6 +859,11 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		restored = new WeakSet();
 		signature = [];
 		announcements.clear();
+		nativeFinals = new WeakMap();
+		memberships = new WeakMap();
+		invalidBindings = new WeakSet();
+		requestedBindings = new WeakSet();
+		nativeAnnouncements = new WeakMap();
 	}
 
 	/** The groups can't go on: every call goes to Pi from now, the frame redraws natively, and one warning says so. */
@@ -816,40 +931,67 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 
 	/** The announcement that makes this child a member, if any: its tool definition carries the announced execute and renderer functions, and it is built as Pi builds a default tool row. */
 	function announcementFor(child: any): Announcement | undefined {
-		if (announcements.size === 0 || !(child instanceof ToolExecutionComponent)) return undefined;
+		if (!(child instanceof ToolExecutionComponent)) return undefined;
 		const row = child as any;
 		const definition = row.toolDefinition;
 		if (!definition || typeof definition.execute !== "function") return undefined;
+		const box = row.contentBox;
+		const parts = box instanceof Box ? box.children : undefined;
+		if (!Array.isArray(parts) || parts.length < 1 || parts.length > 2 || !parts.every((part) => part instanceof MouseRegion)) return undefined;
+		if (!Array.isArray(row.children) || !row.children.includes(box) || typeof row.setExpanded !== "function" || typeof row.toolCallId !== "string") return undefined;
 		for (const announced of announcements.values()) {
-			if (definition.execute !== announced.execute || definition.renderCall !== announced.renderCall || definition.renderResult !== announced.renderResult) continue;
-			if (row.toolName !== announced.toolName || typeof row.toolCallId !== "string" || typeof row.setExpanded !== "function") return undefined;
-			// The shape check reads the row's box and its mouse regions, never what a region holds: pi-45 swaps that.
-			const box = row.contentBox;
-			const parts = box instanceof Box ? box.children : undefined;
-			if (!Array.isArray(parts) || parts.length < 1 || parts.length > 2 || !parts.every((part) => part instanceof MouseRegion)) return undefined;
-			if (!Array.isArray(row.children) || !row.children.includes(box)) return undefined;
-			return announced;
+			if (definition.execute === announced.execute && definition.renderCall === announced.renderCall && definition.renderResult === announced.renderResult && row.toolName === announced.toolName) return announced;
 		}
-		return undefined;
+		// Built-in MCP is admitted from host provenance, never a parsed tool name or an extension's claimed label.
+		if (!sessionId || typeof pi.getAllTools !== "function") return undefined;
+		const current = host?.session?.getToolDefinition(row.toolName);
+		if (!current || current.execute !== definition.execute || current.renderCall !== definition.renderCall || current.renderResult !== definition.renderResult) return undefined;
+		const captured = nativeAnnouncements.get(row);
+		if (captured) {
+			if (captured.execute !== definition.execute || captured.renderCall !== definition.renderCall || captured.renderResult !== definition.renderResult || (row.result?.details?.server !== undefined && row.result.details.server !== (captured as any).server)) return undefined;
+			return captured;
+		}
+		const metadata = pi.getAllTools().find((tool) => tool.name === row.toolName) as any;
+		const aliases = metadata?.namespace?.aliases;
+		if (metadata?.sourceInfo?.path !== "builtin:mcp" || metadata?.sourceInfo?.source !== "builtin" || !Array.isArray(aliases) || aliases.length !== 1 || typeof aliases[0] !== "string" || !aliases[0]) return undefined;
+		const details = row.result?.details;
+		if (details?.server !== undefined && details.server !== aliases[0]) return undefined;
+		if (restored.has(row) && (details?.server !== aliases[0] || typeof details?.tool !== "string" || !details.tool)) return undefined;
+		let native = nativeAnnouncements.get(row);
+		if (native && (native as any).server !== aliases[0]) return undefined;
+		if (!native) {
+			native = { kind: "announce", sessionId, source: "pi-mcp", ownerGeneration: "native-mcp", toolName: row.toolName, execute: definition.execute, renderCall: definition.renderCall, renderResult: definition.renderResult };
+			(native as any).server = aliases[0];
+			nativeAnnouncements.set(row, native);
+		}
+		return native;
 	}
 
-	function candidateFor(row: any, announced: Announcement): ShellMember {
+	function candidateFor(row: any, announced: Announcement): ShellMember | undefined {
+		const args = row.args && typeof row.args === "object" ? row.args : undefined;
+		const codex = announced.source.startsWith("codex-");
+		let membership: Membership | undefined;
+		if (codex && !restored.has(row)) {
+			if (!args || invalidBindings.has(args)) return undefined;
+			if (!memberships.has(args) && !requestedBindings.has(args)) {
+				requestedBindings.add(args);
+				requestSnapshot([row.toolCallId]);
+			}
+			membership = memberships.get(args);
+			if (!membership || membership.source !== announced.source || membership.ownerGeneration !== announced.ownerGeneration || membership.sessionId !== announced.sessionId || membership.toolCallId !== row.toolCallId || membership.itemId !== args.itemId || membership.agentPath !== args.agentPath || (args.threadId !== "" && args.threadId !== membership.threadId) || (announced.source === "codex-command" && args.cwd && args.cwd !== membership.cwd)) return undefined;
+		}
 		let member = candidates.get(row);
-		if (!member || member.source !== announced.source || member.sessionId !== announced.sessionId) {
-			const args = row.args && typeof row.args === "object" ? row.args : {};
-			const codex = announced.source === "codex-command";
+		if (!member || member.source !== announced.source || member.sessionId !== announced.sessionId || member.admissionGeneration !== announced.ownerGeneration || member.clientGeneration !== membership?.clientGeneration || member.threadId !== (membership?.threadId ?? (codex ? args?.threadId : undefined))) {
+			const mcp = announced.source === "codex-mcp" || announced.source === "pi-mcp";
+			if (mcp && announced.source === "codex-mcp" && (typeof args?.server !== "string" || !args.server || typeof args?.tool !== "string" || !args.tool)) return undefined;
 			member = {
-				sessionId: announced.sessionId,
-				toolCallId: row.toolCallId,
-				source: announced.source,
-				threadId: codex && typeof args.threadId === "string" ? args.threadId : undefined,
-				agentPath: codex && typeof args.agentPath === "string" ? args.agentPath : undefined,
-				cwd: String((codex && typeof args.cwd === "string" && args.cwd) || row.cwd || ""),
-				nativeRow: row,
-				...NO_EVIDENCE,
-				rowError: false,
-				callOpen: true,
-				hasResult: false,
+				sessionId: announced.sessionId, toolCallId: row.toolCallId, source: announced.source,
+				threadId: membership?.threadId ?? (codex && typeof args?.threadId === "string" ? args.threadId : undefined),
+				agentPath: membership?.agentPath ?? (codex && typeof args?.agentPath === "string" ? args.agentPath : undefined),
+				clientGeneration: membership?.clientGeneration, admissionGeneration: announced.ownerGeneration,
+				cwd: membership?.cwd ?? String((codex && typeof args?.cwd === "string" && args.cwd) || row.cwd || ""),
+				nativeRow: row, ...NO_EVIDENCE, rowError: false, callOpen: true, hasResult: false,
+				...(mcp ? { mcp: { identity: announced.source === "pi-mcp" ? { server: (announced as any).server } : { server: args!.server, tool: args!.tool, display: mcpDisplayMetadata(args!.display) }, evidence: { state: "pending" as const } } } : {}),
 			};
 			candidates.set(row, member);
 		}
@@ -857,11 +999,11 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	}
 
 	/** What Pi's own row says about a call: whether it is still open, and whether a final result or error is recorded. */
-	function rowFacts(row: any): Pick<ShellMember, "rowError" | "callOpen" | "hasResult"> {
+	function rowFacts(row: any, mcp = false): Pick<ShellMember, "rowError" | "callOpen" | "hasResult"> {
 		const final = row.result !== undefined && row.isPartial === false;
 		return {
 			callOpen: !restored.has(row) && host.pendingTools.get(row.toolCallId) === row,
-			hasResult: final,
+			hasResult: mcp ? nativeFinals.has(row) : final,
 			rowError: final && row.result.isError === true,
 		};
 	}
@@ -878,7 +1020,9 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	/** A call that is over while no owner has said a thing about how it went: what its own record proves, which for Pi bash is nothing. */
 	function settle(id: string): void {
 		const member = view.members.get(id);
-		if (!member || member.callOpen || member.executionEvidence.state !== "waiting") return;
+		if (!member) return;
+		if (member.mcp) { refreshMcp(member); return; }
+		if (member.callOpen || member.executionEvidence.state !== "waiting") return;
 		const held = view.evidence.get(id);
 		if (held) {
 			setEvidence(id, reduceEvidence(held, { kind: "lost" }));
@@ -891,12 +1035,23 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		setEvidence(id, replayEvidence(member.source, final ? { matched, isError: row.result.isError === true, details } : undefined));
 	}
 
+	function refreshMcp(member: ShellMember): void {
+		if (!member.mcp) return;
+		const row = member.nativeRow as any;
+		const final = nativeFinals.get(row);
+		const contradictory = final && ((row.result !== undefined && row.isPartial === false && (row.result.isError === true) !== final.isError) || (member.source === "codex-mcp" && (final.invalidItemId || (final.itemId !== undefined && final.itemId !== row.args?.itemId))));
+		const fact = final ? final.isError ? "failed" : "returned" : !member.callOpen ? "lost" : row.executionStarted ? "start" : undefined;
+		if (!fact) return;
+		const next: McpEvidence = contradictory ? { state: "unknown", conflicted: true } : reduceMcpEvidence(member.mcp.evidence, fact);
+		if (next !== member.mcp.evidence) { member.mcp.evidence = next; updateMember(view, memberId(member)); }
+	}
+
 	/** Re-reads one member's row. Its group is touched only when something the header or a member line shows has changed. */
 	function refresh(id: string | undefined): void {
 		const member = id === undefined ? undefined : view.members.get(id);
 		const row = id === undefined ? undefined : rowOf.get(id);
 		if (!member || !row) return;
-		const facts = rowFacts(row);
+		const facts = rowFacts(row, !!member.mcp);
 		if (facts.callOpen !== member.callOpen || facts.hasResult !== member.hasResult || facts.rowError !== member.rowError) updateMember(view, id!, facts);
 		settle(id!);
 	}
@@ -920,6 +1075,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	function loseSource(source: ShellSource): void {
 		for (const [id, member] of view.members) {
 			if (member.source !== source) continue;
+			if (member.mcp) { member.mcp.evidence = reduceMcpEvidence(member.mcp.evidence, "lost"); updateMember(view, id); continue; }
 			const held = view.evidence.get(id) ?? { executionEvidence: member.executionEvidence, executionStarted: member.executionStarted };
 			const next = reduceEvidence(held, { kind: "lost" });
 			if (next !== held) setEvidence(id, next);
@@ -929,7 +1085,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	function onMessage(data: unknown): void {
 		const message = data as { kind?: unknown; sessionId?: unknown; source?: unknown; ownerGeneration?: unknown } | undefined;
 		if (!message || typeof message !== "object" || message.sessionId !== sessionId) return;
-		if (message.source !== "pi-bash" && message.source !== "codex-command") return;
+		if (message.source !== "pi-bash" && message.source !== "codex-command" && message.source !== "codex-mcp") return;
 		if (typeof message.ownerGeneration !== "string") return;
 		const source = message.source;
 		switch (message.kind) {
@@ -938,6 +1094,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 				const next = message as Announcement;
 				// An owner repeats its announcement with every snapshot it answers; the same one again changes nothing.
 				if (known && known.ownerGeneration === next.ownerGeneration && known.execute === next.execute && known.renderCall === next.renderCall && known.renderResult === next.renderResult) break;
+				armed = undefined;
 				if (known && known.ownerGeneration !== next.ownerGeneration) loseSource(source);
 				announcements.set(source, next);
 				view.owners.set(source, next.ownerGeneration);
@@ -946,11 +1103,43 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 			}
 			case "withdraw":
 				if (announcements.get(source)?.ownerGeneration !== message.ownerGeneration) return;
+				armed = undefined;
 				loseSource(source);
 				announcements.delete(source);
 				view.owners.delete(source);
 				requestRender();
 				break;
+			case "membership-withdraw":
+			case "membership": {
+				const told = message as any;
+				if (source === "pi-bash" || announcements.get(source)?.ownerGeneration !== told.ownerGeneration || !(told.binding instanceof WeakRef) || told.revision !== (told.kind === "membership-withdraw" ? 2 : 1)) return;
+				const args = told.binding.deref();
+				if (!args || typeof args !== "object") return;
+				const keys = ["sessionId", "source", "ownerGeneration", "toolCallId", "itemId", "clientGeneration", "threadId", "agentPath", "cwd"] as const;
+				if (keys.some((key) => typeof told[key] !== "string") || !told.clientGeneration || !told.threadId || !told.itemId || told.toolCallId !== `codex-${told.itemId}`) return;
+				const known = memberships.get(args);
+				if (told.kind === "membership-withdraw") {
+					const matchesArgs = args.itemId === told.itemId && args.agentPath === told.agentPath && (args.threadId === "" || args.threadId === told.threadId) && (source !== "codex-command" || !args.cwd || args.cwd === told.cwd);
+					// A revocation can precede a delayed snapshot. Its weak tombstone blocks that older admission too.
+					if (matchesArgs && (!known || keys.every((key) => known[key] === told[key]))) {
+						armed = undefined;
+						invalidBindings.add(args);
+						memberships.delete(args);
+						requestRender();
+					}
+					return;
+				}
+				if (invalidBindings.has(args)) return;
+				if (known && keys.some((key) => known[key] !== told[key])) {
+					armed = undefined;
+					invalidBindings.add(args);
+				} else if (!known) {
+					armed = undefined;
+					memberships.set(args, Object.fromEntries(keys.map((key) => [key, told[key]])) as Membership);
+				}
+				requestRender();
+				break;
+			}
 			case "fact": {
 				const told = message as Partial<FactMessage>;
 				if (typeof told.toolCallId !== "string" || typeof told.revision !== "number" || !isOwnerFact(told.fact)) return;
@@ -968,7 +1157,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 	function reconcile(entries: Entry[]): void {
 		const rows: TranscriptRow[] = entries.map((entry) =>
 			entry.announced
-				? { kind: "shell", member: candidateFor(entry.child, entry.announced) }
+				? { kind: "shell", member: candidateFor(entry.child, entry.announced)! }
 				: { kind: "content", visible: entry.lines!.length > 0 },
 		);
 		reconcileMembership(view, rows, host.toolOutputExpanded === true);
@@ -979,7 +1168,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		const added: string[] = [];
 		for (const entry of entries) {
 			if (!entry.announced) continue;
-			const candidate = candidateFor(entry.child, entry.announced);
+			const candidate = candidateFor(entry.child, entry.announced)!;
 			const id = memberId(candidate);
 			const member = view.members.get(id)!;
 			if (!known.has(id)) {
@@ -988,10 +1177,10 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 				if (!view.evidence.has(id)) Object.assign(member, NO_EVIDENCE, { ownerGeneration: undefined, revision: undefined });
 			}
 			member.nativeRow = entry.child;
-			Object.assign(member, rowFacts(entry.child));
+			Object.assign(member, rowFacts(entry.child, !!member.mcp));
 			rowOf.set(id, entry.child);
 			idOf.set(entry.child, id);
-			idOfCall.set(member.toolCallId, id);
+			idOfCall.set(member.toolCallId, [...(idOfCall.get(member.toolCallId) ?? []), id]);
 		}
 		// A fact that arrived before its row was drawn went nowhere; the owners still hold it. Only the rows that joined are asked about.
 		if (added.length > 0) requestSnapshot(added);
@@ -1051,15 +1240,17 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 		const ids = new Set<string>();
 		for (const child of container.children) {
 			let announced = announcementFor(child);
+			const candidate = announced ? candidateFor(child, announced) : undefined;
+			if (!candidate) announced = undefined;
 			if (announced) {
 				// One call id drawn by two rows: the second stays Pi's own row, so no command is ever hidden.
-				const id = memberId(candidateFor(child, announced));
+				const id = memberId(candidate!);
 				if (ids.has(id)) announced = undefined;
 				else ids.add(id);
 			}
 			if (announced) {
 				entries.push({ child, announced });
-				seen.push(child, announced.ownerGeneration);
+				seen.push(child, announced.ownerGeneration, candidate);
 			} else {
 				const lines: string[] = native(() => child.render(width));
 				entries.push({ child, lines });
@@ -1235,10 +1426,36 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 
 	function afterEvent(event: any): void {
 		if (!host || !event) return;
-		if (typeof event.toolCallId === "string") refresh(idOfCall.get(event.toolCallId));
+		if (typeof event.toolCallId === "string") for (const id of idOfCall.get(event.toolCallId) ?? []) refresh(id);
 		// A message that ends in an error or an abort closes its calls there, without an event of their own.
 		else if (event.type === "message_end" || event.type === "agent_end" || event.type === "agent_start") {
 			for (const [id, member] of view.members) if (member.callOpen) refresh(id);
+		}
+	}
+
+	function mcpFinal(result: any, isError: boolean): McpFinal {
+		const itemId = result?.details?.itemId;
+		return { isError, ...(itemId === undefined ? {} : typeof itemId === "string" ? { itemId } : { invalidItemId: true }) };
+	}
+
+	/** Match only the selected replay's original call/result pair; ambiguous IDs prove no final result. */
+	function replayFinals(before: Set<unknown>, items: any[]): void {
+		const calls = new Map<string, any[]>();
+		const results = new Map<string, any[]>();
+		for (const item of items) {
+			if (item?.role === "assistant" && Array.isArray(item.content)) for (const call of item.content) {
+				if (call.type === "toolCall") calls.set(call.id, [...(calls.get(call.id) ?? []), call]);
+			}
+			if (item?.role === "toolResult") results.set(item.toolCallId, [...(results.get(item.toolCallId) ?? []), item]);
+		}
+		for (const child of container.children as unknown[]) {
+			if (before.has(child) || !(child instanceof ToolExecutionComponent)) continue;
+			const row = child as any;
+			const matchingCalls = calls.get(row.toolCallId); const matchingResults = results.get(row.toolCallId);
+			if (matchingCalls?.length !== 1 || matchingResults?.length !== 1) continue;
+			const call = matchingCalls[0]; const result = matchingResults[0];
+			if (call.arguments !== row.args || call.name !== row.toolName || result.toolName !== row.toolName) continue;
+			nativeFinals.set(row, mcpFinal(result, result.isError === true));
 		}
 	}
 
@@ -1297,10 +1514,16 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 					});
 					const result = original.apply(self, args);
 					if (self === host) guard("renderSessionItems", () => afterReplay(before, open));
+					if (self === host) guard("replayFinals", () => replayFinals(before, args[0]));
 					return result;
 				}
 				case "handleEvent": {
 					guard("capture", () => capture(self));
+					guard("nativeFinal", () => {
+						const event = args[0];
+						const row = self === host && event?.type === "tool_execution_end" && !event.parentToolCallId ? host.pendingTools.get(event.toolCallId) : undefined;
+						if (row instanceof ToolExecutionComponent && (row as any).toolName === event.toolName && event.result) nativeFinals.set(row, mcpFinal(event.result, event.isError === true));
+					});
 					const result = original.apply(self, args);
 					const after = () => {
 						if (self === host) guard("handleEvent", () => afterEvent(args[0]));
@@ -1335,6 +1558,10 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events">) {
 				if (id !== sessionId) {
 					sessionId = id;
 					announcements.clear();
+					memberships = new WeakMap();
+					invalidBindings = new WeakSet();
+					requestedBindings = new WeakSet();
+					nativeAnnouncements = new WeakMap();
 					view = createShellView();
 					signature = [];
 				}

@@ -10,7 +10,7 @@ export type FakeElicitation = { message: string; app?: string; subtitle?: string
 export type FakeTurnEvent =
 	/** `completion` overrides fields of the completed item and `omit` leaves fields out of it, for a completion Codex sent incomplete or at odds with itself. */
 	| { kind: "command"; id: string; command: string; cwd?: string; exitCode?: number; output?: string[]; approvals?: FakeApproval[]; aggregatedOutput?: string; incomplete?: boolean; completion?: Record<string, unknown>; omit?: string[] }
-	| { kind: "toolCall"; id: string; server: string; tool: string; arguments?: unknown; appContext?: Record<string, unknown> | null; result?: { content?: unknown[]; structuredContent?: unknown }; status?: "completed" | "failed"; error?: string; elicitations?: FakeElicitation[]; progress?: boolean; incomplete?: boolean; durationMs?: number }
+	| { kind: "toolCall"; id: string; server: string; tool: string; arguments?: unknown; appContext?: Record<string, unknown> | null; completedAppContext?: Record<string, unknown>; pluginId?: string; result?: { content?: unknown[]; structuredContent?: unknown }; status?: "completed" | "failed"; error?: string; elicitations?: FakeElicitation[]; progress?: boolean; incomplete?: boolean; durationMs?: number }
 	| { kind: "startupStatus"; name: string; status: string; error?: string | null; failureReason?: string | null }
 	/** A `subAgentActivity` item on the current turn, as Codex announces a sub-agent (probe 2026-09-14). */
 	| { kind: "subAgent"; activity: "started" | "interacted" | "completed" | "interrupted"; agentThreadId: string; agentPath: string }
@@ -35,6 +35,8 @@ export type FakeTurnEvent =
 	| { kind: "complete"; status?: "completed" | "interrupted" | "failed"; errorMessage?: string; after?: FakeTurnEvent[] };
 
 export type FakeScenario = {
+	/** Consecutive native thread/start identities for display-isolation probes. */
+	threadIds?: string[];
 	/** Reject `initialize` with this message. */
 	initializeError?: string;
 	/** Reject `turn/start` when it carries this model id (the retired-model case). */
@@ -101,6 +103,7 @@ if (process.argv.includes("--version")) {
 
 const log = process.env.RBF_FAKE_LOG;
 const THREAD_ID = "thread-fake-1";
+let threadStartCounter = 0;
 type HistoryTurn = { id: string; status: string; items: Record<string, unknown>[] };
 const historyPath = process.env.RBF_FAKE_HISTORY;
 const history: HistoryTurn[] = scenario.retainHistory && historyPath && existsSync(historyPath)
@@ -244,7 +247,7 @@ async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
 				break;
 			}
 			case "toolCall": {
-				const base = { id: ev.id, type: "mcpToolCall", server: ev.server, tool: ev.tool, arguments: ev.arguments ?? {}, appContext: ev.appContext ?? null, pluginId: null, readOnlyHint: true };
+				const base = { id: ev.id, type: "mcpToolCall", server: ev.server, tool: ev.tool, arguments: ev.arguments ?? {}, appContext: ev.appContext ?? null, pluginId: ev.pluginId ?? null, readOnlyHint: true };
 				notify("item/started", { threadId: THREAD, turnId, item: { ...base, status: "inProgress", result: null, error: null, durationMs: null } });
 				let status: string = ev.status ?? "completed";
 				let result: unknown = ev.result ? { structuredContent: null, ...ev.result } : { content: [{ type: "text", text: "" }], structuredContent: null };
@@ -264,7 +267,7 @@ async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
 				if (ev.progress) notify("item/mcpToolCall/progress", { threadId: THREAD, turnId, itemId: ev.id, message: "working", progress: 1, total: 2 });
 				if (ev.incomplete) break; // the item never completes; the test kills the child or interrupts
 				await tick();
-				notify("item/completed", { threadId: THREAD, turnId, item: { ...base, status: ev.error ? "failed" : status, result: ev.error ? null : result, error: ev.error ? { message: ev.error } : null, durationMs: ev.durationMs ?? 12 } });
+				notify("item/completed", { threadId: THREAD, turnId, item: { ...base, ...(ev.completedAppContext ? {appContext:ev.completedAppContext} : {}), status: ev.error ? "failed" : status, result: ev.error ? null : result, error: ev.error ? { message: ev.error } : null, durationMs: ev.durationMs ?? 12 } });
 				break;
 			}
 			case "startupStatus":
@@ -304,6 +307,8 @@ async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
 					await tick();
 					if (late.kind === "subAgent") await runTurn({ ...ctl, interrupted: false }, [late]).catch(() => {});
 					else if (late.kind === "command") command(late);
+					else if (late.kind === "sleep") await new Promise((resolve) => setTimeout(resolve, late.ms));
+					else if (late.kind === "die") process.exit(3);
 				}
 				return;
 			}
@@ -366,7 +371,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		}
 		case "thread/start":
-			send({ id: m.id, result: threadResponse() });
+			send({ id: m.id, result: threadResponse(scenario.threadIds?.[threadStartCounter++] ?? THREAD_ID) });
 			break;
 		case "thread/resume":
 			send({ id: m.id, result: threadResponse(scenario.resumeThreadId ?? String(m.params?.threadId ?? THREAD_ID), m.params?.excludeTurns ? undefined : (scenario.resumeTurns ?? [])) });

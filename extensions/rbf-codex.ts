@@ -1,3 +1,4 @@
+import { literalMcpLabel, mcpDisplayMetadata, type McpDisplay } from "./lib/mcp-display.js";
 // rbf-codex — use Codex's full agent harness through Pi (#pi-10, v0.21.12).
 //
 // Pi spawns `codex app-server` over stdio as a direct child, one per Pi session, and
@@ -162,14 +163,14 @@ export const QuestionOption = Type.Object({ label: Type.String(), description: T
 export const Question = Type.Object({ id: Type.String(), header: Type.String(), question: Type.String(), options: Type.Optional(Type.Array(QuestionOption)), isOther: Type.Optional(Type.Boolean()), isSecret: Type.Optional(Type.Boolean()) });
 export const QuestionParams = Type.Object({ itemId: Type.String(), ...AgentFields, questions: Type.Array(Question) });
 /** `arguments` is Codex's object as sent (the `code` of a `js` call, an app connector's fields); `appContext` is read for display only and not persisted. */
-export const ToolCallParams = Type.Object({ itemId: Type.String(), ...AgentFields, server: Type.String(), tool: Type.String(), arguments: Type.Unknown() });
+export const ToolCallParams = Type.Object({ itemId: Type.String(), ...AgentFields, server: Type.String(), tool: Type.String(), arguments: Type.Unknown(), display: Type.Optional(Type.Object({ appName: Type.Optional(Type.String()), connectorId: Type.Optional(Type.String()), pluginId: Type.Optional(Type.String()) })) });
 export type AgentArgs = { threadId: string; agentPath: string };
 export type CommandArgs = AgentArgs & { itemId: string; command: string; cwd: string };
 export type PatchChangeArg = { path: string; kind: string; movePath?: string; diff: string };
 export type PatchArgs = AgentArgs & { itemId: string; changes: PatchChangeArg[] };
 export type QuestionArg = { id: string; header: string; question: string; options?: { label: string; description: string }[]; isOther?: boolean; isSecret?: boolean };
 export type QuestionArgs = AgentArgs & { itemId: string; questions: QuestionArg[] };
-export type ToolCallArgs = AgentArgs & { itemId: string; server: string; tool: string; arguments: unknown };
+export type ToolCallArgs = AgentArgs & { itemId: string; server: string; tool: string; arguments: unknown; display?: McpDisplay };
 export type RowKind = "commandExecution" | "fileChange" | "question" | "mcpToolCall";
 /** A server request a row's `execute` answers: an item's approval or question, or computer use's per-app question (an MCP elicitation with no item of its own). */
 export type RequestKind = RowKind | "elicitation";
@@ -921,13 +922,15 @@ export function shellCompletionFact(item: Rec): CodexDisplayFact {
 }
 
 /** One command item's display identity: the thread it was admitted on, captured from the owner, and whether its start was admitted. */
-type CodexDisplayCall = { tell: (fact: CodexDisplayFact) => void; threadId: string; started: boolean; lost?: boolean; lastCompletion?: Rec };
+type CodexDisplayCall = { bind: ShellDisplayCall<CodexDisplayFact>["bind"]; tell: (fact: CodexDisplayFact) => void; threadId: string; started: boolean; lost?: boolean; lastCompletion?: Rec };
 
 type ShellDisplayBus = { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
 type ShellDisplayTool = { name: string; execute: unknown; renderCall?: unknown; renderResult?: unknown };
 
 /** One invocation's identity, captured when its execute began. `tell` publishes a fact about it and never throws. */
-export type ShellDisplayCall<Fact> = { sessionId: string; toolCallId: string; tell: (fact: Fact) => void };
+type DisplayScope = { clientGeneration: string; threadId: string };
+type DisplayMembership = { itemId: string; threadId: string; agentPath: string; cwd: string };
+export type ShellDisplayCall<Fact> = { sessionId: string; toolCallId: string; tell: (fact: Fact) => void; bind: (args: object, membership: DisplayMembership) => void };
 
 /**
  * One owner's side of the display channel: it announces itself, publishes facts, keeps the last `limit` invocations for a view
@@ -946,13 +949,21 @@ export function createShellDisplayOwner<Fact extends { kind: string }>(
 	let tool: ShellDisplayTool | undefined;
 	let stopListening: (() => void) | undefined;
 	/** Retained invocations by call id, least recently updated first. */
-	const retained = new Map<string, { ended: boolean; messages: unknown[] }>();
+	type Retained = { toolCallId: string; clientGeneration?: string; ended: boolean; messages: unknown[]; membership?: Record<string, unknown>; lifetime: { closed: boolean } };
+	const retained = new Map<string, Retained>();
 
 	// Each message is sent on its own: a subscriber that throws on one must not cut short the withdrawal, the announcement or the facts after it.
 	const send = (message: unknown) => {
 		try {
 			events.emit(SHELL_DISPLAY_CHANNEL, message);
 		} catch {}
+	};
+	const revoke = (invocation: Retained) => {
+		invocation.lifetime.closed = true;
+		if (!invocation.membership) return;
+		const membership = invocation.membership;
+		delete invocation.membership;
+		send({ ...membership, kind: "membership-withdraw", revision: 2 });
 	};
 	const announce = () =>
 		send({ kind: "announce", sessionId, source, toolName: tool?.name, ownerGeneration, execute: tool?.execute, renderCall: tool?.renderCall, renderResult: tool?.renderResult });
@@ -962,8 +973,9 @@ export function createShellDisplayOwner<Fact extends { kind: string }>(
 			if (!ownerGeneration || request?.kind !== "snapshot-request" || request.sessionId !== sessionId) return;
 			announce();
 			// A request that names calls gets those calls' facts only; one that names none gets everything kept.
-			const wanted = Array.isArray(request.toolCallIds) ? request.toolCallIds.flatMap((id) => retained.get(id) ?? []) : [...retained.values()];
+			const wanted = [...retained.values()].filter((call) => !Array.isArray(request.toolCallIds) || request.toolCallIds.includes(call.toolCallId));
 			for (const invocation of wanted) {
+				if (invocation.membership) send(invocation.membership);
 				for (const message of invocation.messages) send(message);
 			}
 		} catch {}
@@ -989,36 +1001,49 @@ export function createShellDisplayOwner<Fact extends { kind: string }>(
 			} catch {}
 		},
 		/** The identity of one invocation, captured now. Undefined while nothing is announced. */
-		open(toolCallId: string): ShellDisplayCall<Fact> | undefined {
+		open(toolCallId: string, scope?: DisplayScope): ShellDisplayCall<Fact> | undefined {
 			if (!ownerGeneration) return undefined;
-			const identity = { sessionId, source, ownerGeneration, toolCallId };
+			const identity = { sessionId, source, ownerGeneration, toolCallId, ...scope };
+			const key = scope ? JSON.stringify([scope.clientGeneration, scope.threadId, toolCallId]) : toolCallId;
+			const lifetime = retained.get(key)?.lifetime ?? { closed: false };
+			const keep = () => {
+				const invocation: Retained = retained.get(key) ?? { toolCallId, clientGeneration: scope?.clientGeneration, ended: false, messages: [], lifetime };
+				retained.delete(key);
+				retained.set(key, invocation);
+				if (retained.size > limit) {
+					const evict = [...retained].find(([, call]) => call.ended)?.[0] ?? retained.keys().next().value;
+					if (evict !== undefined) { revoke(retained.get(evict)!); retained.delete(evict); }
+				}
+				return invocation;
+			};
+			// Scoped handles share their admission lifetime even when opened before either binds.
+			if (scope) keep();
 			let revision = 0;
 			const tell = (fact: Fact) => {
 				try {
 					// A call from before a withdrawal or a new session says nothing: no old callback speaks for a new owner.
 					if (identity.ownerGeneration !== ownerGeneration) return;
 					const message = { kind: "fact", ...identity, revision: ++revision, fact };
-					const invocation = retained.get(toolCallId) ?? { ended: false, messages: [] };
-					retained.delete(toolCallId);
+					const invocation = keep();
 					invocation.messages.push(message);
 					if (invocation.messages.length > SHELL_DISPLAY_FACTS_PER_INVOCATION) invocation.messages.splice(1, 1);
 					invocation.ended ||= ends(fact);
-					retained.set(toolCallId, invocation);
-					if (retained.size > limit) {
-						let evict: string | undefined;
-						for (const [id, kept] of retained) {
-							evict ??= id;
-							if (kept.ended) {
-								evict = id;
-								break;
-							}
-						}
-						retained.delete(evict!);
-					}
 					send(message);
 				} catch {}
 			};
-			return { sessionId, toolCallId, tell };
+			return { sessionId, toolCallId, tell, bind(args, membership) {
+				try {
+					if (identity.ownerGeneration !== ownerGeneration || !scope || lifetime.closed) return;
+					const invocation = keep();
+					if (invocation.membership) return;
+					invocation.membership = { kind: "membership", ...identity, ...membership, revision: 1, binding: new WeakRef(args) };
+					send(invocation.membership);
+				} catch {}
+			} };
+		},
+		/** The client left. Process facts remain available; its weak live presentation admission ends. */
+		retireClient(clientGeneration: string): void {
+			try { for (const invocation of retained.values()) if (invocation.clientGeneration === clientGeneration) revoke(invocation); } catch {}
 		},
 		/** The owner is going away: withdraw, forget the snapshot and stop answering. */
 		stop(): void {
@@ -1033,7 +1058,7 @@ export function createShellDisplayOwner<Fact extends { kind: string }>(
 
 // ── the Codex side of one turn, across every streamSimple call and tool execution it spans ──
 type UserInputItem = { type: "text"; text: string; text_elements: [] } | { type: "image"; url: string };
-type TurnItem = { kind: RowKind; threadId: string; agentPath: string; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec; server?: string; tool?: string; arguments?: unknown; appName?: string; answered?: Answer; aborted?: boolean; display?: CodexDisplayCall; /** Display only: Pi called this row's execute, which reports its own ending. */ executed?: boolean };
+type TurnItem = { kind: RowKind; threadId: string; agentPath: string; rowOpened: boolean; command?: string; cwd?: string; changes: PatchChangeArg[]; questions: QuestionArg[]; output: string; completed?: Rec; server?: string; tool?: string; arguments?: unknown; appName?: string; displayMetadata?: McpDisplay; answered?: Answer; aborted?: boolean; display?: CodexDisplayCall; /** Display only: Pi called this row's execute, which reports its own ending. */ executed?: boolean };
 /** A sub-agent Codex announced on this turn; `turnId` is known once its `turn/started` arrives (a live parent re-drives an interrupted child with a new turn on the same thread). */
 type ChildThread = { turnId: string | null; agentPath: string };
 type PendingRequest = { id: number | string; method: string; params: Rec; kind: RequestKind; itemId: string };
@@ -1049,6 +1074,7 @@ function describeToolCall(it: TurnItem, item: Rec): void {
 	it.arguments ??= item.arguments ?? {};
 	const app = item.appContext && typeof item.appContext === "object" ? (item.appContext as Rec) : {};
 	if (typeof app.appName === "string" && app.appName) it.appName = app.appName;
+	it.displayMetadata = mcpDisplayMetadata({ appName: app.appName, connectorId: app.connectorId, pluginId: item.pluginId ?? app.pluginId });
 }
 type ProjectedEvent =
 	| { kind: "row"; itemId: string }
@@ -1089,13 +1115,24 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		const display = createShellDisplayOwner<CodexDisplayFact>(pi.events, "codex-command", (fact) => fact.kind === "completion" || fact.kind === "not-run" || fact.kind === "lost");
 		/** Command items each client admitted and has not seen complete, by item id. Client-local: a completion that arrives after its turn, or after the session moved on, finds the identity captured when the item was first seen. */
 		const openDisplayCalls = new WeakMap<AppServerClient, Map<string, CodexDisplayCall>>();
+		const mcpDisplay = createShellDisplayOwner<{ kind: string }>(pi.events, "codex-mcp", () => true);
+		const clientGenerations = new WeakMap<AppServerClient, { generation: string; active: boolean }>();
+		function displayScope(client: AppServerClient, threadId: string): DisplayScope | undefined {
+			// A departed client's buffered row may still be emitted natively; it cannot regain live membership.
+			if (client.exited) return undefined;
+			let lifetime = clientGenerations.get(client);
+			if (!lifetime) clientGenerations.set(client, (lifetime = { generation: randomUUID(), active: true }));
+			return lifetime.active ? { clientGeneration: lifetime.generation, threadId } : undefined;
+		}
 		/** The item's display identity, captured on first use: its session from the announced owner, its thread from the turn that holds it (a root row's own `threadId` is empty). */
 		function displayCallFor(client: AppServerClient, itemId: string, it: TurnItem, rootThreadId: string): CodexDisplayCall | undefined {
 			if (it.kind !== "commandExecution") return undefined;
 			if (!it.display) {
-				const call = display?.open(`codex-${itemId}`);
+				const scope = displayScope(client, it.threadId || rootThreadId);
+				if (!scope) return undefined;
+				const call = display?.open(`codex-${itemId}`, scope);
 				if (!call) return undefined;
-				it.display = { tell: call.tell, threadId: it.threadId || rootThreadId, started: false };
+				it.display = { bind: call.bind, tell: call.tell, threadId: it.threadId || rootThreadId, started: false };
 				let open = openDisplayCalls.get(client);
 				if (!open) openDisplayCalls.set(client, (open = new Map()));
 				open.set(itemId, it.display);
@@ -1160,6 +1197,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		/** The client is gone, and with it the only owner that could say how its open commands ended. */
 		function displayClientLost(client: AppServerClient): void {
 			try {
+				const generation = clientGenerations.get(client);
+				if (generation) { generation.active = false; display?.retireClient(generation.generation); mcpDisplay?.retireClient(generation.generation); }
 				const open = openDisplayCalls.get(client);
 				if (!open) return;
 				for (const call of open.values()) displayLost(call);
@@ -1167,6 +1206,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			} catch {}
 		}
 		let registeredCommandTool: ShellDisplayTool | undefined;
+		let registeredMcpTool: ShellDisplayTool | undefined;
 
 		class ActiveTurn {
 			readonly events: ProjectedEvent[] = [];
@@ -1849,7 +1889,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 						case "row": {
 							if (mode.silent) return true;
 							const it = turn.items.get(ev.itemId)!;
-							out.toolCall(rowToolCall(ev.itemId, it));
+							out.toolCall(rowToolCall(ev.itemId, it, turn));
 							settle(() => out.finish("toolUse")); // the ActiveTurn keeps receiving; the next call attaches
 							return false;
 						}
@@ -1863,12 +1903,23 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return out.stream;
 		}
 
-		function rowToolCall(itemId: string, it: TurnItem): ToolCall {
+		function rowToolCall(itemId: string, it: TurnItem, turn: ActiveTurn): ToolCall {
 			const id = `codex-${itemId}`;
 			const agent = { threadId: it.threadId, agentPath: it.agentPath };
-			if (it.kind === "commandExecution") return { type: "toolCall", id, name: TOOL_COMMAND, arguments: { itemId, ...agent, command: it.command ?? "", cwd: it.cwd ?? "" } satisfies CommandArgs };
+			if (it.kind === "commandExecution") {
+				const args = { itemId, ...agent, command: it.command ?? "", cwd: it.cwd ?? "" } satisfies CommandArgs;
+				try { displayCallFor(turn.client, itemId, it, turn.threadId)?.bind(args, { itemId, threadId: it.threadId || turn.threadId, agentPath: it.agentPath, cwd: it.cwd || state.ctx?.sessionManager.getCwd() || "" }); } catch {}
+				return { type: "toolCall", id, name: TOOL_COMMAND, arguments: args };
+			}
 			if (it.kind === "fileChange") return { type: "toolCall", id, name: TOOL_PATCH, arguments: { itemId, ...agent, changes: it.changes } satisfies PatchArgs };
-			if (it.kind === "mcpToolCall") return { type: "toolCall", id, name: TOOL_TOOL, arguments: { itemId, ...agent, server: it.server ?? "", tool: it.tool ?? "", arguments: it.arguments ?? {} } satisfies ToolCallArgs };
+			if (it.kind === "mcpToolCall") {
+				const args: ToolCallArgs = { itemId, ...agent, server: it.server ?? "", tool: it.tool ?? "", arguments: it.arguments ?? {}, ...(it.displayMetadata ? { display: { ...it.displayMetadata } } : {}) };
+				try {
+					const scope = displayScope(turn.client, it.threadId || turn.threadId);
+					if (scope) mcpDisplay?.open(id, scope)?.bind(args, { itemId, threadId: it.threadId || turn.threadId, agentPath: it.agentPath, cwd: state.ctx?.sessionManager.getCwd() || "" });
+				} catch {}
+				return { type: "toolCall", id, name: TOOL_TOOL, arguments: args };
+			}
 			return { type: "toolCall", id, name: TOOL_QUESTION, arguments: { itemId, ...agent, questions: it.questions } satisfies QuestionArgs };
 		}
 
@@ -2107,7 +2158,11 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			},
 			renderResult: renderRowResult,
 		});
-		pi.registerTool({
+		const registerMcpTool: typeof pi.registerTool = (tool) => {
+			pi.registerTool(tool);
+			registeredMcpTool = tool;
+		};
+		registerMcpTool({
 			name: TOOL_TOOL,
 			label: "Codex tool call",
 			description: `Records an MCP, app, or computer-use tool call the Codex agent made in this conversation${NO_SNIPPET}`,
@@ -2119,8 +2174,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				// output gray, then the arguments: a lone string argument (the code of a `js` call) as lines collapsed as output is, anything else as one JSON line.
 				const st = startTiming(context);
 				const { title: callTitle, rest } = splitTitle(args.arguments);
-				const name = state.activeTurn?.items.get(args.itemId)?.appName || args.server;
-				const title = tagLines(theme, args.agentPath, `${theme.fg("toolTitle", theme.bold(`${name}.${args.tool}`))}${callTitle ? ` ${theme.fg("toolOutput", callTitle)}` : ""}`);
+				const name = literalMcpLabel(state.activeTurn?.items.get(args.itemId)?.appName || mcpDisplayMetadata(args.display)?.appName || args.server);
+				const title = tagLines(theme, args.agentPath, `${theme.fg("toolTitle", theme.bold(`${name}.${literalMcpLabel(args.tool)}`))}${callTitle ? ` ${theme.fg("toolOutput", callTitle)}` : ""}`);
 				const component = (context.lastComponent instanceof Container ? context.lastComponent : new Container()) as Container;
 				component.clear();
 				component.addChild(new Text(title, 0, 0));
@@ -2473,6 +2528,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					sessionId = ctx.sessionManager.getSessionId();
 				} catch {}
 				display?.start(sessionId, registeredCommandTool);
+				if (registeredMcpTool) mcpDisplay?.start(sessionId, registeredMcpTool);
 			}
 			state.ctx = ctx;
 			state.client = null;
@@ -2519,6 +2575,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				await closeChild();
 			} finally {
 				display?.stop();
+				mcpDisplay?.stop();
 			}
 		});
 		pi.on("session_before_switch", async () => {

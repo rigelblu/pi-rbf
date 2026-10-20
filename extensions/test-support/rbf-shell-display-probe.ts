@@ -111,7 +111,7 @@ export default function rbfShellDisplayProbe(pi: ExtensionAPI): void {
 				const cmd = this.args?.command;
 				if (active && this.expanded && typeof cmd === "string" && cmd.includes(linkCmd)) {
 					// Labelled test-only native hyperlink line
-					lines.push("    " + hyperlink("Full Output (test link)", "file:///tmp/rbf-test-full-output.log"));
+					lines.push("    " + hyperlink("Full Output (test link)", process.env.RBF_PROBE_LINK_TARGET || "file:///tmp/rbf-test-full-output.log"));
 				}
 				return lines;
 			};
