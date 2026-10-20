@@ -47,7 +47,7 @@ def strip(raw: bytes) -> bytes:
 CSI_OR_TEXT = re.compile(rb"\x1b\[([0-9;?<>=]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|([^\x1b]+)")
 
 
-def drawn_row(raw: bytes, pattern: "re.Pattern[bytes]"):
+def drawn_row(raw: bytes, pattern: "re.Pattern[bytes]", column_text=None):
     """The 1-based row of the latest row drawing that matches. A fullscreen Pi addresses a row (ESC[row;colH) and then writes all of it."""
     rows = {}
     row, order = 1, 0
@@ -68,7 +68,14 @@ def drawn_row(raw: bytes, pattern: "re.Pattern[bytes]"):
                 seen = rows.get(row, (order, b""))
                 rows[row] = (seen[0], seen[1] + piece.replace(b"\r", b""))
     found = [(seen[0], r) for r, seen in rows.items() if pattern.search(seen[1])]
-    return max(found)[1] if found else None
+    if not found:
+        return None
+    last = max(found)[1]
+    if column_text is not None:
+        text = rows[last][1].decode("utf8", errors="replace")
+        at = text.find(column_text)
+        return at + 1 if at >= 0 else None
+    return last
 
 
 def main() -> int:
@@ -163,6 +170,12 @@ def main() -> int:
                     failure = f"could not locate a drawn row matching {target['text']!r}"
                     break
                 located[target["name"]] = found
+                if "columnText" in target:
+                    column = drawn_row(bytes(raw), re.compile(target["text"].encode()), target["columnText"])
+                    if column is None:
+                        failure = f"could not locate column {target['columnText']!r}"
+                        break
+                    located[target["name"] + "X"] = column
                 snapshots[f"row:{target['name']}"] = found
             elif "bytes" in step:
                 def row_of(m):
