@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.31.1 (2026-10-20)
+## 🟠⋯ Added for End Users
+- 2026-10-20 - feat | see announced Codex agents, their supplied assignments and last reported statuses in Pi. Open the full list from the agents footer or `/agents-codex`; saved branch snapshots read Last recorded until fresh evidence arrives. On supported direct Ghostty/cmux/Kitty terminals, the footer shows a hand pointer. Install the matching Codex adapter and fully restart Pi; individual child conversations and controls remain deferred. Preserves the v0.31.0 MCP/shell display (#pi-10.11)
+
+---
+
 # 🔵⋯ v0.31.0 (2026-10-20)
 ## 🟠⋯ Added for End Users
 - 2026-10-20 - feat | see adjacent MCP/app calls and shell commands in one compact summary, with each recorded service’s name, call count and status. Expand to inspect the original calls; click an expanded member to close the whole group. Supplied friendly names are retained, with exact server/tool fallback for older records. Supported native MCP and Codex rows group; unsupported owners/renderers keep native rows. Update the grouping view and Codex adapter with their matching identity helper, then fully restart Pi. Verified on Pi 0.85.1 and daily Pi 1.3.0; all four human checks passed (#pi-52)
