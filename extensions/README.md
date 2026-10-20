@@ -670,43 +670,38 @@ To check it locally, start Pi with the extension, ask for `seq 1 12`, and type `
 
 # 🔵⋯ rbf-shell-command-groups
 
-Introduced in pi-rbf v0.27.0 (pi-42.1); close-at-reading-position added in v0.30.1 (pi-42.2). Shell commands an agent runs one after another show as one line with a count, and the commands themselves are hidden until you open it:
-```
- ▸ ran 3 shell commands · 1 failed
-```
-```
- ▾ ran 3 shell commands · 1 failed
- $ pwd
- └  /Users/me/project
- $ printf SHELL-CHECK
- └  SHELL-CHECK
- $ exit 7
- └  (no output)
-    Command exited with code 7
-```
-The open view is drawn with `rbf-tool-parts-indent` loaded. Without it the results sit flush under each command, with no `└`.
+Named MCP activity added in pi-rbf v0.31.0 (pi-52), extending the shell summaries from v0.27.0 and whole-group close from v0.30.1. Adjacent eligible MCP/app calls and agent shell commands share one collapsed summary:
 
-- The count is the number of shell commands the agent started in a row. Text from the agent, or any other tool call, ends a group and the next command starts a new one
-- The closed line names what needs attention: `running 1 shell command`, `1 shell command · background` with a `Task ID:` line under it, `1 failed`, cancelled and not-run commands
-- Open and close a group by clicking its line in fullscreen mode. Ctrl+O opens and closes every group and tool row, in fullscreen and regular mode. A plain click on any command/output inside an open group immediately closes the whole group. Drag selection and copy remain available. Double/triple-click word/line selection inside a group is deliberately unavailable. Native link handling is left to Pi; ordinary bash output has no clickable Full Output link
-- Opening a group shows Pi's own command rows and results, unchanged. Nothing about what runs, or what is saved in the session, changes
-- After you quit and reopen a session, groups read `status unknown`, for example `3 shell commands · 1 error (status unknown) · 2 unknown`. Pi no longer holds proof of how those commands ended, so it doesn't claim they ran. A Codex command whose saved record carries a numeric exit code keeps its result
-- Covered: Pi's own bash tool and Codex commands run through `rbf-codex`. Not covered, and drawn as before: a session started with `--sandbox`, commands you type with `!` or `!!`, and shell calls nested inside another tool
-- Ctrl+B still sends Pi's own running bash command to the background. It does not control Codex commands
-- If grouping can't attach to this Pi, rows stay as they were and one warning says `Shell command groups unavailable; showing native tool rows.`
+```text
+ ▸ called Acme Design 2 times; 1 shell command
+    called Notes Lab 1 time · 1 failed
+```
 
-To upgrade from v0.27.0 to v0.30.1, back up your installed `rbf-shell-command-groups.ts` and replace only that file, then restart Pi. The existing `rbf-background-tasks.ts` and `rbf-codex.ts` are unchanged by this slice. Keep the backup to restore the earlier header-only disclosure behavior; restore that file and restart to undo the upgrade.
+Names are examples. A supplied service/app name is preferred; older or unnamed Codex records retain their exact recorded server/tool pair, such as `codex_apps/figma.use_figma`. Dots do not manufacture a plugin or vendor name. Distinct recorded identities remain distinct even when their friendly names match. Control characters are escaped; labels containing summary separators or quotes are quoted literally. Identity supplied when a Codex row is emitted survives replay. A name arriving only later does not rewrite the summary or saved identity, even if the native live title changes.
 
-For a first installation, install the three files together, then quit Pi and start it again. The view needs this checkout's `rbf-background-tasks.ts` and `rbf-codex.ts`, which tell it how each command ended; with older copies of those two, rows stay as they were:
+- Each category keeps its own count and status. Shell-only summaries retain their existing wording, such as `▸ ran 3 shell commands · 1 failed`. Missing completion evidence reads `status unknown`; an MCP pipeline start never claims remote dispatch or a running process.
+- Click the header in fullscreen to open or close the run. Ctrl+O uses Pi’s native global expansion in fullscreen and regular mode. A plain click on ordinary output in any expanded member immediately closes the whole group. Native links and drag selection/copy retain ownership. Grouped double/triple-click word/line selection remains unavailable.
+- Expansion shows the original native calls, arguments and results in original order, including existing truncation and links. It does not execute a tool again. Ordinary bash output does not gain a Full Output link; the human link check used a labelled local test fixture.
+- Supported registered native MCP renderers and Codex MCP/command rows can group with compatible execution owners. Supported Pi bash remains covered. A different owner/thread/agent/cwd or a visible transcript boundary splits the run. Unsupported or conflicting owner/renderers stay native; this is not universal MCP/provider support.
+- Sandbox sessions, user `!`/`!!` commands and calls nested inside another tool keep their existing rows. Ctrl+B still controls Pi’s own bash backgrounding, not Codex commands. Old records use only their recorded identity and completion evidence; reopening does not recover missing live ownership.
+- An unavailable grouping seam leaves native rows and emits one warning. No settings or saved-session migration is required.
+
+## Install or upgrade to v0.31.0
+
+Back up the installed grouping view and Codex adapter, plus `lib/mcp-display.ts` if it already exists. Keep the matching relative directory layout and fully restart Pi after copying these three files:
+
 ```sh
-mkdir -p /Volumes/tom-ssd/tmp/pi-42/backup && command cp -f ~/.pi/agent/extensions/rbf-background-tasks.ts ~/.pi/agent/extensions/rbf-codex.ts /Volumes/tom-ssd/tmp/pi-42/backup/
-command cp -f ./extensions/rbf-shell-command-groups.ts ./extensions/rbf-background-tasks.ts ./extensions/rbf-codex.ts ~/.pi/agent/extensions/
+mkdir -p ~/.pi/agent/extensions/lib
+command cp -f ./extensions/lib/mcp-display.ts ~/.pi/agent/extensions/lib/mcp-display.ts
+command cp -f ./extensions/rbf-codex.ts ~/.pi/agent/extensions/rbf-codex.ts
+command cp -f ./extensions/rbf-shell-command-groups.ts ~/.pi/agent/extensions/rbf-shell-command-groups.ts
 ```
-To roll back the display only, run `rm -f ~/.pi/agent/extensions/rbf-shell-command-groups.ts` and restart Pi. The two updated files can stay: without the view they only keep a small in-memory record that nothing reads. To roll back all three, also run `command cp -f /Volumes/tom-ssd/tmp/pi-42/backup/rbf-background-tasks.ts /Volumes/tom-ssd/tmp/pi-42/backup/rbf-codex.ts ~/.pi/agent/extensions/`, unless either file has been updated again since.
 
-To try it without installing, and without touching your own Pi settings, run `PI_CODING_AGENT_DIR="$(mktemp -d)" node_modules/.bin/pi --no-extensions -e extensions/rbf-shell-command-groups.ts -e extensions/rbf-background-tasks.ts -e extensions/rbf-codex.ts -e extensions/rbf-tool-parts-indent.ts --tui-mode fullscreen` from the checkout. That profile has no model signed in; pick a `[codex-harness]` model if the Codex CLI is logged in.
+This upgrade keeps the already compatible `rbf-background-tasks.ts`; first-time installation also needs this checkout’s matching background owner. Styling extensions such as `rbf-tool-parts-indent` remain optional. A full restart activates the matching view/owner/helper together; do not rely on `/reload` to replace already loaded wrappers.
 
-v0.30.1 gesture/routing verification ran on Pi 0.85.1 and 1.0.4. Tomek reported ordinary whole-group collapse and drag/copy working, then waived the remaining human checks. A test-only Full Output link fixture did not activate; it is not a feature supplied by ordinary bash output or human proof of native links. Historical v0.27.0 verification ran on 0.85.1/1.0.3. Not yet run: `/rewind`, compaction, leaving a branch while a command runs, a sandbox session with running commands, and light or monochrome themes.
+To undo an upgrade, restore the backed-up grouping view and Codex adapter together, then restore the earlier helper or remove it only if it was previously absent and nothing else uses it. Fully restart Pi. Do not overwrite a newer installation with an old backup. Disabling only the grouping view restores native display; keep the helper while the new Codex adapter imports it.
+
+Verification: project Pi0.85.1 and daily Pi1.3.0, including generic identity, lifecycle/owner isolation, saved replay and original details. Tom passed mixed/long-name scan and light/dark readability, physical whole-group close/reopen, original native local-link opening and exact native drag/paste. Automated coverage includes40/80/120-column rendering and stale gestures. Real remote MCP/provider requests and universal provider compatibility are not claimed; human review used isolated deterministic sessions. Earlier v0.27.0/v0.30.1 evidence and limits remain in their changelog entries.
 
 # 🔵⋯ rbf-monitor
 

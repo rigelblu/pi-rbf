@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.31.0 (2026-10-20)
+## 🟠⋯ Added for End Users
+- 2026-10-20 - feat | see adjacent MCP/app calls and shell commands in one compact summary, with each recorded service’s name, call count and status. Expand to inspect the original calls; click an expanded member to close the whole group. Supplied friendly names are retained, with exact server/tool fallback for older records. Supported native MCP and Codex rows group; unsupported owners/renderers keep native rows. Update the grouping view and Codex adapter with their matching identity helper, then fully restart Pi. Verified on Pi 0.85.1 and daily Pi 1.3.0; all four human checks passed (#pi-52)
+
+---
+
 # 🔵⋯ v0.30.2 (2026-10-08)
 ## 🟠⋯ Fixed for End Users
 - 2026-10-08 - fix (ux) | select visually wrapped transcript text and copy its original logical lines, without extra newlines or continuation indentation. Genuine line breaks, blank lines and selected source spaces remain. Supported fullscreen text, code and ordinary paragraphs use source-backed copying; unsupported renderers keep native copying. Install the copy extension with its matching path-label, clean-code and tool-indent files, then fully restart Pi. Verified on Pi 0.85.1 and 1.0.4; both physical clipboard checks passed, with leading spaces on the first multiline-control line explicitly accepted by Tom (#pi-50)
