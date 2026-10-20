@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { createRbfCodex, BOOTSTRAP_MODEL, RowError, COPY } from "./rbf-codex.ts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The component cases run on the repository's Pi by default. With PI_HOST_PACKAGE set to another installed
@@ -41,6 +45,7 @@ import {
 	NO_EVIDENCE,
 	reconcileMembership,
 	reduceEvidence,
+	reduceMcpEvidence,
 	replayEvidence,
 	updateMember,
 	wrapFields,
@@ -1144,7 +1149,140 @@ describe("extensions/rbf-shell-command-groups", () => {
 		});
 	});
 
+
+	describe("pi-52 generic counts copy and boundaries", () => {
+		const mcp = (id: string, name: string, connectorId: string): ShellMember => member("waiting", {
+			toolCallId: id, source: "codex-mcp" as any, threadId: "root", agentPath: "",
+			mcp: { identity: { server: "custom-server", tool: "invoke", display: { appName: name, connectorId } }, evidence: { state: "returned" } },
+		} as any);
+		it("counts arbitrary MCP identities beside shell activity and retains native invocation order", () => {
+			const a = mcp("m1", "Acme Design", "a");
+			const b = member("succeeded", { toolCallId: "s1", source: "codex-command", threadId: "root", agentPath: "" });
+			const c = mcp("m2", "Notes Lab", "b");
+			const again = mcp("m3", "Acme Design", "a");
+			const rows = [a,b,c,again];
+			expect(header(rows)).toBe("▸ called Acme Design 2 times; ran 1 shell command; called Notes Lab 1 time");
+			expect(ids(groupRows(rows.map(shell), [], false))).toEqual([rows.map(memberId)]);
+		});
+		it("keeps two identical friendly names and server/tool pairs distinct by recorded connector identity", () => {
+			const a = mcp("m1", "Design", "c1");
+			const b = mcp("m2", "Design", "c2");
+			expect(header([a,b])).toBe("▸ called Design [custom-server/invoke] [connector: c1] 1 time; called Design [custom-server/invoke] [connector: c2] 1 time");
+		});
+	});
+
 	// ─── The view, against Pi's own classes ─────────────────────────────────────
+
+	describe("pi-52 scoped command facts",()=>{
+		it("a departed-client reused call ID, wrong thread and stale revision cannot update another member",()=>{
+			const a=member("waiting",{source:"codex-command",toolCallId:"same",clientGeneration:"old",threadId:"root"});
+			const b=member("waiting",{source:"codex-command",toolCallId:"same",clientGeneration:"new",threadId:"root"});
+			const view=createShellView();reconcileMembership(view,[{kind:"shell",member:a},{kind:"shell",member:b}],false);view.owners.set("codex-command","owner");
+			const message={kind:"fact",sessionId:a.sessionId,source:"codex-command",ownerGeneration:"owner",toolCallId:"same",clientGeneration:"old",threadId:"root",revision:2,fact:{kind:"start"}} as FactMessage;
+			expect(applyEvidence(view,{...message,threadId:"other"})).toBe(false);expect(applyEvidence(view,message)).toBe(true);
+			expect(a.executionEvidence.state).toBe("running");expect(b.executionEvidence.state).toBe("waiting");
+			expect(applyEvidence(view,{...message,revision:1,fact:{kind:"completion",exitCode:0,status:"completed"}})).toBe(false);
+			expect(applyEvidence(view,{...message,ownerGeneration:"revoked",revision:9})).toBe(false);
+		});
+	});
+
+	describe("pi-52 MCP evidence", () => {
+		it("keeps native lifecycle separate from remote dispatch or process proof", () => {
+			let evidence = { state: "pending" } as Parameters<typeof reduceMcpEvidence>[0];
+			evidence = reduceMcpEvidence(evidence, "start");
+			expect(evidence).toEqual({ state: "active" });
+			evidence = reduceMcpEvidence(evidence, "failed");
+			expect(evidence).toEqual({ state: "failed" });
+			expect(reduceMcpEvidence(evidence, "start")).toBe(evidence);
+			expect(reduceMcpEvidence(evidence, "lost")).toBe(evidence);
+			expect(reduceMcpEvidence(evidence, "returned")).toEqual({ state: "unknown", conflicted: true });
+			expect(reduceMcpEvidence({ state: "pending" }, "lost")).toEqual({ state: "unknown" });
+			expect(reduceMcpEvidence({ state: "unknown", conflicted: true }, "returned")).toEqual({ state: "unknown", conflicted: true });
+		});
+	});
+
+	describe("pi-52 generic counts copy and boundaries", () => {
+		const mcp = (name: string | undefined, state = "returned", over: Record<string, unknown> = {}) => member("waiting", {
+			source: "codex-mcp", threadId: "root", agentPath: "", mcp: { identity: { server: "custom.server", tool: "a.tool.with.dots", ...(name ? { display: { appName: name } } : {}), ...over }, evidence: { state } },
+		} as any);
+		it("uses exact recorded fallback without interpreting dots", () => {
+			expect(header([mcp(undefined)])).toBe("▸ called custom.server/a.tool.with.dots 1 time");
+			expect(header([mcp("Notes Lab"), mcp("Notes Lab")], true)).toBe("▾ called Notes Lab 2 times");
+		});
+		it.each(["pending", "active", "failed", "unknown"])("attributes %s to its MCP category", (state) => {
+			const rows = [mcp("Notes Lab", state), member("succeeded", { source: "codex-command" })];
+			const fields = formatHeader(rows, false);
+			const text = wrapFields(fields, 120).flatMap((line) => line.spans.map((span) => span.text)).join("");
+			expect(text).toBe(state === "failed" ? "▸ called Notes Lab 1 time · 1 failed; ran 1 shell command" : `▸ Notes Lab: 1 call · ${state === "unknown" ? "status unknown" : state}; ran 1 shell command`);
+			expect(rows[0]!.executionStarted).toBe(false);
+		});
+		it("escapes identity controls literally, retaining raw values", () => {
+			const raw = "Acme\u001b[31m\n\r\t\u0007\u007f\u009bX";
+			const row = mcp(raw);
+			expect(header([row])).toBe("▸ called Acme\\u001b[31m\\n\\r\\t\\u0007\\u007f\\u009bX 1 time");
+			expect(row.mcp!.identity.display!.appName).toBe(raw);
+			for (const width of [40, 80, 120]) {
+				const lines = wrapFields(formatHeader([row], false), width - 1);
+				expect(lines.every((line) => line.column + line.spans.reduce((sum, span) => sum + [...span.text].length, 0) <= width - 1)).toBe(true);
+				expect(lines.flatMap((line) => line.spans).every((span) => !/[\x00-\x1f\x7f-\x9f]/.test(span.text))).toBe(true);
+			}
+		});
+		it("keeps distinct plugin identities separate, even with an equal name and pair", () => {
+			const a = mcp("Design", "returned", { display: { appName: "Design", pluginId: "p1" } });
+			const b = mcp("Design", "returned", { display: { appName: "Design", pluginId: "p2" } });
+			const text = wrapFields(formatHeader([a,b],false),1000).flatMap((line)=>line.spans.map((span)=>span.text)).join("");
+			expect(text).toBe("▸ called Design [custom.server/a.tool.with.dots] [plugin: p1] 1 time; called Design [custom.server/a.tool.with.dots] [plugin: p2] 1 time");
+		});
+		it("keeps printable names that imitate identity suffixes distinct",()=>{
+			const names=["Name","Name","Name [s/t] [connector: c1]",'identity: ["codex","s","c1",null] [name: Name [s/t] [connector: c1]]'];
+			const rows=names.map((appName,i)=>mcp(appName,"returned",{server:"s",tool:"t",display:{appName,connectorId:["c1","c2","c3","c4"][i]}}));
+			const clauses=formatHeader(rows,false).map((field)=>field.map((span)=>span.text).join("").replace(/^[▸▾] /,""));
+			expect(clauses).toHaveLength(4);expect(new Set(clauses).size).toBe(4);
+		});
+
+		it.each([
+			["Design 1 time · 1 failed; called Search", '▸ called "Design 1 time · 1 failed; called Search" 1 time'],
+			["Search; Archive", '▸ called "Search; Archive" 1 time'],
+			["Search · Archive", '▸ called "Search · Archive" 1 time'],
+			['Acme "Notes"', String.raw`▸ called "Acme \"Notes\"" 1 time`],
+			[String.raw`Acme\Folder "Notes"`, String.raw`▸ called "Acme\\\\Folder \"Notes\"" 1 time`],
+		])("pi-52 printable summary syntax keeps %s inside one literal identity",(appName,expected)=>{
+			const row=mcp(appName);
+			expect(header([row])).toBe(expected);
+			expect(row.mcp!.identity.display!.appName).toBe(appName);
+		});
+		it("pi-52 printable summary syntax quotes the final fallback and disambiguated label",()=>{
+			expect(header([mcp(undefined,"returned",{server:"notes;archive",tool:"search"})])).toBe('▸ called "notes;archive/search" 1 time');
+			const first=mcp("Design","returned",{display:{appName:"Design",connectorId:"c;1"}});
+			const second=mcp("Design","returned",{display:{appName:"Design",connectorId:"c2"}});
+			expect(header([first,second])).toBe('▸ called "Design [custom.server/a.tool.with.dots] [connector: c;1]" 1 time; called Design [custom.server/a.tool.with.dots] [connector: c2] 1 time');
+		});
+
+		it("the supplied MCP-shell-MCP example uses its exact fallback and one combined count",()=>{
+			const rows=[mcp(undefined,"returned",{server:"codex_apps",tool:"figma.use_figma"}),member("succeeded",{source:"codex-command"}),mcp(undefined,"returned",{server:"codex_apps",tool:"figma.use_figma"})];
+			expect(header(rows)).toBe("▸ called codex_apps/figma.use_figma 2 times; ran 1 shell command");
+		});
+		it.each(["server","tool","connectorId","pluginId"])("escapes controls in %s while preserving exact category identity",(field)=>{
+			const raw="x\u001b[31m\n\r\t\u0007\u007f\u009b";
+			const first=mcp(undefined,"returned",field==="server"||field==="tool"?{[field]:raw}:{display:{appName:"Design",[field]:raw}});
+			const second=mcp(undefined,"returned",field==="server"||field==="tool"?{[field]:"other"}:{display:{appName:"Design",[field]:"other"}});
+			const rendered=header([first,second])!;expect(rendered).toContain("x\\u001b[31m\\n\\r\\t\\u0007\\u007f\\u009b");expect(rendered).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+		});
+
+		it("does not merge different opaque scopes or drop reused call IDs", () => {
+			const a = mcp("A"); const b = mcp("B", "returned", { server: "other" });
+			a.clientGeneration = "departed"; b.clientGeneration = "current"; b.toolCallId = a.toolCallId;
+			expect(memberId(a)).not.toBe(memberId(b));
+			expect(groupRows([{kind:"shell",member:a},{kind:"shell",member:b}],[],false)).toHaveLength(2);
+		});
+		it("retains category order with shell first and respects visible boundaries", () => {
+			const shell=member("succeeded",{source:"codex-command",threadId:"root",agentPath:""});
+			const rows=[shell,mcp("Notes")];
+			expect(wrapFields(formatHeader(rows,false),120).flatMap((line)=>line.spans.map((span)=>span.text)).join("")).toBe("▸ ran 1 shell command; called Notes 1 time");
+			expect(groupRows([{kind:"shell",member:shell},{kind:"content",visible:true},{kind:"shell",member:rows[1]!}],[],false)).toHaveLength(2);
+			expect(groupRows([{kind:"shell",member:shell},{kind:"content",visible:false},{kind:"shell",member:rows[1]!}],[],false)).toHaveLength(1);
+		});
+	});
 
 	describe("view components", () => {
 		const SESSION = "s1";
@@ -1189,6 +1327,8 @@ describe("extensions/rbf-shell-command-groups", () => {
 			const host: any = Object.create(InteractiveMode.prototype);
 			Object.assign(host, {
 				isInitialized: true,
+				// Native 1.3 initializes this class field; Object.create deliberately skips the constructor.
+				programStatus: { handleEvent() {} },
 				footer: { invalidate() {} },
 				ui: { requestRender, terminal: { setProgress() {} } },
 				chatContainer: new Container(),
@@ -1279,6 +1419,164 @@ describe("extensions/rbf-shell-command-groups", () => {
 			return made;
 		}
 
+
+		describe("pi-52 live membership identity", () => {
+			function codex(s: ReturnType<typeof stage>) {
+				const tool = { ...s.bash, name: "codex_command", renderCall: (args: any) => new Text(`$ ${args.command}`,0,0), renderResult: () => new Text("out",0,0) };
+				s.definitions.set(tool.name, tool);
+				const owner = createShellDisplayOwner<any>(s.events,"codex-command",()=>false)!;
+				let ownerGeneration="";
+				s.events.on(SHELL_DISPLAY_CHANNEL,(message:any)=>{if(message.kind==="announce"&&message.source==="codex-command")ownerGeneration=message.ownerGeneration;});
+				owner.start(SESSION,tool);
+				const begin = async (id: string, actualThread: string, clientGeneration: string) => {
+					const args = { itemId:id,threadId:"",agentPath:"",command:"pwd",cwd:"/work" };
+					s.events.emit(SHELL_DISPLAY_CHANNEL,{ kind:"membership",sessionId:SESSION,source:"codex-command",ownerGeneration,toolCallId:`codex-${id}`,revision:1,itemId:id,clientGeneration,threadId:actualThread,agentPath:"",cwd:"/work",binding:new WeakRef(args) });
+					await s.host.handleEvent({type:"tool_execution_start",toolCallId:`codex-${id}`,toolName:tool.name,args});
+					return args;
+				};
+				return {begin,owner,tool,get ownerGeneration(){return ownerGeneration;}};
+			}
+			it("never merges same-empty-root arguments from different actual root threads, starting with the first frame", async () => {
+				const s=stage();const c=codex(s);
+				await c.begin("a","actual-root-A","client-1");
+				expect(s.headers()).toHaveLength(1);
+				await c.begin("b","actual-root-B","client-1");
+				expect(s.headers()).toHaveLength(2);
+				c.owner.stop();
+			});
+			it("never merges rows from departed and current clients sharing the same root argument strings", async () => {
+				const s=stage();const c=codex(s);
+				await c.begin("a","actual-root","departed-client");
+				s.draw();
+				await c.begin("b","actual-root","current-client");
+				expect(s.headers()).toHaveLength(2);
+				c.owner.stop();
+			});
+			it("keeps cloned presentation args and contradictory immutable binding native", async () => {
+				const s=stage();const c=codex(s);const args=await c.begin("a","root","client");expect(s.headers()).toHaveLength(1);
+				s.rows()[0].updateArgs({...args});expect(s.headers()).toEqual([]);
+				s.rows()[0].updateArgs(args);
+				s.events.emit(SHELL_DISPLAY_CHANNEL,{kind:"membership",sessionId:SESSION,source:"codex-command",ownerGeneration:c.ownerGeneration,toolCallId:"codex-a",revision:1,itemId:"a",clientGeneration:"client",threadId:"different-root",agentPath:"",cwd:"/work",binding:new WeakRef(args)});
+				expect(s.headers()).toEqual([]);c.owner.stop();
+			});
+			it("an unseen withdrawal tombstones a delayed older snapshot before first admission",async()=>{
+				const s=stage();const c=codex(s);const args={itemId:"a",threadId:"",agentPath:"",cwd:"/work",command:"pwd"};
+				const identity={sessionId:SESSION,source:"codex-command",ownerGeneration:c.ownerGeneration,toolCallId:"codex-a",itemId:"a",clientGeneration:"client",threadId:"root",agentPath:"",cwd:"/work",binding:new WeakRef(args)};
+				s.events.emit(SHELL_DISPLAY_CHANNEL,{...identity,kind:"membership-withdraw",revision:2});s.events.emit(SHELL_DISPLAY_CHANNEL,{...identity,kind:"membership",revision:1});
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"codex-a",toolName:c.tool.name,args});expect(s.headers()).toEqual([]);c.owner.stop();
+			});
+
+			it("a synchronous snapshot can bind before the first projected frame",async()=>{
+				const s=stage();const c=codex(s);const args={itemId:"snapshot",threadId:"",agentPath:"",cwd:"/work",command:"pwd"};
+				s.events.on(SHELL_DISPLAY_CHANNEL,(message:any)=>{if(message.kind==="snapshot-request"&&message.toolCallIds?.includes("codex-snapshot"))s.events.emit(SHELL_DISPLAY_CHANNEL,{kind:"membership",sessionId:SESSION,source:"codex-command",ownerGeneration:c.ownerGeneration,toolCallId:"codex-snapshot",revision:1,itemId:"snapshot",clientGeneration:"client",threadId:"actual-root",agentPath:"",cwd:"/work",binding:new WeakRef(args)});});
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"codex-snapshot",toolName:c.tool.name,args});
+				expect(s.headers()).toHaveLength(1);expect([...s.view.state.members.values()][0]!.threadId).toBe("actual-root");c.owner.stop();
+			});
+			it("one captured client/thread combines command and MCP without merging another owner",async()=>{
+				const s=stage();const c=codex(s);await c.begin("a","root","client");
+				const tool={...c.tool,name:"codex_tool"};s.definitions.set(tool.name,tool);
+				const mcpOwner=createShellDisplayOwner<any>(s.events,"codex-mcp",()=>false)!;let generation="";
+				s.events.on(SHELL_DISPLAY_CHANNEL,(message:any)=>{if(message.kind==="announce"&&message.source==="codex-mcp")generation=message.ownerGeneration;});mcpOwner.start(SESSION,tool);
+				const args={itemId:"m",threadId:"",agentPath:"",server:"custom",tool:"invoke",arguments:{},display:{appName:"Notes"}};
+				s.events.emit(SHELL_DISPLAY_CHANNEL,{kind:"membership",sessionId:SESSION,source:"codex-mcp",ownerGeneration:generation,toolCallId:"codex-m",revision:1,itemId:"m",clientGeneration:"client",threadId:"root",agentPath:"",cwd:"/work",binding:new WeakRef(args)});
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"codex-m",toolName:tool.name,args});await c.begin("b","root","client");
+				expect(s.headers()).toHaveLength(1);expect(s.view.state.groups[0]!.memberIds).toHaveLength(3);
+				await c.begin("d","root","other");expect(s.headers()).toHaveLength(2);mcpOwner.stop();c.owner.stop();
+			});
+			it.each(["invalid-weak-token","expired-token","wrong-session","wrong-owner","wrong-item","wrong-cwd"])("%s remains a native barrier from admission",async(kind)=>{
+				const s=stage();const c=codex(s);const args={itemId:"a",threadId:"",agentPath:"",cwd:"/work",command:"pwd"};
+				const binding=kind==="invalid-weak-token"?{deref:()=>args}:kind==="expired-token"?new (class extends WeakRef<object>{deref(){return undefined;}})(args):new WeakRef(args);
+				s.events.emit(SHELL_DISPLAY_CHANNEL,{kind:"membership",sessionId:kind==="wrong-session"?"other":SESSION,source:"codex-command",ownerGeneration:kind==="wrong-owner"?"other":c.ownerGeneration,toolCallId:"codex-a",revision:1,itemId:kind==="wrong-item"?"other":"a",clientGeneration:"client",threadId:"root",agentPath:"",cwd:kind==="wrong-cwd"?"/other":"/work",binding});
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"codex-a",toolName:c.tool.name,args});expect(s.headers()).toEqual([]);c.owner.stop();
+			});
+
+
+			it.each([
+				["header","membership-withdraw"],["member","membership-withdraw"],
+				["header","owner-withdraw"],["member","owner-withdraw"],
+				["header","conflict"],["member","conflict"],
+				["header","replacement"],["member","replacement"],
+			])("pi-52 immediate retirement invalidates a pending %s gesture on %s before redraw",async(target,invalidation)=>{
+					const s=stage();const c=codex(s);const args=await c.begin("a","root","client");
+					s.click(s.headerRow());const group=s.view.state.groups[0]!;expect(group.expanded).toBe(true);
+					const y=target==="header"?s.headerRow():s.draw().findIndex((line)=>line.includes("$ pwd"));expect(y).toBeGreaterThanOrEqual(0);
+					s.mouse("press",y);
+					const membership={kind:"membership",sessionId:SESSION,source:"codex-command",ownerGeneration:c.ownerGeneration,toolCallId:"codex-a",revision:1,itemId:"a",clientGeneration:"client",threadId:"root",agentPath:"",cwd:"/work",binding:new WeakRef(args)};
+					if(invalidation==="membership-withdraw")s.events.emit(SHELL_DISPLAY_CHANNEL,{...membership,kind:"membership-withdraw",revision:2});
+					else if(invalidation==="owner-withdraw")c.owner.stop();
+					else if(invalidation==="conflict")s.events.emit(SHELL_DISPLAY_CHANNEL,{...membership,threadId:"other-root"});
+					else s.events.emit(SHELL_DISPLAY_CHANNEL,{kind:"announce",sessionId:SESSION,source:"codex-command",ownerGeneration:"replacement-owner",toolName:c.tool.name,execute:c.tool.execute,renderCall:c.tool.renderCall,renderResult:c.tool.renderResult});
+					// Deliberately no draw/header query between invalidation and the completed click.
+					s.mouse("release",y);s.mouse("click",y);
+					expect(group.expanded,`${target}: ${invalidation}`).toBe(true);
+					expect(s.headers()).toEqual([]);c.owner.stop();s.view.stop();
+			});
+
+			it("keeps an unbound live Codex row native from its first frame", async () => {
+				const s=stage();const c=codex(s);
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"codex-unbound",toolName:"codex_command",args:{itemId:"unbound",threadId:"",agentPath:"",command:"pwd",cwd:"/work"}});
+				expect(s.headers()).toEqual([]);
+				expect(s.draw().join("\n")).toContain("$ pwd");
+				c.owner.stop();
+			});
+		});
+
+		describe("pi-52 actual producer and native row isolation",()=>{
+			it.each(["command","toolCall"] as const)("different actual roots on one real producer client isolate %s from the first native frame",async(kind)=>{
+				await exercise(kind,false);
+			});
+			it.each(["command","toolCall"] as const)("departed/current real producer clients cannot reassociate reused %s IDs",async(kind)=>{
+				await exercise(kind,true);
+			});
+			async function exercise(kind:"command"|"toolCall",replaceClient:boolean){
+				const saved=process.env.RBF_FAKE_SCENARIO;const work=mkdtempSync(join(tmpdir(),"pi52-native-source-"));
+				const s=stage();const handlers=new Map<string,any>();let provider:any;
+				const item=(id:string)=>kind==="command"?{kind,id,command:"printf fixture",cwd:work,output:["fixture"]}:{kind,id,server:"arbitrary",tool:"invoke",arguments:{},result:{content:[]}};
+				process.env.RBF_FAKE_SCENARIO=JSON.stringify({threadIds:replaceClient?["actual-root"]:["actual-root-A","actual-root-B"],turn:[item(replaceClient?"duplicate":"a"),{kind:"complete"}],laterTurns:[item("b"),{kind:"complete"}]});
+				const seen:any[]=[];s.events.on(SHELL_DISPLAY_CHANNEL,(message)=>seen.push(message));
+				const pi:any={events:s.events,on:(name:string,handler:any)=>handlers.set(name,handler),appendEntry(){},registerTool:(tool:any)=>s.definitions.set(tool.name,tool),registerProvider:(_name:string,config:any)=>{provider=config;},getThinkingLevel:()=>"medium"};
+				const ctx:any={...s.ctx,model:BOOTSTRAP_MODEL,isIdle:()=>true,hasPendingMessages:()=>false,ui:{notify(){},setWorkingMessage(){}},sessionManager:{getSessionId:()=>SESSION,getCwd:()=>work,getBranch:()=>[],getLeafId:()=>"leaf"}};
+				createRbfCodex({argv:[],command:{bin:process.execPath,args:[resolve(import.meta.dirname,"test-support/rbf-codex-fake-app-server.ts")]}})(pi);
+				try{
+					await handlers.get("session_start")({type:"session_start"},ctx);
+					const user={role:"user",content:[{type:"text",text:"fixture"}],timestamp:1};
+					const stream=async(messages:any[],rowOnlyTerminal=false)=>{
+						let final:any;let call:any;
+						for await(const event of provider.streamSimple(BOOTSTRAP_MODEL,{messages},{})){
+							if(event.type==="start")await s.host.handleEvent({type:"message_start",message:event.partial});
+							else if(event.partial){
+								await s.host.handleEvent({type:"message_update",message:event.partial,assistantMessageEvent:event});s.draw();
+								for(const row of s.rows())if(row.args?.itemId){const member=[...s.view.state.members.values()].find((member)=>member.nativeRow===row);if(member){expect(member.clientGeneration).toBeTruthy();const record=seen.find((m)=>m.kind==="membership"&&m.binding?.deref()===row.args);expect(record).toBeDefined();expect(member.threadId).toBe(record.threadId);expect(member.clientGeneration).toBe(record.clientGeneration);}}
+								for(const group of s.view.state.groups){const tuples=group.memberIds.map((id)=>{const member=s.view.state.members.get(id)!;return JSON.stringify([member.clientGeneration,member.threadId,member.agentPath,member.cwd]);});expect(new Set(tuples).size).toBe(1);}
+							}
+							if(event.type==="done"){final=event.message;call=final.content.find((part:any)=>part.type==="toolCall");await s.host.handleEvent({type:"message_end",message:final});}
+							if(event.type==="error") {
+								// This seam fixture projects only original tool rows, creating controlled adjacency across source turns.
+								// The scripted turn has no prose answer; its terminal no-answer is not a row-admission event.
+								if(rowOnlyTerminal&&event.error.errorMessage===COPY["no-answer"])return {};
+								throw new Error(event.error.errorMessage);
+							}
+						}
+						return {final,call};
+					};
+					const round=async()=>{
+						const {final,call}=await stream([user]);expect(call).toBeDefined();expect(call.arguments.threadId).toBe("");
+						await s.host.handleEvent({type:"tool_execution_start",toolCallId:call.id,toolName:call.name,args:call.arguments});s.draw();
+						let result:any;let isError=false;try{result=await(s.definitions.get(call.name) as any).execute(call.id,structuredClone(call.arguments),undefined,undefined,ctx);}catch(error){if(!(error instanceof RowError))throw error;result={content:[{type:"text",text:error.message}],details:{}};isError=true;}
+						await s.host.handleEvent({type:"tool_execution_end",toolCallId:call.id,toolName:call.name,result,isError});
+						await stream([user,final,{role:"toolResult",toolCallId:call.id,toolName:call.name,...result,isError,timestamp:2}],true);return call;
+					};
+					await round();expect(s.headers()).toHaveLength(1);
+					const first=seen.find((m)=>m.kind==="membership");
+					if(replaceClient){await handlers.get("session_before_switch")({type:"session_before_switch"},ctx);expect(s.headers()).toEqual([]);}
+					await round();const records=seen.filter((m)=>m.kind==="membership"&&m.revision===1);const last=records.at(-1);
+					if(replaceClient){expect(last.clientGeneration).not.toBe(first.clientGeneration);expect(last.toolCallId).toBe(first.toolCallId);s.events.emit(SHELL_DISPLAY_CHANNEL,first);expect(s.headers()).toHaveLength(1);expect([...s.view.state.members.values()][0]!.clientGeneration).toBe(last.clientGeneration);}
+					else{expect(last.clientGeneration).toBe(first.clientGeneration);expect(last.threadId).not.toBe(first.threadId);expect(s.headers()).toHaveLength(2);}
+					expect(s.rows()).toHaveLength(2);
+				}finally{await handlers.get("session_shutdown")?.({type:"session_shutdown"},ctx);if(saved===undefined)delete process.env.RBF_FAKE_SCENARIO;else process.env.RBF_FAKE_SCENARIO=saved;rmSync(work,{recursive:true,force:true});}
+			}
+		});
+
 		/** Members in the states the collapsed renders show, made the way each state is reached live. */
 		async function member(s: ReturnType<typeof stage>, id: string, state: string) {
 			const [kind, identity] = state.split(":");
@@ -1322,6 +1620,71 @@ describe("extensions/rbf-shell-command-groups", () => {
 			console.log(`view components host: Pi ${VERSION}`);
 			expect(typeof VERSION).toBe("string");
 			if (!process.env.PI_HOST_PACKAGE) expect(VERSION).toBe("0.85.1");
+		});
+
+		describe("pi-52 MCP evidence and native admission", () => {
+			function nativeMcp(s: ReturnType<typeof stage>, alias = "Custom Notes") {
+				const definition = { ...s.bash, name: "mcp_sanitized_hash", renderCall: undefined, renderResult: undefined };
+				s.definitions.set(definition.name, definition);
+				(s.view as any).stop();
+				const metadata = [{name:definition.name,sourceInfo:{path:"builtin:mcp",source:"builtin"},namespace:{aliases:[alias]}}];
+				const view = createShellGroupsView({events:s.events,getAllTools:()=>metadata} as any);
+				view.start(s.ctx); (s as any).view=view;
+				return {definition,metadata,view};
+			}
+			it("admits native MCP by exact provenance and follows native start/final error", async () => {
+				const s=stage();const n=nativeMcp(s);
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"m1",toolName:n.definition.name,args:{query:"example"}});
+				expect(s.headers()).toEqual([" ▸ Custom Notes: 1 call · active"]);
+				await s.host.handleEvent({type:"tool_execution_update",toolCallId:"m1",toolName:n.definition.name,partialResult:{content:[{type:"text",text:"completed"}]}});
+				expect(s.headers()).toEqual([" ▸ Custom Notes: 1 call · active"]);
+				await s.host.handleEvent({type:"tool_execution_end",toolCallId:"m1",toolName:n.definition.name,result:{content:[],details:{server:"Custom Notes",tool:"search"}},isError:true});
+				expect(s.headers()).toEqual([" ▸ called Custom Notes 1 time · 1 failed"]);
+				const children=[...s.chat.children];s.click(s.headerRow());
+				expect(s.chat.children).toEqual(children);
+				expect(s.draw().slice(2)).toEqual(s.native());
+			});
+			it("a native assistant abort/error without a final tool result remains unknown with its error",async()=>{
+				const s=stage();const n=nativeMcp(s);const call={type:"toolCall",id:"m1",name:n.definition.name,arguments:{query:"fixture"}};
+				const message={role:"assistant",content:[call],stopReason:"toolUse"};
+				await s.host.handleEvent({type:"message_start",message});await s.host.handleEvent({type:"message_update",message,assistantMessageEvent:{type:"toolcall_start",contentIndex:0,partial:message}});
+				expect(s.headers()).toEqual([" ▸ Custom Notes: 1 call · pending"]);
+				await s.host.handleEvent({type:"message_end",message:{...message,stopReason:"aborted"}});
+				expect(s.headers()).toEqual([" ▸ Custom Notes: 1 call · error · status unknown"]);
+				const member=[...n.view.state.members.values()][0]!;expect(member.hasResult).toBe(false);expect(member.mcp!.evidence.state).toBe("unknown");
+			});
+
+			it("keeps replaced metadata and renderers native from first admission", async () => {
+				const s=stage();const n=nativeMcp(s);n.metadata[0]!.sourceInfo.path="extension:pretend";
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"m1",toolName:n.definition.name,args:{}});
+				expect(s.headers()).toEqual([]);
+				n.metadata[0]!.sourceInfo.path="builtin:mcp";s.rows()[0].toolDefinition={...n.definition,renderCall:()=>new Text("custom",0,0)};
+				expect(s.headers()).toEqual([]);
+			});
+			it("1,000 MCP members and 100 output updates copy no output and do not regroup", async () => {
+				const s=stage();const n=nativeMcp(s);
+				for(let i=0;i<1000;i++) {
+					if(i>0&&i%100===0)s.prose(`Batch ${i/100}`);
+					await s.host.handleEvent({type:"tool_execution_start",toolCallId:`m${i}`,toolName:n.definition.name,args:{}});
+				}
+				expect(s.headers()).toHaveLength(10);expect(n.view.state.members.size).toBe(1000);
+				const reconciliations=n.view.state.reconciliations;const updates=n.view.state.groups.map((group)=>group.updates);
+				const render=vi.spyOn(ToolExecutionComponent.prototype,"render");
+				for(let i=0;i<100;i++) {
+					await s.host.handleEvent({type:"tool_execution_update",toolCallId:"m437",toolName:n.definition.name,partialResult:{content:[{type:"text",text:"MCP-OUTPUT-MARKER".repeat(i+1)}]}});s.draw();
+				}
+				expect(render).not.toHaveBeenCalled();render.mockRestore();
+				expect(n.view.state.reconciliations).toBe(reconciliations);expect(n.view.state.groups.map((group)=>group.updates)).toEqual(updates);
+				expect(JSON.stringify([...n.view.state.members.values()].map(({nativeRow,...rest})=>rest))).not.toContain("MCP-OUTPUT-MARKER");
+			},60_000);
+
+			it("captures the server alias and refuses relabelling on reconnect", async () => {
+				const s=stage();const n=nativeMcp(s);
+				await s.host.handleEvent({type:"tool_execution_start",toolCallId:"m1",toolName:n.definition.name,args:{}});
+				expect(s.headers()).toHaveLength(1);
+				n.metadata[0]!.namespace.aliases=["Other"];
+				expect(s.headers()).toEqual([" ▸ Custom Notes: 1 call · active"]);
+			});
 		});
 
 		describe("layout", () => {
@@ -2605,7 +2968,7 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(s.notify).not.toHaveBeenCalled(); // one tick later, after Pi's own draw
 				await tick();
 				expect(s.notify.mock.calls).toEqual([[UNAVAILABLE_WARNING, "warning"]]);
-				expect(UNAVAILABLE_WARNING).toBe("Shell command groups unavailable; showing native tool rows.");
+				expect(UNAVAILABLE_WARNING).toBe("Tool call groups unavailable; showing native tool rows.");
 				// Detached: nothing of the view is left on the container or the prototype, and later frames and events are Pi's alone.
 				for (const name of CONTAINER_METHODS) expect(Object.prototype.hasOwnProperty.call(s.chat, name)).toBe(false);
 				for (const name of HOST_METHODS) expect((InteractiveMode.prototype as any)[name]).toBe(pristine[name]);

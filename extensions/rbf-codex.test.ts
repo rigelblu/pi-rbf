@@ -1372,6 +1372,99 @@ describe("rbf-codex", () => {
 		});
 	});
 
+
+	describe("pi-52 pre-row membership transport", () => {
+		it.each(["command","toolCall"] as const)("publishes immutable %s membership before the first synthetic-row stream event", async (kind) => {
+			const event: any = kind === "command"
+				? {kind,id:"identity-1",command:"pwd",cwd:dir,output:["/work"]}
+				: {kind,id:"identity-1",server:"arbitrary-server",tool:"invoke",arguments:{text:"fixture"},result:{content:[]}};
+			scenario({turn:[event,{kind:"complete"}]});
+			const events=createEventBus();const seen:any[]=[];
+			events.on(SHELL_DISPLAY_CHANNEL,(message)=>seen.push(message));
+			const b=await boot({events,cwd:dir});
+			const stream=b.provider.config.streamSimple!(model(),{messages:[userMessage("go")]} as Context,{});
+			let checked=false;const observed:any[]=[];
+			for await(const event of stream){
+				observed.push(event);
+				if(event.type!=="toolcall_start")continue;
+				const call=event.partial.content[event.contentIndex] as ToolCall;
+				const identity=seen.find(m=>m.kind==="membership"&&m.toolCallId===call.id);
+				expect(identity,"membership must exist before even the first row event").toBeDefined();
+				expect(identity).toMatchObject({sessionId:"session-A",source:kind==="command"?"codex-command":"codex-mcp",toolCallId:"codex-identity-1",itemId:"identity-1",threadId:"thread-fake-1",agentPath:"",cwd:dir});
+				expect(typeof identity.clientGeneration).toBe("string");
+				expect(identity.clientGeneration.length).toBeGreaterThan(0);
+				expect(identity.binding.deref()).toBe(call.arguments);
+				expect(call.arguments.threadId).toBe("");
+				expect(call.arguments).not.toHaveProperty("clientGeneration");
+				checked=true;
+			}
+			expect(checked,JSON.stringify(observed.map(e=>({type:e.type,error:e.error?.errorMessage})))).toBe(true);
+		});
+	});
+
+	describe("pi-52 membership retirement",()=>{
+		it("eviction and client loss revoke weak admission without changing process facts or allowing rebinding",()=>{
+			const events=createEventBus();const seen:any[]=[];events.on(SHELL_DISPLAY_CHANNEL,(message)=>seen.push(message));
+			const owner=createShellDisplayOwner<{kind:string}>(events,"codex-mcp",()=>false,1)!;owner.start("session-A",{name:TOOL_TOOL,execute(){}});
+			const a={itemId:"a"};const b={itemId:"b"};const scope={clientGeneration:"client",threadId:"root"};
+			const first=owner.open("codex-a",scope)!;first.bind(a,{itemId:"a",threadId:"root",agentPath:"",cwd:"/work"});
+			owner.open("codex-b",scope)!.bind(b,{itemId:"b",threadId:"root",agentPath:"",cwd:"/work"});
+			expect(seen.filter((message)=>message.kind==="membership-withdraw").map((message)=>[message.toolCallId,message.revision,message.binding.deref()])).toEqual([["codex-a",2,a]]);
+			first.bind(a,{itemId:"a",threadId:"root",agentPath:"",cwd:"/work"});expect(seen.filter((message)=>message.kind==="membership"&&message.toolCallId==="codex-a")).toHaveLength(1);
+			owner.retireClient("client");expect(seen.filter((message)=>message.kind==="membership-withdraw").map((message)=>message.toolCallId)).toEqual(["codex-a","codex-b"]);
+			seen.length=0;events.emit(SHELL_DISPLAY_CHANNEL,{kind:"snapshot-request",sessionId:"session-A"});expect(seen.filter((message)=>message.kind==="membership")).toEqual([]);owner.stop();
+		});
+	});
+
+	describe("pi-52 buffered rows after client loss",()=>{
+		it.each(["command","toolCall"] as const)("a buffered %s remains native without renewing a departed client generation",async(kind)=>{
+			const item=(id:string)=>kind==="command"?{kind,id,command:"printf fixture",cwd:dir,output:[id]}:{kind,id,server:"custom",tool:"invoke",result:{content:[{type:"text",text:id}]}};
+			scenario({turn:[item("a"),item("b"),{kind:"complete",after:[{kind:"sleep",ms:50},{kind:"die"}]}]});
+			const events=createEventBus();const seen:any[]=[];events.on(SHELL_DISPLAY_CHANNEL,(message)=>seen.push(message));const b=await boot({events,cwd:dir});
+			const first=await b.turn("go");expect(first.toolCall!.id).toBe("codex-a");await sleep(180);
+			expect(seen.some((message)=>message.kind==="membership-withdraw"&&message.toolCallId==="codex-a")).toBe(true);
+			const result=await b.exec(first.toolCall!);const second=await b.turn([userMessage("go"),first.final!,toolResultMessage(first.toolCall!,result)]);
+			expect(second.toolCall!.id).toBe("codex-b");expect(seen.filter((message)=>message.kind==="membership"&&message.toolCallId==="codex-b")).toEqual([]);
+			expect(await b.exec(second.toolCall!)).toMatchObject({content:[{type:"text",text:"b"}]});
+		});
+	});
+
+	describe("pi-52 saved MCP identity", () => {
+		it("records only supplied metadata at emission and retains it for replay", async () => {
+			scenario({turn:[{kind:"toolCall",id:"x",server:"arbitrary",tool:"a.b",arguments:{query:"fixture"},appContext:{appName:"Notes Lab",connectorId:"c1"},pluginId:"p1",result:{content:[]}},{kind:"complete"}]});
+			const b=await boot();const r=await b.round([userMessage("go")]);
+			expect(r.first.toolCall!.arguments).toEqual({itemId:"x",threadId:"",agentPath:"",server:"arbitrary",tool:"a.b",arguments:{query:"fixture"},display:{appName:"Notes Lab",connectorId:"c1",pluginId:"p1"}});
+			const saved=JSON.parse(JSON.stringify(r.first.toolCall!.arguments));
+			const rows=b.tools.get(TOOL_TOOL)!.renderCall!(saved,fakeTheme,{state:{},expanded:false,executionStarted:false,invalidate(){}} as any).render(120).map((line:string)=>line.trim());
+			expect(rows[0]).toBe("Notes Lab.a.b");
+			expect(saved).not.toHaveProperty("clientGeneration");
+		});
+		it("late-only identity does not mutate the emitted fallback or stored arguments", async () => {
+			scenario({turn:[{kind:"toolCall",id:"x",server:"custom.server",tool:"a.b",arguments:{},completedAppContext:{appName:"Late Design",connectorId:"late"},result:{content:[]}},{kind:"complete"}]});
+			const b=await boot();const first=await b.turn("go");const args=first.toolCall!.arguments;
+			const before=JSON.stringify(args);expect(args).not.toHaveProperty("display");
+			await b.exec(first.toolCall!);
+			expect(JSON.stringify(args)).toBe(before);
+		});
+		it.each([null,{}, {appName:42}, {appName:"Valid",connectorId:42}])("invalid display metadata %j leaves the exact legacy identity readable",async(display)=>{
+			const b=await boot();const args={itemId:"old",threadId:"",agentPath:"",server:"old.server",tool:"tool.with.dots",arguments:{},display};
+			const rows=b.tools.get(TOOL_TOOL)!.renderCall!(args,fakeTheme,{state:{},expanded:false,executionStarted:false,invalidate(){}} as any).render(120).map((line:string)=>line.trim());
+			expect(rows[0]).toBe("old.server.tool.with.dots");
+		});
+	});
+
+	describe("pi-52 MCP display facts",()=>{
+		it.each(["absent","throwing"])("%s display subscribers leave native MCP requests and settlement intact",async(mode)=>{
+			scenario({turn:[{kind:"toolCall",id:"x",server:"custom",tool:"invoke",arguments:{key:"value"},result:{content:[{type:"text",text:"native result"}]}},{kind:"answer",id:"done",text:"done"},{kind:"complete"}]});
+			const events=mode==="absent" ? undefined : {emit(){throw new Error("subscriber");},on(){return ()=>{};}};
+			const b=await boot({events});const r=await b.round([userMessage("go")]);
+			expect(r.result).toMatchObject({content:[{type:"text",text:"native result"}],isError:false});
+			expect(r.next!.text).toBe("done");
+			expect(sent().filter((request)=>request.method==="turn/start")).toHaveLength(1);
+			expect(r.first.toolCall!.arguments).toMatchObject({server:"custom",tool:"invoke",arguments:{key:"value"}});
+		});
+	});
+
 	describe("tool call rows (Scenario 17)", () => {
 		const replies = () => sent().filter((m) => m.id !== undefined && !m.method) as { id: number; result?: any; error?: any }[];
 		const rc = (executionStarted = false, expanded = false) => ({ state: {} as Record<string, unknown>, executionStarted, expanded, invalidate: () => {} });
@@ -1447,7 +1540,7 @@ describe("rbf-codex", () => {
 			scenario({ turn: [{ kind: "toolCall", id: "t1", server: "codex_apps", tool: "create_issue", arguments: { title: "Bug" }, appContext: { connectorId: "gh", appName: "GitHub" }, incomplete: true }, { kind: "hang" }] });
 			const live = await boot();
 			const first = await live.turn("file it");
-			expect(first.toolCall!.arguments).toEqual({ itemId: "t1", threadId: "", agentPath: "", server: "codex_apps", tool: "create_issue", arguments: { title: "Bug" } });
+			expect(first.toolCall!.arguments).toEqual({ itemId: "t1", threadId: "", agentPath: "", server: "codex_apps", tool: "create_issue", arguments: { title: "Bug" }, display: { appName: "GitHub", connectorId: "gh" } });
 			expect(lines(live.tools.get(TOOL_TOOL)!.renderCall(first.toolCall!.arguments, fakeTheme, rc()))).toEqual(["GitHub.create_issue Bug"]);
 			// The timing state is bash's: `Elapsed` while partial, `Took` once final.
 			const timed = rc(true);
@@ -2925,7 +3018,12 @@ describe("rbf-codex", () => {
 			const facts = (id?: string) => seen.filter((message) => message?.kind === "fact" && (!id || message.toolCallId === id));
 			const told = (id: string) => facts(id).map((message) => message.fact);
 			/** The identity every fact of one command carries: the session and generation announced, never a display argument. */
-			const identity = (toolCallId: string) => ({ kind: "fact", sessionId: "session-A", source: "codex-command", ownerGeneration: seen.find((message) => message.kind === "announce")!.ownerGeneration, toolCallId });
+			const identity = (toolCallId: string) => {
+				const captured = facts(toolCallId)[0]!;
+				expect(captured.clientGeneration).toEqual(expect.any(String));
+				expect(captured.threadId).toEqual(expect.any(String));
+				return { kind: "fact", sessionId: "session-A", source: "codex-command", ownerGeneration: seen.find((message) => message.kind === "announce")!.ownerGeneration, toolCallId, clientGeneration: captured.clientGeneration, threadId: captured.threadId };
+			};
 			/** Pi's loop for one prompt: every row the turn opens is executed, until a call ends without one. */
 			const drive = async (text: string, signal?: AbortSignal) => {
 				let messages: Context["messages"] = [userMessage(text)];
@@ -2959,10 +3057,12 @@ describe("rbf-codex", () => {
 				const b = await watched();
 				const tool = b.tools.get(TOOL_COMMAND)!;
 				expect(SHELL_DISPLAY_CHANNEL).toBe("rbf:shell-display:v1");
-				expect(b.seen).toEqual([{ kind: "announce", sessionId: "session-A", source: "codex-command", toolName: TOOL_COMMAND, ownerGeneration: expect.stringMatching(/^codex-command:.{8,}$/), execute: tool.execute, renderCall: tool.renderCall, renderResult: tool.renderResult }]);
+				expect(b.seen.filter((message) => message.source === "codex-command")).toEqual([{ kind: "announce", sessionId: "session-A", source: "codex-command", toolName: TOOL_COMMAND, ownerGeneration: expect.stringMatching(/^codex-command:.{8,}$/), execute: tool.execute, renderCall: tool.renderCall, renderResult: tool.renderResult }]);
 				expect(b.seen[0]!.execute).toBe(tool.execute);
 				expect(b.seen[0]!.renderCall).toBe(tool.renderCall);
 				expect(b.seen[0]!.renderResult).toBe(tool.renderResult);
+				const mcp = b.tools.get(TOOL_TOOL)!;
+				expect(b.seen.filter((message) => message.source === "codex-mcp")).toEqual([{kind:"announce",sessionId:"session-A",source:"codex-mcp",toolName:TOOL_TOOL,ownerGeneration:expect.stringMatching(/^codex-mcp:/),execute:mcp.execute,renderCall:mcp.renderCall,renderResult:mcp.renderResult}]);
 			});
 
 			it("a view that attaches after the owner asks and gets the announce, then every retained fact in order; another session's request gets nothing", async () => {
@@ -2981,7 +3081,10 @@ describe("rbf-codex", () => {
 				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "something-new" });
 				expect(late.map((m) => m.kind)).toEqual(["snapshot-request", "something-new"]);
 				events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
-				const answers = late.slice(2).filter((m) => m.kind !== "snapshot-request");
+				const allAnswers = late.slice(2).filter((m) => m.kind !== "snapshot-request");
+				expect(allAnswers.filter((m) => m.kind === "membership").map((m) => m.toolCallId)).toEqual(["codex-c1", "codex-c2"]);
+				expect(allAnswers.filter((m) => m.source === "codex-mcp")).toHaveLength(1);
+				const answers = allAnswers.filter((m) => m.source === "codex-command" && m.kind !== "membership");
 				expect(answers.map((m) => [m.kind, m.toolCallId, m.revision, m.fact?.kind])).toEqual([
 					["announce", undefined, undefined, undefined],
 					["fact", "codex-c1", 1, "start"],
@@ -3000,7 +3103,10 @@ describe("rbf-codex", () => {
 				await b.shutdown();
 				expect(b.told("codex-c1")).toEqual([{ kind: "start" }, { kind: "cut", identity: "c1" }, { kind: "lost" }]);
 				const generation = b.seen[0]!.ownerGeneration;
-				expect(b.seen.at(-1)).toEqual({ kind: "withdraw", sessionId: "session-A", source: "codex-command", ownerGeneration: generation });
+				expect(b.seen.filter((m) => m.kind === "withdraw")).toEqual([
+					{kind:"withdraw",sessionId:"session-A",source:"codex-command",ownerGeneration:generation},
+					{kind:"withdraw",sessionId:"session-A",source:"codex-mcp",ownerGeneration:b.seen.find((m)=>m.source==="codex-mcp")!.ownerGeneration},
+				]);
 				b.events.emit(SHELL_DISPLAY_CHANNEL, { kind: "snapshot-request", sessionId: "session-A" });
 				expect(b.seen.at(-1)).toEqual({ kind: "snapshot-request", sessionId: "session-A" });
 			});

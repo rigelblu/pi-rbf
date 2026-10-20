@@ -40,7 +40,7 @@ const READY = existsSync(REPO_PI) && spawnSync("python3", ["--version"]).status 
 function artifactRoot(): string {
 	const script = join(homedir(), ".agents", "skills", "eng-use-external-tmp", "scripts", "resolve-external-tmp.sh");
 	const resolved = existsSync(script) ? spawnSync("bash", [script, "pi-42"], { encoding: "utf8" }).stdout?.trim() : "";
-	const root = join(resolved || join(tmpdir(), "pi-42"), "pty");
+	const root = process.env.RBF_SHELL_GROUPS_ARTIFACTS || join(resolved || join(tmpdir(), "pi-42"), "pty");
 	mkdirSync(root, { recursive: true });
 	return root;
 }
@@ -64,6 +64,7 @@ type Run = {
 	cols?: number;
 	rows?: number;
 	mode?: "fullscreen" | "regular";
+	mcp?: object;
 	steps: Step[];
 };
 type Result = { dir: string; marks: Record<string, any>; screen(mark: string): Screen; lines(mark: string): string[]; facts(): Fact[]; session(): any[] };
@@ -83,6 +84,7 @@ function drive(run: Run): Promise<Result> {
 	const dir = join(ARTIFACTS, run.scenario, run.host.name, run.name);
 	rmSync(dir, { recursive: true, force: true });
 	for (const sub of ["agent", "sessions", "work", "screens"]) mkdirSync(join(dir, sub), { recursive: true });
+	if (run.mcp) writeFileSync(join(dir,"agent","mcp.json"),JSON.stringify(run.mcp));
 	const cols = run.cols ?? 80;
 	const rows = run.rows ?? 50;
 	const out = join(dir, "raw.bin");
@@ -147,6 +149,7 @@ function drive(run: Run): Promise<Result> {
 				if (typeof marks[name] !== "number") throw new Error(`no snapshot ${name}`);
 				const at = replayScreen(raw.subarray(0, marks[name]), cols, rows, resizes.filter((resize) => resize.at <= marks[name]!));
 				writeFileSync(join(dir, "screens", `${name}.txt`), at.lines.join("\n"));
+				if(run.scenario==="pi-52")writeFileSync(join(dir,"screens",`${name}.cells.json`),JSON.stringify(at));
 				return at;
 			};
 			for (const name of Object.keys(marks)) if (typeof marks[name] === "number" && !name.includes(":")) screen(name);
@@ -1298,7 +1301,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 	describe.each(HOSTS)("neighbors fallback and scale on $name", (host) => {
 		const scenario = "S7-neighbors-fallback";
 		const script = [bash("echo one"), bash("echo two"), text("GATE_DONE")];
-		const WARNING = " Warning: Shell command groups unavailable; showing native tool rows.";
+		const WARNING = " Warning: Tool call groups unavailable; showing native tool rows.";
 
 		it(
 			"with no owner loaded, or a sandbox launch, every row is Pi's own, silently",
@@ -1369,7 +1372,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 						{ sleep: 0.5 },
 						// The fault is in the group's bookkeeping; the next frame that draws the transcript meets it.
 						...expandNatively,
-						{ wait: "Shell command groups unavailable" },
+						{ wait: "Tool call groups unavailable" },
 						...mark("fallen-back"),
 						{ key: "ctrl-o" },
 						{ wait: "Tool output: collapsed" },
@@ -1379,7 +1382,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				expect(headers(run.lines("grouped"))).toEqual([" ▸ ran 2 shell commands"]);
 				const fallen = run.lines("fallen-back");
 				expect(headers(fallen)).toEqual([]);
-				expect(fallen.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				expect(fallen.filter((line) => line.includes("Tool call groups unavailable"))).toEqual([WARNING]);
 				// The rows the user sees are the ones Pi draws alone, expanded by Pi's own shortcut, in the same order.
 				const rowsOf = (lines: string[]) => {
 					const all = transcript(lines).map((line) => line.replace(/Took \d+\.\ds/, "Took N.Ns"));
@@ -1390,7 +1393,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				// Pi's own controls go on working, and the warning is not said again.
 				const collapsed = run.lines("native-collapsed");
 				expect(headers(collapsed)).toEqual([]);
-				expect(collapsed.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				expect(collapsed.filter((line) => line.includes("Tool call groups unavailable"))).toEqual([WARNING]);
 				expect(rowsOf(collapsed).length).toBeLessThan(rowsOf(fallen).length);
 			},
 			PTY * 2,
@@ -1416,7 +1419,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 						{ sleep: 0.5 },
 						...mark("armed"),
 						...click("header", "ran 2 shell commands"),
-						{ wait: "Shell command groups unavailable" },
+						{ wait: "Tool call groups unavailable" },
 						...mark("dropped"),
 						...click("row", "echo one"),
 						...mark("native-click"),
@@ -1425,7 +1428,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				expect(headers(run.lines("armed"))).toEqual([" ▸ ran 2 shell commands"]);
 				const dropped = run.lines("dropped");
 				expect(headers(dropped)).toEqual([]);
-				expect(dropped.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				expect(dropped.filter((line) => line.includes("Tool call groups unavailable"))).toEqual([WARNING]);
 				// Nothing opened: both rows are the collapsed rows Pi draws alone.
 				const rowsOf = (lines: string[]) => {
 					const all = took(transcript(lines));
@@ -1436,7 +1439,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				const clicked = rowsOf(run.lines("native-click"));
 				expect(clicked.length).toBeGreaterThan(rowsOf(dropped).length);
 				expect(clicked.slice(clicked.indexOf(" $ echo two"))).toEqual(rowsOf(dropped).slice(rowsOf(dropped).indexOf(" $ echo two")));
-				expect(run.lines("native-click").filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				expect(run.lines("native-click").filter((line) => line.includes("Tool call groups unavailable"))).toEqual([WARNING]);
 			},
 			PTY * 2,
 		);
@@ -1483,7 +1486,7 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 						{ sleep: 0.5 },
 						// Click on expanded member row with fault active
 						...click("member_click", "item_1"),
-						{ wait: "Shell command groups unavailable" },
+						{ wait: "Tool call groups unavailable" },
 						...mark("member_fault_dropped"),
 						// Next click on native result row operates natively to collapse output
 						...click("row_native", "item_7"),
@@ -1493,9 +1496,9 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 				expect(headers(run.lines("expanded"))).toEqual([" ▾ ran 2 shell commands"]);
 				const dropped = run.lines("member_fault_dropped");
 				expect(headers(dropped)).toEqual([]);
-				expect(dropped.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				expect(dropped.filter((line) => line.includes("Tool call groups unavailable"))).toEqual([WARNING]);
 				const nativeClicked = run.lines("native_clicked");
-				expect(nativeClicked.filter((line) => line.includes("Shell command groups unavailable"))).toEqual([WARNING]);
+				expect(nativeClicked.filter((line) => line.includes("Tool call groups unavailable"))).toEqual([WARNING]);
 
 				const rowsOf = (lines: string[]) => {
 					const all = took(transcript(lines));
@@ -1604,4 +1607,106 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 			PTY,
 		);
 	});
+});
+
+
+describe.skipIf(!READY).each(HOSTS)("pi-52 real native host $name", (host) => {
+	it("pi-52 details mouse and width: one generic mixed run retains all native members", async () => {
+		const codex: FakeScenario = { turn: [
+			{kind:"toolCall",id:"m1",server:"custom-server",tool:"invoke",appContext:{appName:"Acme Design",connectorId:"acme"},arguments:{query:"first"},result:{content:[{type:"text",text:"MCP-DRAG-CHECK"}]}},
+			{kind:"command",id:"c1",command:"printf shell",output:["SHELL-CHECK"]},
+			{kind:"toolCall",id:"m2",server:"notes",tool:"search",appContext:{appName:"Notes Lab",connectorId:"notes"},arguments:{query:"second"},result:{content:[{type:"text",text:"NOTES-CHECK"}]}},
+			{kind:"toolCall",id:"m3",server:"custom-server",tool:"invoke",appContext:{appName:"Acme Design",connectorId:"acme"},arguments:{query:"third"},result:{content:[{type:"text",text:"LAST-CHECK"}]}},
+			{kind:"answer",id:"done",text:"PI52_DONE"},{kind:"complete"},
+		] };
+		const run=await drive({scenario:"pi-52",host,name:"mixed-native",extensions:[VIEW,CODEX,INDENT,BLENDED,join(SUPPORT,"rbf-mcp-membership-probe.ts")],env:{RBF_PI52_BINDING_LOG:join(ARTIFACTS,"pi-52",host.name,"mixed-native","binding.jsonl")},model:"codex-harness/codex",codex,cols:120,rows:60,steps:[...START,...GO,{wait:"PI52_DONE"},...mark("collapsed"),...click("header","called Acme Design 2 times"),...mark("expanded"),...click("member","SHELL-CHECK"),...mark("member-closed"),...click("reopen","called Acme Design 2 times"),...mark("reopened")]});
+		expect(headers(run.lines("collapsed"))).toEqual([" ▸ called Acme Design 2 times; ran 1 shell command; called Notes Lab 1 time"]);
+		expect(headers(run.lines("expanded"))).toEqual([" ▾ called Acme Design 2 times; ran 1 shell command; called Notes Lab 1 time"]);
+		expect(run.lines("expanded").join("\n")).toContain("MCP-DRAG-CHECK");
+		expect(run.lines("expanded").join("\n")).toContain("LAST-CHECK");
+		expect(headers(run.lines("member-closed"))).toEqual(headers(run.lines("collapsed")));
+		expect(took(run.lines("reopened"))).toEqual(took(run.lines("expanded")));
+		const memberships=run.facts().filter((fact)=>fact.kind==="membership");
+		expect(new Set(memberships.map((fact)=>fact.toolCallId)).size).toBe(4);
+		const observed=readFileSync(join(run.dir,"binding.jsonl"),"utf8").trim().split("\n").map((line)=>JSON.parse(line));
+		const frames=observed.filter((record)=>record.kind==="frame");
+		expect(frames.some((frame)=>frame.rows.some((row:any)=>!row.executionStarted&&row.projected))).toBe(true);
+		for(const frame of frames)for(const row of frame.rows)if(row.projected){expect(row.bound).toBe(true);expect(row.threadId).toBe(row.expectedThreadId);expect(row.clientGeneration).toBe(row.expectedClientGeneration);}
+		expect(observed.filter((record)=>record.kind==="validated-input").map((record)=>record.bound)).toEqual([false,false,false,false]);
+		const calls=run.session().filter((entry)=>entry.type==="message"&&entry.message?.role==="assistant").flatMap((entry)=>entry.message.content.filter((part:any)=>part.type==="toolCall"));
+		expect(calls.map((call:any)=>call.arguments.display?.appName)).toEqual(["Acme Design",undefined,"Notes Lab","Acme Design"]);
+		expect(calls.every((call:any)=>call.arguments.clientGeneration===undefined&&call.arguments.threadId==="")).toBe(true);
+	},180_000);
+});
+
+
+describe.skipIf(!READY || !HOSTS.some((host)=>host.name==="pi-1.3.0"))("pi-52 native built-in MCP",()=>{
+	it("pi-52 MCP evidence: the real built-in adapter captures an arbitrary configured server without replacing execute",async()=>{
+		const host=HOSTS.find((host)=>host.name==="pi-1.3.0")!;
+		const run=await drive({scenario:"pi-52",host,name:"builtin-native",extensions:[...PROFILE,"builtin:mcp"],mcp:{mcpServers:{"Custom-Notes":{command:process.execPath,args:[join(SUPPORT,"rbf-mcp-local-server.ts")],exposure:"direct"}}},script:[{tool:"mcp__Custom_Notes__echo",args:{text:"first"}},bash("printf shell"),{tool:"mcp__Custom_Notes__echo",args:{text:"fail"}},text("NATIVE_MCP_DONE")],steps:[...START,{sleep:2},...GO,{wait:"NATIVE_MCP_DONE"},...mark("collapsed"),...click("header","called Custom-Notes 2 times"),...mark("expanded")]});
+		expect(headers(run.lines("collapsed"))).toEqual([" ▸ called Custom-Notes 2 times · 1 failed; ran 1 shell command"]);
+		expect(run.lines("expanded").join("\n")).toContain("LOCAL-MCP:first");
+		expect(run.lines("expanded").join("\n")).toContain("LOCAL-MCP:fail");
+		expect(toolResults(run.session()).filter((result)=>result.details?.server==="Custom-Notes")).toHaveLength(2);
+	},180_000);
+});
+
+
+describe.skipIf(!READY).each(HOSTS)("pi-52 persistence and rendering $name",(host)=>{
+	it("pi-52 replay and identity: recorded generic identities survive reload twice, reopen and tree navigation",async()=>{
+		const codex:FakeScenario={retainHistory:true,turn:[
+			{kind:"toolCall",id:"design1",server:"codex_apps",tool:"shared.tool",appContext:{appName:"Design",connectorId:"c1"},result:{content:[]}},
+			{kind:"toolCall",id:"design2",server:"codex_apps",tool:"shared.tool",appContext:{appName:"Design",connectorId:"c2"},result:{content:[]}},
+			{kind:"toolCall",id:"old",server:"custom.server",tool:"tool.with.dots",result:{content:[]}},
+			{kind:"toolCall",id:"late",server:"late.server",tool:"invoke",completedAppContext:{appName:"Late Design"},result:{content:[]}},
+			{kind:"answer",id:"answer",text:"IDENTITY_ONE"},{kind:"complete"}],laterTurns:[{kind:"toolCall",id:"second",server:"other",tool:"read",appContext:{appName:"Other Lab"},result:{content:[]}},{kind:"answer",id:"answer2",text:"IDENTITY_TWO"},{kind:"complete"}]};
+		const reload=(count:number):Step[]=>[{paste:"/reload"},{key:"enter"},{wait:"Reloaded",count},{sleep:1},...mark(`reload${count}`)];
+		const navigate=(keys:string[],count:number):Step[]=>[{key:"ctrl-u"},{paste:"/tree"},{key:"enter"},{wait:"Session Tree",count},{sleep:0.5},...keys.map((key)=>({key})),{key:"enter"},{wait:"Summarize branch",count},{key:"enter"},{wait:"Navigated to selected point",count}];
+		const run=await drive({scenario:"pi-52",host,name:"identity-reload-tree",extensions:[VIEW,CODEX,INDENT,BLENDED,join(SUPPORT,"rbf-mcp-membership-probe.ts")],env:{RBF_PI52_BINDING_LOG:join(ARTIFACTS,"pi-52",host.name,"identity-reload-tree","binding.jsonl")},model:"codex-harness/codex",codex,cols:120,rows:70,steps:[...START,...GO,{wait:"IDENTITY_ONE"},...mark("live"),{paste:"second"},{key:"enter"},{wait:"IDENTITY_TWO"},...mark("both"),...navigate(["up","up","up"],1),...mark("first-branch"),...navigate(["down","down","down"],2),...mark("returned"),...reload(1),...reload(2)]});
+		const check=(lines:string[])=>{const text=lines.join("\n");expect(text).toContain("Design [codex_apps/shared.tool] [connector: c1] 1 time");expect(text).toContain("Design [codex_apps/shared.tool] [connector: c2] 1 time");expect(text).toContain("called custom.server/tool.with.dots 1 time");expect(text).toContain("called late.server/invoke 1 time");expect(text).not.toContain("called Late Design");};
+		for(const name of ["live","reload1","reload2","first-branch","returned"])check(run.lines(name));
+		expect(run.lines("first-branch").join("\n")).not.toContain("IDENTITY_TWO");expect(run.lines("returned").join("\n")).toContain("IDENTITY_TWO");
+		const reopen=await drive({scenario:"pi-52",host,name:"identity-reopen",extensions:[VIEW,CODEX,INDENT,BLENDED],model:"codex-harness/codex",codex,args:["--continue"],sessions:join(run.dir,"sessions"),work:join(run.dir,"work"),cols:120,rows:70,steps:[...START,...mark("reopened")]});check(reopen.lines("reopened"));
+	},180_000);
+
+	it("pi-52 details mouse and width: actual light and dark themes and native details at 40/80/120 columns",async()=>{
+		const codex:FakeScenario={turn:[
+			{kind:"toolCall",id:"a",server:"custom",tool:"invoke",appContext:{appName:"Acme Design"},arguments:{query:"example"},result:{content:[{type:"text",text:"MCP-DRAG-CHECK"}]}},
+			{kind:"command",id:"s",command:"printf shell",output:["SHELL-CHECK"],completion:{exitCode:null}},
+			{kind:"toolCall",id:"b",server:"notes",tool:"search",appContext:{appName:"Notes Lab"},arguments:{query:"example"},error:"NATIVE-FAILURE"},
+			{kind:"answer",id:"done",text:"THEME_DONE"},{kind:"complete"}]};
+		const themeSteps=(theme:string,count:number):Step[]=>[{paste:"/settings"},{key:"enter"},{sleep:0.3},{paste:"Theme"},{key:"enter"},{wait:"Select a theme",count},...mark(`${theme}-menu`),...(theme==="dark"?(host.name==="pi-1.3.0"?[{key:"down"},{key:"down"}]:[]):[{key:"down"}]),{key:"enter"},{sleep:0.3},{key:"escape"},{sleep:0.3}];
+		const steps:Step[]=[...START,...GO,{wait:"THEME_DONE"}];
+		for(const [i,theme] of ["dark","light"].entries()){
+			steps.push(...themeSteps(theme,i+1));
+			for(const cols of [40,80,120])steps.push({resize:{cols,rows:70}},...mark(`${theme}-${cols}-closed`),{key:"ctrl-o"},...mark(`${theme}-${cols}-open`),{key:"ctrl-o"},...mark(`${theme}-${cols}-closed-again`));
+		}
+		const candidate=await drive({scenario:"pi-52",host,name:"themes-widths",extensions:[VIEW,CODEX,INDENT,BLENDED],model:"codex-harness/codex",codex,cols:120,rows:70,steps});
+		const nativeSteps=steps.filter((step)=>!(step.snapshot&&String(step.snapshot).includes("closed-again")));
+		const native=await drive({scenario:"pi-52",host,name:"themes-native-control",extensions:[CODEX,INDENT,BLENDED],model:"codex-harness/codex",codex,cols:120,rows:70,steps:nativeSteps});
+		const details=(lines:string[])=>{let at=transcript(lines);const first=at.findIndex((line)=>line.startsWith(" Acme Design.invoke"));at=at.slice(first).filter((line)=>line!=="    Status unknown");return took(at);};
+		for(const theme of ["dark","light"])for(const cols of [40,80,120]){
+			const name=`${theme}-${cols}`;const closed=candidate.lines(`${name}-closed`);expect(headers(closed)).toHaveLength(1);
+			expect(closed.some((line)=>line.includes("failed"))).toBe(true);expect(closed.some((line)=>line.includes("unknown"))).toBe(true);
+			expect(details(candidate.lines(`${name}-open`))).toEqual(details(native.lines(`${name}-open`)));
+			expect(headers(candidate.lines(`${name}-closed-again`))).toEqual(headers(closed));
+		}
+		expect(JSON.parse(readFileSync(join(candidate.dir,"agent","settings.json"),"utf8")).theme).toBe("light");
+	},180_000);
+});
+
+
+describe.skipIf(!READY).each(HOSTS)("pi-52 mixed native controls $name",(host)=>{
+	const codex:FakeScenario={turn:[{kind:"toolCall",id:"a",server:"custom",tool:"invoke",appContext:{appName:"Notes Lab"},arguments:{query:"fixture"},result:{content:[{type:"text",text:"MCP-DRAG-CHECK"}]}},{kind:"command",id:"s",command:"printf link-fixture",output:["SHELL-CHECK"]},{kind:"answer",id:"done",text:"CONTROL_DONE"},{kind:"complete"}]};
+	const extensions=[VIEW,CODEX,INDENT,BLENDED,join(import.meta.dirname,"rbf-edit-glance.ts")];
+	it("pi-52 details mouse and width: mixed native link and exact MCP drag receipt preserve disclosure",async()=>{
+		const base=join(ARTIFACTS,"pi-52",host.name,"mixed-link-drag");const linkLog=join(base,"link.log");const copyLog=join(base,"copy.log");
+		const run=await drive({scenario:"pi-52",host,name:"mixed-link-drag",extensions,model:"codex-harness/codex",codex,cols:80,rows:60,env:{PI_HYPERLINKS:"1",RBF_PROBE_LINK_COMMAND:"link-fixture",RBF_PROBE_LINK_TARGET:"file:///private/tmp/pi52-link-test.txt",RBF_PROBE_LINK_LOG:linkLog,RBF_PROBE_COPY_LOG:copyLog},steps:[...START,...GO,{wait:"CONTROL_DONE"},...click("header","called Notes Lab 1 time"),...mark("opened"),...click("link","Full Output",{x:10}),...mark("link-clicked"),{locate:{name:"drag",text:"MCP-DRAG-CHECK"}},{bytes:"\x1b[<0;5;{drag}M"},{bytes:"\x1b[<32;24;{drag}M"},...mark("selecting"),{bytes:"\x1b[<0;24;{drag}m"},...mark("selected"),...click("member","SHELL-CHECK"),...mark("closed")]});
+		expect(headers(run.lines("opened"))).toEqual([" ▾ called Notes Lab 1 time; ran 1 shell command"]);expect(headers(run.lines("link-clicked"))).toEqual(headers(run.lines("opened")));expect(headers(run.lines("selected"))).toEqual(headers(run.lines("opened")));
+		expect(readFileSync(linkLog,"utf8")).toBe("file:///private/tmp/pi52-link-test.txt\n");expect(readFileSync(copyLog,"utf8")).toBe("MCP-DRAG-CHECK\n");expect(run.screen("selecting").cells.some((row)=>row.some((cell)=>cell.inverse))).toBe(true);expect(headers(run.lines("closed"))).toEqual([" ▸ called Notes Lab 1 time; ran 1 shell command"]);
+	},180_000);
+	it("pi-52 details mouse and width: regular TUI uses the original global disclosure shortcut",async()=>{
+		const run=await drive({scenario:"pi-52",host,name:"mixed-regular",extensions,model:"codex-harness/codex",codex,cols:80,rows:60,mode:"regular",steps:[...START,...GO,{wait:"CONTROL_DONE"},...mark("closed"),{key:"ctrl-o"},...mark("open"),{key:"ctrl-o"},...mark("closed-again")]});
+		expect(headers(run.lines("closed"))).toEqual([" ▸ called Notes Lab 1 time; ran 1 shell command"]);expect(headers(run.lines("open"))).toEqual([" ▾ called Notes Lab 1 time; ran 1 shell command"]);expect(run.lines("open").join("\n")).toContain("MCP-DRAG-CHECK");expect(headers(run.lines("closed-again"))).toEqual(headers(run.lines("closed")));
+	},180_000);
 });
