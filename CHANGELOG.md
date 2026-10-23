@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.31.3 (2026-10-23)
+## 🟠⋯ Fixed for End Users
+- 2026-10-23 - fix (ux) | see Codex’s reported context usage, capacity and tokens remaining in Pi’s footer. Unavailable or stale figures read `context ? (Codex)` instead of the placeholder `0.0%/1000M (auto)`. Counts follow Codex reports; Codex keeps control of compaction. Update only the Codex adapter and fully restart Pi. Verified on Pi 0.85.1 and daily Pi 1.3.0, including a real Codex update and Tom’s interactive test (#pi-10.13)
+
+---
+
 # 🔵⋯ v0.31.2 (2026-10-20)
 ## 🟠⋯ Fixed for End Users
 - 2026-10-20 - fix (ux) | keep announced Codex agents behind the `agents` footer until you choose to inspect them. Click the footer or use `/agents-codex` to open the full list; announcements, updates and restored snapshots no longer add an automatic roster above the editor. Saved freshness labels and native tool/dialog behavior remain available. Update the Codex adapter and fully restart Pi. Verified on Pi 0.85.1 and daily Pi 1.3.0; candidate-specific human visual check passed (#pi-10.12)
