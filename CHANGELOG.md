@@ -3,6 +3,8 @@ title: Changelog
 ---
 
 # 🔵⋯ [Unreleased]
+## 🟠⋯ Fixed for End Users
+- 2026-10-25 - fix | resume saved Codex conversations containing Unicode line or paragraph separators. Fully restart Pi after updating the Codex adapter (#pi-10)
 
 ---
 

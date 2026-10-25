@@ -25,7 +25,6 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative } from "node:path";
-import { createInterface } from "node:readline";
 
 export const PROVIDER_ID = "codex-harness"; // the picker prints this id in brackets; it must read apart from Pi's built-in `openai-codex`
 export const API_ID = "rbf-codex-app-server";
@@ -507,7 +506,22 @@ export class AppServerClient {
 	private constructor(readonly child: ChildProcessWithoutNullStreams) {
 		// A write that lands after Codex died raises EPIPE on stdin; unhandled, that exits Pi. `exit` follows anyway.
 		child.stdin.on("error", () => {});
-		createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
+		// JSONL uses LF boundaries; Unicode line/paragraph separators remain valid JSON string data.
+		let fragments: string[] = [];
+		child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+			let start = 0;
+			let end: number;
+			while ((end = chunk.indexOf("\n", start)) !== -1) {
+				fragments.push(chunk.slice(start, end));
+				const line = fragments.join("");
+				fragments = [];
+				start = end + 1;
+				this.receive(line);
+			}
+			if (start < chunk.length) fragments.push(chunk.slice(start));
+		}).on("end", () => {
+			if (fragments.length) this.receive(fragments.join(""));
+		});
 		child.stderr.on("data", (chunk: Buffer | string) => {
 			for (const l of String(chunk).split("\n")) if (l.trim()) this.stderrTail.push(l.trim());
 			while (this.stderrTail.length > STDERR_TAIL_LINES) this.stderrTail.shift();
@@ -1704,7 +1718,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 						overviewSafe(() => { if (this.overviewGeneration === overviewGeneration && state.ctx?.mode === "tui" && m.id === undefined && agents.observe(m.method, (m.params ?? {}) as Rec)) changedAgents(); });
 						this.project(m);
 					} catch (e) {
-						// One malformed notification must never escape readline's event and take Pi down.
+						// One malformed notification must never escape stdout dispatch and take Pi down.
 						this.end({ status: "failed", error: String(e) });
 					}
 				});
@@ -2056,7 +2070,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			client.onExit.add(() => { displayClientLost(client); if (state.client === client) { contextMeter.clear(); presentAgents(); } });
 			const failedServers = new Set<string>();
 			client.subscribe((m) => {
-				// Runs inside readline's `line` event: nothing thrown here may escape, as the turn's own subscriber guards.
+				// Runs inside stdout frame dispatch: nothing thrown here may escape, as the turn's own subscriber guards.
 				try {
 					watch(m);
 				} catch {
@@ -2174,7 +2188,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			const turnParams: Rec = { threadId, input: items, effort };
 			const codexId = codexModelId(model.id);
 			if (codexId) turnParams.model = codexId;
-			// Subscribe before sending: readline hands over every line of one stdout chunk at once, so a notification can share a chunk with the response.
+			// Subscribe before sending: stdout dispatches every frame in one chunk synchronously, so a notification can share a chunk with the response.
 			overviewSafe(() => { const reset = agents.begin(threadId, client.endedTurns); changedAgents(reset); });
 			const turn = new ActiveTurn(client, threadId);
 			state.activeTurn = turn;
