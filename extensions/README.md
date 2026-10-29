@@ -567,6 +567,8 @@ Local Pi extension that makes the transient status line after a model change nam
 
 # 🔵⋯ rbf-codex
 
+Saved-session resume repair (local v0.31.4): conversations whose history contains Unicode line or paragraph separators resume through the existing branch-verification path. Update only `rbf-codex.ts` and fully restart Pi when installing the repair. Tom’s already-installed matching adapter is accepted in daily use and needs no replacement for this metadata-only release.
+
 ## 🟠⋯ Overview
 Local Pi extension that registers Codex as the model provider `codex-harness`, so a Pi conversation runs on Codex's full agent harness with Pi as the only visible interface: Codex's commands, file changes, tool calls (MCP servers, app connectors, computer use), and questions show as Pi's own tool rows, a sub-agent's rows and dialogs carry its name, approvals, questions, and computer use's per-app question are answered through Pi's dialogs, and Pi's fork, tree, steer, and image paste work as they do for Pi's own models. Verified against Pi 0.85.1 and Codex CLI >= 0.157.1 on Node.
 
