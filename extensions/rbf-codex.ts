@@ -1249,6 +1249,53 @@ export class CodexAgentRoster {
 	}
 }
 
+export type CodexContextSnapshot = { tokens: number; contextWindow: number };
+
+/** A latest reported snapshot, never cumulative accounting or a Pi context estimate. */
+export class CodexContextMeter {
+	private threadId = "";
+	private turnId = "";
+	private epoch = 0;
+	private viewEpoch = 0;
+	get viewGeneration(): number { return this.viewEpoch; }
+	snapshot: CodexContextSnapshot | undefined;
+
+	clear(): void { this.threadId = ""; this.turnId = ""; this.snapshot = undefined; this.epoch++; this.viewEpoch++; }
+	begin(threadId: string): number { this.threadId = threadId; this.turnId = ""; this.snapshot = undefined; return ++this.epoch; }
+	confirmTurn(epoch: number, turnId: string): void { if (epoch === this.epoch && this.threadId) this.turnId = turnId; }
+	observe(method: string | undefined, params: unknown): boolean {
+		const p = agentRecord(params);
+		if (!this.threadId || p.threadId !== this.threadId) return false;
+		if (method === "turn/started" && !this.turnId) {
+			const id = agentRecord(p.turn).id;
+			if (typeof id === "string" && id) this.turnId = id;
+		}
+		if (method === "thread/compacted" || ((method === "item/started" || method === "item/completed") && agentRecord(p.item).type === "contextCompaction")) {
+			this.clear(); // a delayed pre-compaction count must not revive this turn
+			return true;
+		}
+		if (method !== "thread/tokenUsage/updated" || !this.turnId || p.turnId !== this.turnId) return false;
+		const u = agentRecord(p.tokenUsage), tokens = agentRecord(u.last).totalTokens, contextWindow = u.modelContextWindow;
+		const valid = typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens >= 0 && typeof contextWindow === "number" && Number.isSafeInteger(contextWindow) && contextWindow > 0;
+		const next = valid ? { tokens: tokens as number, contextWindow: contextWindow as number } : undefined;
+		const changed = next?.tokens !== this.snapshot?.tokens || next?.contextWindow !== this.snapshot?.contextWindow;
+		this.snapshot = next;
+		return changed;
+	}
+}
+
+function codexContextTokens(count: number): string {
+	if (count < 1000) return String(count);
+	const scale = count < 1_000_000 ? 1000 : 1_000_000;
+	return (count / scale).toFixed(1).replace(/\.0$/, "") + (scale === 1000 ? "k" : "M");
+}
+
+export function formatCodexContext(snapshot: CodexContextSnapshot | undefined): string {
+	if (!snapshot) return "context ? (Codex)";
+	const { tokens, contextWindow } = snapshot;
+	return `${(tokens / contextWindow * 100).toFixed(1)}%/${codexContextTokens(contextWindow)} · ${codexContextTokens(Math.max(0, contextWindow - tokens))} left (Codex)`;
+}
+
 // Use the same registry protocol as the shell/todo badges; this extension also works alone.
 const AGENTS_FOOTER_REGISTRY = Symbol.for("@earendil-works/pi-rbf:footer-registry");
 type AgentFooterHook = { id: string; reset?: () => void; render(this: any, lines: string[], width: number): string[]; handleMouse(this: any, event: TuiMouseEvent): TuiMouseEventResult | undefined };
@@ -1264,7 +1311,7 @@ export function createCodexAgentPointer(env: NodeJS.ProcessEnv = process.env, tt
 	};
 }
 
-export function installCodexAgentsFooter(visible: () => boolean, open: () => void, getTheme: () => Pick<Theme, "fg" | "bold"> | undefined, pointer?: (inside: boolean) => void) {
+function codexFooterRegistry() {
 	const proto = FooterComponent.prototype as typeof FooterComponent.prototype & { [AGENTS_FOOTER_REGISTRY]?: AgentFooterRegistry; handleMouse?: AgentFooterRegistry["originalHandleMouse"] };
 	let registry = proto[AGENTS_FOOTER_REGISTRY];
 	if (!registry) {
@@ -1288,6 +1335,54 @@ export function installCodexAgentsFooter(visible: () => boolean, open: () => voi
 		proto.render = created.installedRender;
 		proto.handleMouse = created.installedHandleMouse;
 	}
+	return { proto, registry };
+}
+
+/** Run before badge layout, including when the shell registry was installed first. */
+export function installCodexContextFooter(visible: () => boolean, getSnapshot: () => CodexContextSnapshot | undefined, getTheme: () => Pick<Theme, "fg" | "bold"> | undefined) {
+	const { proto, registry } = codexFooterRegistry();
+	const nativeContext = /(?:\d+(?:\.\d+)?%|\?)\/[\d.]+[kM]?(?: \(auto\))?/;
+	const hook: AgentFooterHook = {
+		id: "codex-context",
+		render(lines, width) {
+			if (!visible() || this.session?.state?.model?.provider !== PROVIDER_ID || !lines[1]) return lines;
+			let base = lines;
+			// Tiny native layouts may already clip the placeholder; recover the complete stats first.
+			if (!nativeContext.test(base[1])) base = registry.originalRender.call(this, Math.max(width, 512));
+			const padding = base[1].match(/^(.*?)(\s{2,})(.*)$/);
+			let left = padding ? padding[1] : base[1];
+			const right = padding?.[3] ?? "";
+			let snapshot: CodexContextSnapshot | undefined;
+			try { snapshot = getSnapshot(); } catch {}
+			let label = formatCodexContext(snapshot);
+			try { const percent = snapshot ? snapshot.tokens / snapshot.contextWindow * 100 : 0; label = getTheme()?.fg(percent > 90 ? "error" : percent > 70 ? "warning" : "dim", label) ?? label; } catch {}
+			left = nativeContext.test(left) ? left.replace(nativeContext, () => label) : label;
+			left = truncateToWidth(left, Math.max(0, width), "");
+			const available = width - visibleWidth(left) - 2;
+			const model = available > 0 ? truncateToWidth(right, available, "") : "";
+			const result = base.map(line => truncateToWidth(line, Math.max(0, width), ""));
+			result[1] = left + (model ? " ".repeat(Math.max(2, width - visibleWidth(left) - visibleWidth(model))) + model : "");
+			return result;
+		},
+		handleMouse() { return undefined; },
+	};
+	// Replacement retains first position, regardless of shell/agents/todo load order.
+	const rest = [...registry.hooks].filter(([id]) => id !== hook.id);
+	registry.hooks.clear(); registry.hooks.set(hook.id, hook);
+	for (const [id, h] of rest) registry.hooks.set(id, h);
+	return { dispose() {
+		if (registry.hooks.get(hook.id) !== hook) return;
+		registry.hooks.delete(hook.id);
+		if (!registry.hooks.size && proto.render === registry.installedRender && proto.handleMouse === registry.installedHandleMouse) {
+			proto.render = registry.originalRender;
+			if (registry.originalHandleMouse) proto.handleMouse = registry.originalHandleMouse; else delete proto.handleMouse;
+			delete proto[AGENTS_FOOTER_REGISTRY];
+		}
+	} };
+}
+
+export function installCodexAgentsFooter(visible: () => boolean, open: () => void, getTheme: () => Pick<Theme, "fg" | "bold"> | undefined, pointer?: (inside: boolean) => void) {
+	const { proto, registry } = codexFooterRegistry();
 	let hovered = false, screenY: number | undefined;
 	let bounds: { start: number; end: number } | undefined;
 	const setHovered = (inside: boolean) => { if (hovered === inside) return; hovered = inside; try { pointer?.(inside); } catch {} };
@@ -1375,6 +1470,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			recentCompactTerminal: null as { at: number; outcome: "completed" | "failed" | "unknown"; reason?: string; replayed: boolean } | null,
 		};
 
+		const contextMeter = new CodexContextMeter();
+		let contextFooter: ReturnType<typeof installCodexContextFooter> | undefined;
 		const agents = new CodexAgentRoster(now);
 		let agentsFooter: ReturnType<typeof installCodexAgentsFooter> | undefined;
 		let footerInputOff: (() => void) | undefined;
@@ -1956,7 +2053,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				throw new CodexError("codex-version");
 			}
 			client.onRequest = onServerRequest;
-			client.onExit.add(() => displayClientLost(client));
+			client.onExit.add(() => { displayClientLost(client); if (state.client === client) { contextMeter.clear(); presentAgents(); } });
 			const failedServers = new Set<string>();
 			client.subscribe((m) => {
 				// Runs inside readline's `line` event: nothing thrown here may escape, as the turn's own subscriber guards.
@@ -1968,6 +2065,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			});
 			function watch(m: JsonRpc): void {
 				const p = (m.params ?? {}) as Rec;
+				const retiredStart = m.method === "turn/started" && client.endedTurns.has(String(agentRecord(p.turn).id ?? ""));
+				if (m.id === undefined && state.client === client && !retiredStart && contextMeter.observe(m.method, m.params)) presentAgents();
 				if (m.method === "mcpServer/startupStatus/updated") {
 					// One notice per MCP server that failed to start, per child process; `starting` and `ready` say nothing (the probe saw only those).
 					const name = String(p.name ?? "");
@@ -2069,7 +2168,9 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		}
 
-		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, effort: string): Promise<ActiveTurn> {
+		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, effort: string, contextView: number): Promise<ActiveTurn> {
+			const contextEpoch = contextView === contextMeter.viewGeneration ? contextMeter.begin(threadId) : -1;
+			presentAgents();
 			const turnParams: Rec = { threadId, input: items, effort };
 			const codexId = codexModelId(model.id);
 			if (codexId) turnParams.model = codexId;
@@ -2095,6 +2196,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				throw e instanceof CodexError && e.key === "generic" ? new CodexError("turn-failed", e.detail) : e;
 			}
 			turn.turnId = String(rec(started.turn).id);
+			contextMeter.confirmTurn(contextEpoch, turn.turnId);
 			overviewSafe(() => agents.setTurn(turn.turnId!));
 			return turn;
 		}
@@ -2103,6 +2205,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		function streamSimple(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 			const out = new AssistantMessageWriter(model);
 			const ctx = state.ctx;
+			const contextView = contextMeter.viewGeneration;
 			const fail = (e: unknown) => {
 				if (options?.signal?.aborted || e instanceof AbortedError) return out.finish("aborted");
 				const err = e instanceof CodexError ? e : new CodexError("generic", String(e));
@@ -2186,7 +2289,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 						notify(NOTICE.policy(bound.policy, bound.sandbox));
 					}
 					if (signal?.aborted) return out.finish("aborted");
-					const started = await startTurn(client, bound.threadId, items, model, effort);
+					const started = await startTurn(client, bound.threadId, items, model, effort, contextView);
 					if (signal?.aborted) {
 						await started.interrupt();
 						return drain(started, { silent: true });
@@ -2660,6 +2763,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			threadId: string,
 			runningControl: { threadId: string; navigatedDuringRun: boolean; finished: boolean }
 		): Promise<void> {
+			contextMeter.clear(); presentAgents();
 			type CompactOutcome =
 				| { outcome: "completed" }
 				| { outcome: "failed"; reason: string }
@@ -2907,9 +3011,11 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				if (registeredMcpTool) mcpDisplay?.start(sessionId, registeredMcpTool);
 			}
 			state.ctx = ctx;
+			contextMeter.clear(); contextFooter?.dispose();
 			agentsFooter?.dispose(); footerInputOff?.();
 			if (ctx.mode === "tui") overviewSafe(() => {
 				agentsFooter = installCodexAgentsFooter(() => state.ctx?.mode === "tui" && state.ctx.model?.provider === PROVIDER_ID && !!(agents.agents.length || agents.unavailable || agents.partial || agents.notSaved), () => { const current = state.ctx; if (current && !state.shuttingDown) void openAgents(current).catch(() => {}); }, () => state.ctx?.ui.theme, createCodexAgentPointer());
+				contextFooter = installCodexContextFooter(() => state.ctx?.mode === "tui" && state.ctx.model?.provider === PROVIDER_ID, () => contextMeter.snapshot, () => state.ctx?.ui.theme);
 				footerInputOff = ctx.ui.onTerminalInput?.(data => { if (agentsFooter?.pointerInput(data)) presentAgents(); return undefined; });
 			});
 			restoreAgents(ctx);
@@ -2938,6 +3044,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			if (last?.message?.role === "user" || (last?.message?.role === "assistant" && last.message.stopReason === "toolUse")) notify(NOTICE.interrupted, "warning");
 		});
 		const closeChild = async () => {
+			contextMeter.clear();
 			leaveAgents();
 			overviewSafe(() => { agentsFooter?.dispose(); footerInputOff?.(); });
 			agentsFooter = undefined; footerInputOff = undefined;
@@ -2959,6 +3066,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			try {
 				await closeChild();
 			} finally {
+				contextFooter?.dispose(); contextFooter = undefined;
 				display?.stop();
 				mcpDisplay?.stop();
 			}
@@ -2973,6 +3081,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return { cancel: true };
 		});
 		pi.on("session_tree", async (_event, _ctx) => {
+			contextMeter.clear();
 			state.ctx = _ctx; restoreAgents(_ctx);
 			const terminal = state.recentCompactTerminal;
 			if (terminal && !terminal.replayed && now() - terminal.at < 1500) {
@@ -3000,11 +3109,13 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		});
 		pi.on("session_before_tree", async (event, ctx) => {
+			contextMeter.clear();
 			leaveAgents();
 			if (isBoundBranch(ctx) && event.preparation.userWantsSummary) return { summary: { summary: NOTICE.treeSummary } };
 			return {};
 		});
 		pi.on("model_select", async (event, ctx) => {
+			contextMeter.clear();
 			state.ctx = ctx; agentsFooter?.reset();
 			overviewSafe(() => { overviewClose?.(); overviewRender = undefined; });
 			presentAgents();
