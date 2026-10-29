@@ -8,6 +8,7 @@ export type FakeApproval = { when: "before" | "after"; command?: string | null; 
 /** Computer use's per-app question, as Codex 0.154.0 sends it (probe 2026-09-14): an empty-form MCP elicitation during the `mcpToolCall`; a refused one fails the call and the turn goes on. */
 export type FakeElicitation = { message: string; app?: string; subtitle?: string; persist?: string[]; mode?: string; properties?: Record<string, unknown>; approvalKind?: string | null };
 export type FakeTurnEvent =
+	| { kind: "notification"; method: string; params?: Record<string, unknown> }
 	/** `completion` overrides fields of the completed item and `omit` leaves fields out of it, for a completion Codex sent incomplete or at odds with itself. */
 	| { kind: "command"; id: string; command: string; cwd?: string; exitCode?: number; output?: string[]; approvals?: FakeApproval[]; aggregatedOutput?: string; incomplete?: boolean; completion?: Record<string, unknown>; omit?: string[] }
 	| { kind: "toolCall"; id: string; server: string; tool: string; arguments?: unknown; appContext?: Record<string, unknown> | null; completedAppContext?: Record<string, unknown>; pluginId?: string; result?: { content?: unknown[]; structuredContent?: unknown }; status?: "completed" | "failed"; error?: string; elicitations?: FakeElicitation[]; progress?: boolean; incomplete?: boolean; durationMs?: number }
@@ -189,6 +190,9 @@ async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
 		if (ctl.interrupted) break;
 		await tick();
 		switch (ev.kind) {
+			case "notification":
+				notify(ev.method, { threadId: THREAD, turnId, ...(ev.params ?? {}) });
+				break;
 			case "command": {
 				const before = (ev.approvals ?? []).filter((a) => a.when === "before");
 				const after = (ev.approvals ?? []).filter((a) => a.when === "after");
@@ -307,6 +311,7 @@ async function runTurn(ctl: TurnCtl, events: FakeTurnEvent[]): Promise<void> {
 					await tick();
 					if (late.kind === "subAgent") await runTurn({ ...ctl, interrupted: false }, [late]).catch(() => {});
 					else if (late.kind === "command") command(late);
+					else if (late.kind === "notification") notify(late.method, { threadId: THREAD, turnId, ...(late.params ?? {}) });
 					else if (late.kind === "sleep") await new Promise((resolve) => setTimeout(resolve, late.ms));
 					else if (late.kind === "die") process.exit(3);
 				}

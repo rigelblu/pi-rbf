@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfi
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, RefreshModelsContext, ThinkingLevel, ToolCall } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, getSupportedThinkingLevels, validateToolArguments } from "@earendil-works/pi-ai";
 import { Box, Editor } from "@earendil-works/pi-tui";
-import { initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
+import { FooterComponent, initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
 import { writeInterruptionFixture } from "./test-support/rbf-codex-interruption-fixture.ts";
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { API_ID, APPROVAL_CHOICES, BOOTSTRAP_MODEL, BOOTSTRAP_MODEL_ID, COMPACT_DISPATCHER_KEY, COMPACT_NOTICE, COMPACT_SAFE_REASONS, COPY, CATALOG_MAX_AGE_MS, ENTRY_TYPE, NOTICE, OTHER_CHOICE, PROVIDER_ID, ROW_STATUS, TOOL_COMMAND, TOOL_PATCH, TOOL_QUESTION, TOOL_TOOL, TURN_ENTRY_TYPE, AppServerClient, classifyCompletedTurn, codexModelId, createRbfCodex, diffCounts, displayCommand, displayPath, flattenChanges, humanRequestKind, isAppApproval, isCompactCommand, isSupportedCodexVersion, loneString, mapEffort, parseCodexVersion, patchRowLine, RowError, splitTitle, toPreviewDiff, toProviderModel, truncateTitle, verifyBranchHistory, verifyEmptyBranchHistory } from "./rbf-codex.ts";
@@ -232,6 +232,44 @@ describe("rbf-codex", () => {
 		return { ...fx, ...c, turn, shutdown, exec, round, editor, submit };
 	}
 
+
+ describe("context telemetry integration", () => {
+  const sample = { last: { totalTokens: 50000 }, total: { totalTokens: 9000000 }, modelContextWindow: 200000 };
+  const update = (params: Record<string, unknown> = {}) => ({ kind: "notification" as const, method: "thread/tokenUsage/updated", params: { tokenUsage: sample, ...params } });
+  const meter = () => {
+   return () => {
+    const hook = (FooterComponent.prototype as any)[Symbol.for("@earendil-works/pi-rbf:footer-registry")]?.hooks.get("codex-context");
+    const lines = ["/work", "0.0%/1000M (auto)                    codex"];
+    return hook ? hook.render.call({ session: { state: { model: model() } } }, lines, 120)[1] : lines[1];
+   };
+  };
+  it("projects root telemetry through the real client without changing usage or limits", async () => {
+   scenario({ turn: [update(), update({threadId:"child",tokenUsage:{...sample,last:{totalTokens:199000}}}),update({turnId:"old",tokenUsage:{...sample,last:{totalTokens:198000}}}),{kind:"answer",id:"done",text:"DONE"},{kind:"complete"}] });
+   const b=await boot({persistAppends:true}),read=meter();expect(read()).toContain("context ? (Codex)");const result=await b.turn("context");expect(read()).toContain("25.0%/200k · 150k left (Codex)");expect(result.final?.usage.totalTokens).toBe(0);expect(b.ctx.model?.contextWindow).toBe(1e9);
+  });
+  for(const event of ["session_tree","model_select","session_start","session_before_switch"]) it("clears the admitted snapshot on "+event, async()=>{
+   scenario({turn:[update(),{kind:"answer",id:"done",text:"DONE"},{kind:"complete"}]});const b=await boot({persistAppends:true});await b.turn("context");const read=meter();expect(read()).toContain("150k left");await b.handlers.get(event)?.({model:model(),previousModel:model()},b.ctx);expect(read()).toContain("context ? (Codex)");
+  });
+  it("restores fresh telemetry on a deliberate turn after a vetoed session switch",async()=>{
+   process.env.RBF_FAKE_HISTORY=join(dir,"context-history.json");
+   scenario({retainHistory:true,turn:[update(),{kind:"answer",id:"done",text:"DONE"},{kind:"complete"}]});const b=await boot({persistAppends:true}),read=meter();await b.turn("first");expect(read()).toContain("150k left");await b.handlers.get("session_before_switch")?.({},b.ctx);expect(read()).toContain("context ? (Codex)");expect((await b.turn("after veto")).text).toBe("DONE");expect(read()).toContain("25.0%/200k · 150k left (Codex)");
+  });
+  it("clears on manual compaction and rearms only for the next user turn",async()=>{
+   scenario({retainHistory:true,turn:[update(),{kind:"answer",id:"done",text:"DONE"},{kind:"complete"}]});const b=await boot({persistAppends:true});await b.turn("context");const read=meter();expect(read()).toContain("150k left");await b.submit("/compact");await vi.waitFor(()=>expect(b.notify).toHaveBeenCalledWith(COMPACT_NOTICE.completeStatus,"info"));expect(read()).toContain("context ? (Codex)");await b.turn("next");expect(read()).toContain("150k left");
+  });
+  it("does not rearm after navigation while history verification is pending",async()=>{
+   scenario({retainHistory:true,turnsListDelayMs:150,turn:[update(),{kind:"answer",id:"done",text:"DONE"},{kind:"complete"}]});const b=await boot({persistAppends:true});await b.turn("first");const read=meter();expect(read()).toContain("150k left");const running=b.turn("second");await vi.waitFor(()=>expect(methods()).toContain("thread/turns/list"));await b.handlers.get("session_tree")?.({},b.ctx);await running;expect(read()).toContain("context ? (Codex)");
+  });
+  it("rejects a retired turn start arriving before the new turn response",async()=>{
+   scenario({retainHistory:true,turnStartDelayMs:250,turnScripts:[[{kind:"answer",id:"one",text:"ONE"},{kind:"complete",after:[{kind:"sleep",ms:120},{kind:"notification",method:"turn/started",params:{turn:{id:"turn-fake-1"}}},update({tokenUsage:{...sample,last:{totalTokens:190000}}})]}],[{kind:"answer",id:"two",text:"TWO"},{kind:"complete"}]]});const b=await boot({persistAppends:true});await b.turn("first");const read=meter();await b.turn("second");expect(read()).toContain("context ? (Codex)");expect(read()).not.toContain("95.0%");
+  });
+  it("accepts final current-turn telemetry after native completion",async()=>{
+   scenario({turn:[{kind:"answer",id:"done",text:"DONE"},{kind:"complete",after:[{kind:"sleep",ms:30},update()]}]});const b=await boot(),read=meter();await b.turn("context");await vi.waitFor(()=>expect(read()).toContain("25.0%/200k · 150k left (Codex)"));
+  });
+  it("clears when the app-server dies after publishing telemetry",async()=>{
+   scenario({turn:[update(),{kind:"sleep",ms:50},{kind:"die"}]});const b=await boot(),read=meter();const running=b.turn("context");await vi.waitFor(()=>expect(read()).toContain("150k left"));await running;expect(read()).toContain("context ? (Codex)");
+  });
+ });
 	describe("sub-agent overview", () => {
 		async function readOverview(b: Awaited<ReturnType<typeof boot>>): Promise<string> {
 			let text = "";
