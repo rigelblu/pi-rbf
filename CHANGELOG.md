@@ -6,6 +6,12 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.32.0 (2026-11-02)
+## 🟠⋯ Added for End Users
+- 2026-11-02 - feat | choose Fast, Standard or Codex default for a Codex-harness conversation with `/fast-codex`, keep the choice across resume and branches, and see `fast` or `standard` beside the model and thinking level. Global defaults stay unchanged. Explicit choices require Codex CLI 0.166.0 or newer; requested service does not guarantee speed, and higher usage may apply. Update only the Codex adapter and fully restart Pi (#pi-54)
+
+---
+
 # 🔵⋯ v0.31.4 (2026-10-28)
 ## 🟠⋯ Fixed for End Users
 - 2026-10-25 - fix | resume saved Codex conversations containing Unicode line or paragraph separators. Fully restart Pi after updating the Codex adapter (#pi-10)
