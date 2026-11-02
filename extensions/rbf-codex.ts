@@ -59,6 +59,8 @@ type JsonRpc = { id?: number | string; method?: string; params?: unknown; result
 export const COPY = {
 	"codex-missing": "Codex CLI not found. Install Codex, check `codex --version`, and send again.",
 	"codex-version": "Codex CLI 0.157.1 or newer is required. Upgrade Codex and try again.",
+	"codex-fast-version": "Codex CLI 0.166.0 or newer is required for this service choice. Upgrade Codex or choose Codex default with /fast-codex.",
+	"codex-fast-unreadable": "The saved Codex service choice could not be read. Use /fast-codex and choose Codex default, then try again.",
 	"codex-logged-out": "Codex is not logged in. Run `codex login`, then send again.",
 	"workspace-mismatch": "This conversation's Codex thread belongs to another directory. Start a new Pi conversation here, or reopen it from that directory.",
 	"unsupported-input": "This Codex model accepts plain text only. Remove the image, or pick an image-capable Codex model.",
@@ -681,7 +683,7 @@ export function versionArgsFor(command: CodexCommand): string[] {
 	return ["--version"];
 }
 
-export async function checkCodexVersion(command: CodexCommand): Promise<boolean> {
+export async function checkCodexVersion(command: CodexCommand, minimum?: [number, number, number]): Promise<boolean> {
 	const argsToUse = versionArgsFor(command);
 	const runVersion = (bin: string) =>
 		new Promise<string>((resolve, reject) => {
@@ -719,7 +721,13 @@ export async function checkCodexVersion(command: CodexCommand): Promise<boolean>
 			return false;
 		}
 	}
-	return isSupportedCodexVersion(stdout);
+	if (!minimum) return isSupportedCodexVersion(stdout);
+	const version = parseCodexVersion(stdout);
+	if (!version) return false;
+	for (let i = 0; i < 3; i++) {
+		if (version[i] !== minimum[i]) return version[i] > minimum[i];
+	}
+	return true;
 }
 
 export function isCompactCommand(text: unknown): boolean {
@@ -1483,6 +1491,72 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			runningCompact: null as { threadId: string; navigatedDuringRun: boolean; finished: boolean } | null,
 			recentCompactTerminal: null as { at: number; outcome: "completed" | "failed" | "unknown"; reason?: string; replayed: boolean } | null,
 		};
+		type FastMode = "fast" | "standard" | "inherit";
+		const fastEntryType = "rbf-codex-fast/v1";
+		const fastLabels: Record<FastMode, string> = { fast: "Fast", standard: "Standard", inherit: "Codex default" };
+		const fastVersions = new WeakMap<AppServerClient, Promise<boolean>>();
+		// Pi may advance its in-memory branch before a session-file write throws.
+		// Such a branch cannot authorize a service request until an explicit save succeeds.
+		const fastSaveFailures = new Set<string>();
+		let fastGeneration = 0;
+		let fastPicker: AbortController | undefined;
+		function fastMode(ctx: ExtensionContext): FastMode | "unreadable" {
+			try {
+				if (fastSaveFailures.has(ctx.sessionManager.getSessionId())) return "unreadable";
+				const entry = [...ctx.sessionManager.getBranch()].reverse().find(e => e.type === "custom" && typeof e.customType === "string" && e.customType.startsWith("rbf-codex-fast/"));
+				if (!entry || entry.type !== "custom") return "inherit";
+				const mode = rec(entry.data).mode;
+				return entry.customType === fastEntryType && (mode === "fast" || mode === "standard" || mode === "inherit") ? mode : "unreadable";
+			} catch { return "unreadable"; }
+		}
+		function presentFast(ctx: ExtensionContext): void {
+			if (ctx.mode !== "tui") return;
+			const mode = fastMode(ctx);
+			ctx.ui.setStatus("rbf-codex-fast", ctx.model?.provider === PROVIDER_ID && (mode === "fast" || mode === "standard") ? `${mode} requested (Codex)` : undefined);
+		}
+		function leaveFast(): void {
+			fastGeneration++;
+			fastPicker?.abort(); fastPicker = undefined;
+		}
+		function fastBusy(ctx: ExtensionContext): boolean {
+			return state.shuttingDown || !ctx.isIdle() || ctx.hasPendingMessages() || !!(state.activeTurn || state.pendingCompact || state.checkingCompact || state.runningCompact);
+		}
+		pi.registerCommand("fast-codex", {
+			description: "Choose fast or standard Codex service for this conversation",
+			handler: async (args, ctx) => {
+				if (ctx.mode !== "tui") { ctx.ui.notify("Use /fast-codex in the interactive Pi terminal.", "warning"); return; }
+				if (args.trim()) { ctx.ui.notify("Use /fast-codex without arguments.", "warning"); return; }
+				if (ctx.model?.provider !== PROVIDER_ID) { ctx.ui.notify("Select a codex-harness model before using /fast-codex.", "warning"); return; }
+				if (fastBusy(ctx) || fastPicker) { ctx.ui.notify("Codex is busy. Try /fast-codex after Codex finishes.", "warning"); return; }
+				const mode = fastMode(ctx);
+				const current = mode === "unreadable" ? "Codex default" : fastLabels[mode];
+				const choices = [current, ...Object.values(fastLabels).filter(label => label !== current)];
+				const generation = fastGeneration, session = ctx.sessionManager.getSessionId(), leaf = ctx.sessionManager.getLeafId();
+				const provider = ctx.model.provider, modelId = ctx.model.id;
+				const picker = new AbortController(); fastPicker = picker;
+				try {
+					const answer = await ctx.ui.select(`Codex fast mode (${mode === "unreadable" ? "Unreadable" : current})`, choices, { signal: picker.signal });
+					if (answer === undefined) return;
+					if (generation !== fastGeneration || session !== ctx.sessionManager.getSessionId() || leaf !== ctx.sessionManager.getLeafId() || provider !== ctx.model?.provider || modelId !== ctx.model?.id || fastBusy(ctx)) {
+						ctx.ui.notify("The conversation or model changed. Run /fast-codex again.", "warning"); return;
+					}
+					const selected = (Object.keys(fastLabels) as FastMode[]).find(key => fastLabels[key] === answer);
+					if (!selected || selected === mode) return;
+					try { pi.appendEntry(fastEntryType, { mode: selected }); }
+					catch {
+						fastSaveFailures.add(session);
+						// Supersede any mutation-before-throw entry so a later Pi flush/reload
+						// cannot turn that failed save into an authorized higher-cost choice.
+						try { pi.appendEntry(fastEntryType, { mode: "unreadable" }); } catch {}
+						presentFast(ctx);
+						ctx.ui.notify("Could not save the Codex service choice. Use /fast-codex and choose Codex default before sending again.", "error"); return;
+					}
+					fastSaveFailures.delete(session);
+					presentFast(ctx);
+					ctx.ui.notify(selected === "fast" ? "Fast mode requested for this conversation. Higher usage may apply." : selected === "standard" ? "Standard speed requested for this conversation." : "This conversation now uses the Codex default service.", "info");
+				} finally { if (fastPicker === picker) fastPicker = undefined; }
+			},
+		});
 
 		const contextMeter = new CodexContextMeter();
 		let contextFooter: ReturnType<typeof installCodexContextFooter> | undefined;
@@ -2182,10 +2256,11 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		}
 
-		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, effort: string, contextView: number): Promise<ActiveTurn> {
+		async function startTurn(client: AppServerClient, threadId: string, items: UserInputItem[], model: Model<any>, effort: string, contextView: number, mode: FastMode): Promise<ActiveTurn> {
 			const contextEpoch = contextView === contextMeter.viewGeneration ? contextMeter.begin(threadId) : -1;
 			presentAgents();
 			const turnParams: Rec = { threadId, input: items, effort };
+			if (mode !== "inherit") turnParams.serviceTierForTurn = mode === "fast" ? "priority" : "default";
 			const codexId = codexModelId(model.id);
 			if (codexId) turnParams.model = codexId;
 			// Subscribe before sending: stdout dispatches every frame in one chunk synchronously, so a notification can share a chunk with the response.
@@ -2201,7 +2276,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 					if (!(turnParams.model && detail.includes(String(turnParams.model)))) throw e;
 					// Codex retired the persisted model id: one retry on Codex's default, then the user picks another.
 					notify(NOTICE.retiredModel(String(turnParams.model)), "warning");
-					started = rec(await client.request("turn/start", { threadId, input: items, effort }));
+					const { model: _retired, ...retryParams } = turnParams;
+					started = rec(await client.request("turn/start", retryParams));
 				}
 			} catch (e) {
 				turn.dispose();
@@ -2292,18 +2368,25 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 				const signal = options?.signal;
 				if (signal?.aborted) return out.finish("aborted");
 				try {
+					const mode = fastMode(ctx);
+					if (mode === "unreadable") return fail(new CodexError("codex-fast-unreadable"));
 					const level = options?.reasoning ?? pi.getThinkingLevel();
 					const effort = mapEffort(model, level);
 					if (!effort) return fail(new CodexError("unsupported-thinking-level"));
 					const cwd = realpathSync.native(ctx.sessionManager.getCwd());
 					const client = await ensureClient(cwd, signal);
+					if (mode !== "inherit") {
+						let supported = fastVersions.get(client);
+						if (!supported) { supported = checkCodexVersion(command, [0, 166, 0]); fastVersions.set(client, supported); }
+						if (!await supported) return fail(new CodexError("codex-fast-version"));
+					}
 					const bound = await bindThread(client, ctx, cwd, signal);
 					if (!state.noticedPolicy) {
 						state.noticedPolicy = true;
 						notify(NOTICE.policy(bound.policy, bound.sandbox));
 					}
 					if (signal?.aborted) return out.finish("aborted");
-					const started = await startTurn(client, bound.threadId, items, model, effort, contextView);
+					const started = await startTurn(client, bound.threadId, items, model, effort, contextView, mode);
 					if (signal?.aborted) {
 						await started.interrupt();
 						return drain(started, { silent: true });
@@ -3016,6 +3099,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		};
 
 		pi.on("session_start", async (_event, ctx) => {
+			leaveFast();
 			if (registeredCommandTool) {
 				let sessionId: string | undefined;
 				try {
@@ -3043,6 +3127,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			state.checkingCompact = null;
 			state.runningCompact = null;
 			state.recentCompactTerminal = null;
+			presentFast(ctx);
 			(Editor as any)[COMPACT_DISPATCHER_KEY] = {
 				owner: instanceOwner,
 				shouldIntercept: () => {
@@ -3058,6 +3143,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			if (last?.message?.role === "user" || (last?.message?.role === "assistant" && last.message.stopReason === "toolUse")) notify(NOTICE.interrupted, "warning");
 		});
 		const closeChild = async () => {
+			leaveFast();
+			if (state.ctx?.mode === "tui") state.ctx.ui.setStatus("rbf-codex-fast", undefined);
 			contextMeter.clear();
 			leaveAgents();
 			overviewSafe(() => { agentsFooter?.dispose(); footerInputOff?.(); });
@@ -3095,6 +3182,7 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			return { cancel: true };
 		});
 		pi.on("session_tree", async (_event, _ctx) => {
+			leaveFast(); presentFast(_ctx);
 			contextMeter.clear();
 			state.ctx = _ctx; restoreAgents(_ctx);
 			const terminal = state.recentCompactTerminal;
@@ -3123,12 +3211,14 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			}
 		});
 		pi.on("session_before_tree", async (event, ctx) => {
+			leaveFast();
 			contextMeter.clear();
 			leaveAgents();
 			if (isBoundBranch(ctx) && event.preparation.userWantsSummary) return { summary: { summary: NOTICE.treeSummary } };
 			return {};
 		});
 		pi.on("model_select", async (event, ctx) => {
+			leaveFast(); presentFast(ctx);
 			contextMeter.clear();
 			state.ctx = ctx; agentsFooter?.reset();
 			overviewSafe(() => { overviewClose?.(); overviewRender = undefined; });

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -92,7 +92,7 @@ function makeCtx(opts: {
 	const ctx = {
 		mode,
 		hasUI: mode === "tui",
-		ui: { notify, setWorkingMessage, setWidget, select, input },
+		ui: { notify, setWorkingMessage, setWidget, select, input, setStatus: vi.fn() },
 		get model() {
 			return currentModel;
 		},
@@ -447,6 +447,115 @@ describe("rbf-codex", () => {
 			const r2 = refreshCtx({ allowNetwork: true, force: true });
 			expect(await b.provider.config.refreshModels!(r2.ctx)).toEqual([BOOTSTRAP_MODEL]);
 			expect(r1.publish).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("Codex fast mode", () => {
+		const fastEntry = (mode: unknown, customType = "rbf-codex-fast/v1") => ({ type: "custom", customType, data: { mode } });
+		async function choose(b: Awaited<ReturnType<typeof boot>>, answer: string | undefined, args = "") {
+			const command = vi.mocked(b.pi.registerCommand).mock.calls.find(c => c[0] === "fast-codex")?.[1];
+			expect(command, "public /fast-codex control is registered").toBeDefined();
+			b.answers.push(answer);
+			await command!.handler(args, b.ctx as any);
+		}
+		beforeEach(() => { scenario({ version: "codex-cli 0.166.0", retainHistory: true }); });
+		it("saves Fast and Standard per branch, sends priority/default on new turns, then restores inheritance", async () => {
+			const b = await boot({ persistAppends: true });
+			await choose(b, "Fast"); await b.turn("one");
+			await choose(b, "Standard"); await b.turn("two");
+			await choose(b, "Codex default"); await b.turn("three");
+			const starts = sent().filter(x => x.method === "turn/start");
+			expect(starts.map(x => x.params?.serviceTierForTurn)).toEqual(["priority", "default", undefined]);
+			expect(starts[2].params).not.toHaveProperty("serviceTierForTurn");
+			expect(sent().filter(x => ["thread/start", "thread/resume", "thread/fork"].includes(x.method!)).every(x => !Object.hasOwn(x.params!, "serviceTier"))).toBe(true);
+			expect(b.entries.filter(e => e.customType === "rbf-codex-fast/v1").map(e => (e.data as any).mode)).toEqual(["fast", "standard", "inherit"]);
+		});
+		it("preserves the captured priority in the retired-model retry", async () => {
+			scenario({ version: "codex-cli 0.166.0", retiredModel: "gpt-gone" });
+			const b = await boot({ branch: [fastEntry("fast")] });
+			await b.turn("one", model("gpt-gone"));
+			expect(sent().filter(x => x.method === "turn/start").map(x => x.params?.serviceTierForTurn)).toEqual(["priority", "priority"]);
+		});
+		it("inherits untouched defaults without a new wire field or saved preference", async () => {
+			const b = await boot(); await b.turn("one");
+			expect(sent().find(x => x.method === "turn/start")?.params).not.toHaveProperty("serviceTierForTurn");
+			expect(b.entries.some(e => e.customType.startsWith("rbf-codex-fast/"))).toBe(false);
+		});
+		it.each(["fast", "standard", "inherit"])("restores %s from selected branch and focuses the current choice first", async mode => {
+			const b = await boot({ branch: [fastEntry(mode)], persistAppends: true });
+			await choose(b, mode === "fast" ? "Fast" : mode === "standard" ? "Standard" : "Codex default");
+			expect(b.dialogs[0].options?.[0]).toBe(mode === "fast" ? "Fast" : mode === "standard" ? "Standard" : "Codex default");
+			expect(b.entries.filter(e => e.customType === "rbf-codex-fast/v1")).toHaveLength(0);
+		});
+		it("Escape and rejected command contexts save nothing", async () => {
+			const b = await boot(); await choose(b, undefined);
+			b.setIsIdle(false); await choose(b, "Fast"); b.setIsIdle(true);
+			await choose(b, "Fast", "on");
+			b.ctx.model = { ...model(), provider: "other" }; await choose(b, "Fast");
+			expect(b.entries).toHaveLength(0); expect(b.dialogs).toHaveLength(1);
+		});
+		it("discards a late selector result after navigation", async () => {
+			const b = await boot(); let answer!: (value: string) => void;
+			b.select.mockImplementationOnce(() => new Promise(resolve => { answer = resolve; }));
+			const pending = choose(b, "Fast"); b.setLeafId("another-leaf"); answer("Fast"); await pending;
+			expect(b.entries).toHaveLength(0); expect(b.notify).toHaveBeenCalledWith("The conversation or model changed. Run /fast-codex again.", "warning");
+		});
+		it.each([false, true])("save failure refuses new turns until explicit recovery (branch mutated: %s)", async mutated => {
+			const b = await boot({ branch: [fastEntry("standard")], persistAppends: true });
+			vi.mocked(b.pi.appendEntry).mockImplementationOnce((customType, data) => {
+				if (mutated) b.branch.push({ type: "custom", customType, data });
+				throw new Error("disk full");
+			});
+			await choose(b, "Fast"); const failed = await b.turn("one");
+			expect(failed.final?.stopReason).toBe("error"); expect(methods()).not.toContain("turn/start");
+			expect(b.notify).toHaveBeenCalledWith("Could not save the Codex service choice. Use /fast-codex and choose Codex default before sending again.", "error");
+			await choose(b, "Codex default"); await b.turn("two");
+			expect(b.dialogs[1].title).toContain("Unreadable");
+			expect(sent().find(x => x.method === "turn/start")?.params).not.toHaveProperty("serviceTierForTurn");
+		});
+		it("contains a real SessionManager mutation-before-disk-failure and recovers through the public append API", async () => {
+			const sessions = join(dir, "failed-fast-save"); mkdirSync(sessions);
+			const sm = SessionManager.create(dir, sessions);
+			sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "fixture" }], api: "fixture", provider: "fixture", model: "fixture", stopReason: "stop", timestamp: Date.now() } as any);
+			sm.appendCustomEntry("rbf-codex-fast/v1", { mode: "standard" });
+			const file = sm.getSessionFile()!; renameSync(file, file + ".before"); mkdirSync(file);
+			const b = await boot();
+			Object.assign(b.ctx.sessionManager, { getBranch: () => sm.getBranch(), getSessionId: () => sm.getSessionId(), getLeafId: () => sm.getLeafId() });
+			vi.mocked(b.pi.appendEntry).mockImplementation((type, data) => { sm.appendCustomEntry(type, data); });
+			await choose(b, "Fast");
+			expect(sm.getBranch().filter(e => e.type === "custom").map(e => (e as any).data.mode)).toEqual(["standard", "fast", "unreadable"]);
+			expect((await b.turn("refuse")).final?.stopReason).toBe("error"); expect(methods()).not.toContain("turn/start");
+			const reloaded = await boot({ branch: sm.getBranch() as any });
+			expect((await reloaded.turn("still refuse")).final?.stopReason).toBe("error"); expect(methods()).not.toContain("turn/start");
+			rmSync(file, { recursive: true }); renameSync(file + ".before", file);
+			await choose(b, "Codex default"); await b.turn("recover");
+			expect(sent().find(x => x.method === "turn/start")?.params).not.toHaveProperty("serviceTierForTurn");
+		});
+		it("reads only the selected sibling branch and hides status on another provider", async () => {
+			const b = await boot({ branch: [fastEntry("fast")], persistAppends: true });
+			b.branch.splice(0, b.branch.length, fastEntry("standard")); b.setLeafId("sibling");
+			await b.handlers.get("session_tree")?.({}, b.ctx); await b.turn("sibling");
+			expect(sent().find(x => x.method === "turn/start")?.params?.serviceTierForTurn).toBe("default");
+			b.ctx.model = { ...model(), provider: "other" }; await b.handlers.get("model_select")?.({ model: b.ctx.model, previousModel: model() }, b.ctx);
+			expect(b.ctx.ui.setStatus).toHaveBeenLastCalledWith("rbf-codex-fast", undefined);
+		});
+		it.each([fastEntry("bad"), fastEntry("fast", "rbf-codex-fast/v2")])("refuses unreadable state and allows explicit default recovery", async entry => {
+			const b = await boot({ branch: [entry], persistAppends: true });
+			const failed = await b.turn("refuse"); expect(failed.final?.stopReason).toBe("error"); expect(methods()).not.toContain("turn/start");
+			await choose(b, "Codex default"); expect(b.dialogs[0].title).toContain("Unreadable"); await b.turn("recover");
+			expect(sent().find(x => x.method === "turn/start")?.params).not.toHaveProperty("serviceTierForTurn");
+		});
+		it("keeps the old parent version floor for inheritance but refuses explicit choices on older Codex", async () => {
+			scenario({ version: "codex-cli 0.165.0" });
+			const explicit = await boot({ branch: [fastEntry("fast")] }); const refused = await explicit.turn("one");
+			expect(refused.final?.errorMessage).toContain("0.166.0"); expect(methods()).not.toContain("turn/start");
+			const inherited = await boot(); await inherited.turn("two"); expect(methods()).toContain("turn/start");
+		});
+		it("updates/hides native status on branch and model lifecycle", async () => {
+			const b = await boot({ branch: [fastEntry("fast")] }); const status = vi.mocked(b.ctx.ui.setStatus);
+			expect(status).toHaveBeenLastCalledWith("rbf-codex-fast", "fast requested (Codex)");
+			b.branch.splice(0); await b.handlers.get("session_tree")?.({}, b.ctx);
+			expect(status).toHaveBeenLastCalledWith("rbf-codex-fast", undefined);
 		});
 	});
 
