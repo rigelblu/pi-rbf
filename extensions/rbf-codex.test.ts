@@ -551,10 +551,16 @@ describe("rbf-codex", () => {
 			expect(refused.final?.errorMessage).toContain("0.166.0"); expect(methods()).not.toContain("turn/start");
 			const inherited = await boot(); await inherited.turn("two"); expect(methods()).toContain("turn/start");
 		});
-		it("updates/hides native status on branch and model lifecycle", async () => {
+		it("updates the model prefix on branch lifecycle and removes the old status row", async () => {
 			const b = await boot({ branch: [fastEntry("fast")] }); const status = vi.mocked(b.ctx.ui.setStatus);
-			expect(status).toHaveBeenLastCalledWith("rbf-codex-fast", "fast requested (Codex)");
+			const line = () => {
+				const hook = (FooterComponent.prototype as any)[Symbol.for("@earendil-works/pi-rbf:footer-registry")].hooks.get("codex-context");
+				return hook.render.call({ session: { state: { model: b.ctx.model } } }, ["/workspace", "0.0%/1000M (auto)                 (codex-harness) codex • medium"], 120)[1];
+			};
+			expect(line()).toContain("fast (codex-harness) codex • medium");
+			expect(status).toHaveBeenLastCalledWith("rbf-codex-fast", undefined);
 			b.branch.splice(0); await b.handlers.get("session_tree")?.({}, b.ctx);
+			expect(line()).not.toContain("fast ");
 			expect(status).toHaveBeenLastCalledWith("rbf-codex-fast", undefined);
 		});
 	});

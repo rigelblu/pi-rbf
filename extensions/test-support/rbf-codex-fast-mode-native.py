@@ -61,7 +61,7 @@ for (const [tag, end] of Object.entries(JSON.parse(snapshots))) {
     ready = lambda load: {"reloadReady": {"path": str(stage / "loaded.json"), "loads": load, "command": "/rbf-fast-ready"}}
     first, snaps = run("choose", [ready(1)] + command("/fast-codex") + [
         {"wait": "Codex fast mode \\(Codex default\\)"}, {"snapshot": "default-picker"}, {"key": "escape"},
-    ] + command("/fast-codex") + [{"sleep": .3}, {"key": "down"}, {"key": "enter"}, {"wait": "fast requested \\(Codex\\)"}, {"snapshot": "fast-status"}] + command("offline-one") + [
+    ] + command("/fast-codex") + [{"sleep": .3}, {"key": "down"}, {"key": "enter"}, {"wait": "fast \\(codex-harness\\) codex"}, {"snapshot": "fast-status"}] + command("offline-one") + [
         {"waitSessionTurns": {"dir": str(stage / "sessions"), "count": 1}},
     ] + command("/reload") + [ready(2)] + command("/fast-codex") + [
         {"wait": "Codex fast mode \\(Fast\\)"}, {"snapshot": "reload-picker"}, {"key": "enter"},
@@ -71,9 +71,9 @@ for (const [tag, end] of Object.entries(JSON.parse(snapshots))) {
     session = files[0]
     entries = [json.loads(line) for line in session.read_text().splitlines()]
     assert [e["data"]["mode"] for e in entries if e.get("customType") == "rbf-codex-fast/v1"] == ["fast"], stage
-    second, _ = run("resume", [ready(1), {"wait": "fast requested \\(Codex\\)"}] + command("/fast-codex") + [
+    second, _ = run("resume", [ready(1), {"wait": "fast \\(codex-harness\\) codex"}] + command("/fast-codex") + [
         {"wait": "Codex fast mode \\(Fast\\)"}, {"snapshot": "resume-picker"}, {"key": "down"}, {"key": "enter"},
-        {"wait": "standard requested \\(Codex\\)"}, {"snapshot": "standard-status"},
+        {"wait": "standard \\(codex-harness\\) codex"}, {"snapshot": "standard-status"},
     ] + command("offline-two") + [{"waitSessionTurns": {"dir": str(stage / "sessions"), "count": 2}}] + command("/fast-codex") + [
         {"sleep": .3}, {"key": "down"}, {"key": "down"}, {"key": "enter"}, {"wait": "now uses the Codex default service"}, {"snapshot": "default-status"},
     ] + command("offline-three") + [{"waitSessionTurns": {"dir": str(stage / "sessions"), "count": 3}}], ["--session", str(session)])
@@ -92,9 +92,10 @@ for (const [tag, end] of Object.entries(JSON.parse(snapshots))) {
         assert f"Codex fast mode ({title})" in screen and f"→ {current}" in screen, (tag, screen, stage)
     for name, tag, expected in [("choose", "fast-status", "fast"), ("resume", "standard-status", "standard")]:
         screen = (stage / f"{name}.bin.{tag}.screen.txt").read_text()
-        assert f"{expected} requested (Codex)" in screen, (tag, screen, stage)
+        assert f"{expected} (codex-harness) codex" in screen, (tag, screen, stage)
+        assert "requested (Codex)" not in screen, (tag, screen, stage)
     screen = (stage / "resume.bin.default-status.screen.txt").read_text()
-    assert "fast requested (Codex)" not in screen and "standard requested (Codex)" not in screen, stage
+    assert "fast (codex-harness)" not in screen and "standard (codex-harness)" not in screen, stage
     loaded = json.loads((stage / "loaded.json").read_text())
     assert loaded["sourceSha256"] == hashlib.sha256((ROOT / "extensions/rbf-codex.ts").read_bytes()).hexdigest(), stage
     result = {"pass": True, "pi": str(pi), "version": subprocess.check_output([str(pi), "--version"], text=True).strip(), "width": args.width, "modes": modes, "wireTiers": tiers, "sourceSha256": hashlib.sha256((ROOT / "extensions/rbf-codex.ts").read_bytes()).hexdigest(), "stage": str(stage)}

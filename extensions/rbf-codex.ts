@@ -1361,7 +1361,7 @@ function codexFooterRegistry() {
 }
 
 /** Run before badge layout, including when the shell registry was installed first. */
-export function installCodexContextFooter(visible: () => boolean, getSnapshot: () => CodexContextSnapshot | undefined, getTheme: () => Pick<Theme, "fg" | "bold"> | undefined) {
+export function installCodexContextFooter(visible: () => boolean, getSnapshot: () => CodexContextSnapshot | undefined, getTheme: () => Pick<Theme, "fg" | "bold"> | undefined, getService?: () => "fast" | "standard" | undefined) {
 	const { proto, registry } = codexFooterRegistry();
 	const nativeContext = /(?:\d+(?:\.\d+)?%|\?)\/[\d.]+[kM]?(?: \(auto\))?/;
 	const hook: AgentFooterHook = {
@@ -1373,7 +1373,14 @@ export function installCodexContextFooter(visible: () => boolean, getSnapshot: (
 			if (!nativeContext.test(base[1])) base = registry.originalRender.call(this, Math.max(width, 512));
 			const padding = base[1].match(/^(.*?)(\s{2,})(.*)$/);
 			let left = padding ? padding[1] : base[1];
-			const right = padding?.[3] ?? "";
+			let right = padding?.[3] ?? "";
+			let service: "fast" | "standard" | undefined;
+			try { service = getService?.(); } catch {}
+			if (service && right) {
+				let prefix: string = service;
+				try { prefix = getTheme()?.fg("dim", service) ?? service; } catch {}
+				right = `${prefix} ${right}`;
+			}
 			let snapshot: CodexContextSnapshot | undefined;
 			try { snapshot = getSnapshot(); } catch {}
 			let label = formatCodexContext(snapshot);
@@ -1511,8 +1518,8 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 		}
 		function presentFast(ctx: ExtensionContext): void {
 			if (ctx.mode !== "tui") return;
-			const mode = fastMode(ctx);
-			ctx.ui.setStatus("rbf-codex-fast", ctx.model?.provider === PROVIDER_ID && (mode === "fast" || mode === "standard") ? `${mode} requested (Codex)` : undefined);
+			// Clear the former separate row and request a redraw of the branch-derived model prefix.
+			ctx.ui.setStatus("rbf-codex-fast", undefined);
 		}
 		function leaveFast(): void {
 			fastGeneration++;
@@ -3113,7 +3120,10 @@ export function createRbfCodex(options: RbfCodexOptions = {}) {
 			agentsFooter?.dispose(); footerInputOff?.();
 			if (ctx.mode === "tui") overviewSafe(() => {
 				agentsFooter = installCodexAgentsFooter(() => state.ctx?.mode === "tui" && state.ctx.model?.provider === PROVIDER_ID && !!(agents.agents.length || agents.unavailable || agents.partial || agents.notSaved), () => { const current = state.ctx; if (current && !state.shuttingDown) void openAgents(current).catch(() => {}); }, () => state.ctx?.ui.theme, createCodexAgentPointer());
-				contextFooter = installCodexContextFooter(() => state.ctx?.mode === "tui" && state.ctx.model?.provider === PROVIDER_ID, () => contextMeter.snapshot, () => state.ctx?.ui.theme);
+				contextFooter = installCodexContextFooter(() => state.ctx?.mode === "tui" && state.ctx.model?.provider === PROVIDER_ID, () => contextMeter.snapshot, () => state.ctx?.ui.theme, () => {
+					const mode = state.ctx ? fastMode(state.ctx) : "inherit";
+					return mode === "fast" || mode === "standard" ? mode : undefined;
+				});
 				footerInputOff = ctx.ui.onTerminalInput?.(data => { if (agentsFooter?.pointerInput(data)) presentAgents(); return undefined; });
 			});
 			restoreAgents(ctx);
