@@ -99,6 +99,7 @@ def main() -> int:
     snapshots = {}
     located = {}
     failure = None
+    exited = False
 
     def pump(until: float) -> None:
         while True:
@@ -239,6 +240,23 @@ def main() -> int:
                 with open(files[0], "rb") as f:
                     data = f.read()
                 snapshots[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+            elif "waitExit" in step:
+                wait_deadline = min(deadline, time.monotonic() + float(step["waitExit"]))
+                while True:
+                    ended, status = os.waitpid(pid, os.WNOHANG)
+                    if ended:
+                        exited = True
+                        code = os.waitstatus_to_exitcode(status)
+                        snapshots["exit"] = {"code": code}
+                        if code != 0:
+                            failure = f"Pi exited with code {code}"
+                        break
+                    if time.monotonic() > wait_deadline:
+                        failure = "timed out waiting for graceful Pi exit"
+                        break
+                    pump(time.monotonic() + 0.1)
+                if failure:
+                    break
             elif "snapshot" in step:
                 name = step["snapshot"]
                 if name in snapshots:
@@ -248,12 +266,13 @@ def main() -> int:
     finally:
         # Let the last frame land, then take only Pi down; its children follow it (stdin EOF).
         pump(time.monotonic() + 0.4)
-        try:
-            os.kill(pid, signal.SIGTERM)
-            pump(time.monotonic() + 0.3)
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if not exited:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                pump(time.monotonic() + 0.3)
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         try:
             os.waitpid(pid, 0)
         except ChildProcessError:
