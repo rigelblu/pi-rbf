@@ -45,13 +45,22 @@ const footer=()=>({session:{state:{model:{provider:"codex-harness"}}}});
 const render=(f:any,w=80)=>proto.render.call(f,w);
 beforeEach(()=>{initTheme();originalRender=proto.render;originalMouse=proto.handleMouse;delete proto[KEY];proto.render=()=>["/workspace","$0.000 0.0%/1000M (auto)                         codex • medium"];delete proto.handleMouse;});
 afterEach(()=>{for(const c of cleanups.reverse())c();cleanups=[];unpatchFooterComponent();proto.render=originalRender;if(originalMouse)proto.handleMouse=originalMouse;else delete proto.handleMouse;delete proto[KEY];});
-const install=(get=()=>({tokens:50000,contextWindow:200000}) as any)=>{const h=installCodexContextFooter(()=>true,get,()=>theme);cleanups.push(()=>h.dispose());return h;};
+const install=(get=()=>({tokens:50000,contextWindow:200000}) as any,service?:()=>"fast"|"standard"|undefined)=>{const h=installCodexContextFooter(()=>true,get,()=>theme,service);cleanups.push(()=>h.dispose());return h;};
 describe("Codex native context footer",()=>{
+ it.each(["fast","standard"] as const)("puts %s immediately before the provider/model without a separate row",service=>{
+  proto.render=()=>["/workspace","0.0%/1000M (auto)                              (codex-harness) codex • medium"];
+  let selected:"fast"|"standard"|undefined=service;
+  install(()=>undefined,()=>selected);const f=footer(),before=JSON.stringify(f.session);
+  for(const width of [80,120]){const lines=render(f,width);expect(lines).toHaveLength(2);expect(stripTerminalSequences(lines[1])).toContain(`${service} (codex-harness) codex • medium`);expect(visibleWidth(lines[1])).toBeLessThanOrEqual(width);}
+  for(const width of [12,40])expect(visibleWidth(render(f,width)[1])).toBeLessThanOrEqual(width);
+  selected=undefined;expect(stripTerminalSequences(render(f)[1])).not.toMatch(/fast |standard /);
+  selected=service;f.session.state.model.provider="other";expect(stripTerminalSequences(render(f)[1])).not.toMatch(/fast |standard /);expect(JSON.stringify(f.session)).toBe(before.replace('codex-harness','other'));
+ });
  for(const order of ["context-first","shell-first"])it("reflows before badges and preserves their hitboxes: "+order,()=>{
   const shellOpen=vi.fn(),agentOpen=vi.fn(),f=footer();
   const shells=()=>patchFooterComponent({getRunningTasks:()=>[{}]} as any,()=>false,()=>false,shellOpen);
-  if(order==="shell-first")shells();install();if(order==="context-first")shells();const a=installCodexAgentsFooter(()=>true,agentOpen,()=>theme);cleanups.push(()=>a.dispose());
-  const line=stripTerminalSequences(render(f)[1]);expect(line).toContain("25.0%/200k · 150k left (Codex)");expect(line).not.toMatch(/1000M|\(auto\)/);expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+  if(order==="shell-first")shells();install(()=>({tokens:50000,contextWindow:200000}),()=>"fast");if(order==="context-first")shells();const a=installCodexAgentsFooter(()=>true,agentOpen,()=>theme);cleanups.push(()=>a.dispose());
+  const line=stripTerminalSequences(render(f)[1]);expect(line).toContain("25.0%/200k · 150k left (Codex)");expect(line).toContain("fast codex • medium");expect(line).not.toMatch(/1000M|\(auto\)/);expect(visibleWidth(line)).toBeLessThanOrEqual(80);
   for(const [label,open] of [["1 shell",shellOpen],["agents",agentOpen]] as const){proto.handleMouse.call(f,{type:"click",x:line.indexOf(label)+2,y:1,button:"left",screenX:0,screenY:40});expect(open).toHaveBeenCalledOnce();}
  });
  it("updates on telemetry without Pi session changes, and never mutates real state",()=>{const f=footer();const before=JSON.stringify(f.session);let s:any;install(()=>s);expect(stripTerminalSequences(render(f)[1])).toContain("context ? (Codex)");s={tokens:50000,contextWindow:200000};expect(stripTerminalSequences(render(f)[1])).toContain("150k left");expect(JSON.stringify(f.session)).toBe(before);});
@@ -63,7 +72,7 @@ describe("Codex native context footer",()=>{
 describe("context footer session lifetime",()=>{
  it("keeps the actual prototype truthful after a later extension vetoes a switch, and cleans up on shutdown",async()=>{
   const handlers=new Map<string,Function>(),f=footer(),base=render(f);
-  const ctx:any={mode:"tui",model:{...BOOTSTRAP_MODEL,provider:PROVIDER_ID},ui:{setWidget(){},notify(){},setWorkingMessage(){}},sessionManager:{getBranch:()=>[],getSessionId:()=>"A",getCwd:()=>process.cwd(),getLeafId:()=>"leaf"}};
+  const ctx:any={mode:"tui",model:{...BOOTSTRAP_MODEL,provider:PROVIDER_ID},ui:{setWidget(){},notify(){},setWorkingMessage(){},setStatus(){}},sessionManager:{getBranch:()=>[],getSessionId:()=>"A",getCwd:()=>process.cwd(),getLeafId:()=>"leaf"}};
   createRbfCodex({argv:[]})({on:(e:string,h:Function)=>handlers.set(e,h),appendEntry(){},registerTool(){},registerCommand(){},getThinkingLevel:()=>"medium",registerProvider(){}} as any);
   try{
    await handlers.get("session_start")?.({},ctx);expect(stripTerminalSequences(render(f)[1])).toContain("context ? (Codex)");
