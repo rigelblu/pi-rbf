@@ -876,6 +876,6 @@ describe('durable AGY observations through the real provider', () => {
   await vi.waitFor(()=>expect(reports(h)).toHaveLength(1),{timeout:3000,interval:10});controller.abort();expect((await pending).stopReason).toBe('aborted');expect(reports(h).map(e=>e.data.state)).toEqual(['ACTIVE']);expect(inputs(h)).toHaveLength(1);
  });
  it('registers historical rendering independently of selected model and never creates records without observations',async()=>{
-  const h=harness();await h.request('No tools');expect(h.pi.registerEntryRenderer).toHaveBeenCalledWith(AGY_ACTIVITY,expect.any(Function));expect(reports(h)).toHaveLength(0);
+  const h=harness();await h.request('No tools');expect(h.pi.registerEntryRenderer).toHaveBeenCalledWith(AGY_ACTIVITY,expect.any(Function));expect(h.pi.registerEntryRenderer).toHaveBeenCalledWith("rbf-agy-activity/v2",expect.any(Function));expect(reports(h)).toHaveLength(0);
  });
 });

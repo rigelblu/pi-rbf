@@ -92,7 +92,7 @@ import { VERSION, parseArgs, FooterComponent, ThinkingSelectorComponent, type Ex
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model, type RefreshModelsContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { AGY_EXECUTABLE, MIN_PI_VERSION, BOUNDS, parseVersion, versionAtLeast, checkAgyVersion, acquireOwnedChild, executeTurn, closeChildProcess, sanitizeDisplayText, type LiveOwner, type ControllerTracer } from "./lib/agy-native.js";
-import { AGY_ACTIVITY, AGY_HISTORY_FAILURE, newAgyActivityBudget, recordAgyActivity, renderAgyActivity } from "./lib/agy-history.js";
+import { AGY_ACTIVITY, AGY_REPORTED_ACTIVITY, renderAgyReportedStep, AGY_HISTORY_FAILURE, newAgyActivityBudget, recordAgyActivity, renderAgyActivity } from "./lib/agy-history.js";
 export const AGY_PROVENANCE = "rbf-agy-conversation/v1";
 export interface AgyRetirementSeal {
 	owner?: symbol;
@@ -354,6 +354,7 @@ function branchFingerprint(entries: any[]): string { return createHash("sha256")
 export function createRbfAgy(options: AgyProviderOptions = {}) {
 	return (pi: ExtensionAPI) => {
 		pi.registerEntryRenderer(AGY_ACTIVITY, (entry, { expanded }, theme) => renderAgyActivity(entry.data, expanded, theme));
+		pi.registerEntryRenderer(AGY_REPORTED_ACTIVITY, (entry, { expanded }, theme) => renderAgyReportedStep(entry.data, expanded, theme));
 		const executable = options.executable ?? AGY_EXECUTABLE, seal = options.seal ?? processSeal();
 		const leases = new WeakMap<LiveOwner, symbol>();
 		const disclosed = new WeakSet<LiveOwner>();
