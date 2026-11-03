@@ -92,6 +92,7 @@ import { VERSION, parseArgs, FooterComponent, ThinkingSelectorComponent, type Ex
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model, type RefreshModelsContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { AGY_EXECUTABLE, MIN_PI_VERSION, BOUNDS, parseVersion, versionAtLeast, checkAgyVersion, acquireOwnedChild, executeTurn, closeChildProcess, sanitizeDisplayText, type LiveOwner, type ControllerTracer } from "./lib/agy-native.js";
+import { AGY_ACTIVITY, AGY_HISTORY_FAILURE, newAgyActivityBudget, recordAgyActivity, renderAgyActivity } from "./lib/agy-history.js";
 export const AGY_PROVENANCE = "rbf-agy-conversation/v1";
 export interface AgyRetirementSeal {
 	owner?: symbol;
@@ -352,6 +353,7 @@ function entryFingerprint(entry: any): string { return createHash("sha256").upda
 function branchFingerprint(entries: any[]): string { return createHash("sha256").update(JSON.stringify(entries.map(entryFingerprint))).digest("hex"); }
 export function createRbfAgy(options: AgyProviderOptions = {}) {
 	return (pi: ExtensionAPI) => {
+		pi.registerEntryRenderer(AGY_ACTIVITY, (entry, { expanded }, theme) => renderAgyActivity(entry.data, expanded, theme));
 		const executable = options.executable ?? AGY_EXECUTABLE, seal = options.seal ?? processSeal();
 		const leases = new WeakMap<LiveOwner, symbol>();
 		const disclosed = new WeakSet<LiveOwner>();
@@ -366,6 +368,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 		let ctx: ExtensionContext | undefined, currentModel: Model<any> | undefined, phase: Phase = "unused", owner: LiveOwner | undefined, generation = 0, sessionId = "", anchor: {
 			id: string;
 			fingerprint: string;
+			branchFingerprint: string;
 		} | undefined;
 		let pending: {
 			fingerprint: string;
@@ -545,8 +548,8 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					if (owner) {
 						if (settings.nativeModel !== owner.launchModel || settings.nativeEffort !== owner.launchEffort)
 							throw new Error(AGY_COPY.settings);
-						const a = entries.findIndex(e => e.id === anchor?.id), after = entries.slice(a + 1).filter(e => e.type === "message");
-						if (!anchor || a < 0 || entryFingerprint(entries[a]) !== anchor.fingerprint || sid !== sessionId || cwd !== owner.canonicalCwd || after.at(-1)?.id !== latestUser.id || after.slice(0, -1).some(e => refusalEntries.get(e.id) !== entryFingerprint(e)))
+						const a = entries.findIndex(e => e.id === anchor?.id), after = entries.slice(a + 1);
+						if (!anchor || a < 0 || entryFingerprint(entries[a]) !== anchor.fingerprint || branchFingerprint(entries.slice(0, a + 1)) !== anchor.branchFingerprint || sid !== sessionId || cwd !== owner.canonicalCwd || after.at(-1)?.id !== latestUser.id || after.slice(0, -1).some(e => refusalEntries.get(e.id) !== entryFingerprint(e)))
 							throw new Error(AGY_COPY.branch);
 					}
 					else {
@@ -622,19 +625,36 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					attempted.add(latestUser.id);
 					phase = "running";
 					nativeAttempted = true;
-					const result = await executeTurn(owner, prompt, owner.lastAcceptedTurnCount + 1, streamOptions?.signal, update => {
+					const admittedOwner = owner, expectedTurnCount = owner.lastAcceptedTurnCount + 1;
+					const activityBudget = newAgyActivityBudget();
+					let historyFailed = false;
+					const result = await executeTurn(owner, prompt, expectedTurnCount, streamOptions?.signal, update => {
       const details = update.details as any;
       if (details?.state === "stopping" ? !currentScope() : !live()) return;
 						ctx!.ui.setStatus("rbf-agy", details?.state === "stopping" ? "AGY — stopping" : "AGY — running");
 						if (typeof details?.activity === "string")
 							ctx!.ui.setWidget("rbf-agy-activity", sanitizeDisplayText(details.activity).split("\n").filter(Boolean).slice(-5).map(line => truncateToWidth(line, 100, "…")));
-					}, "", tracer, live, currentScope);
+					}, "", tracer, live, currentScope, false, event => {
+						try {
+							const saved = recordAgyActivity(event, { piSessionId: sid, inputEntryId: latestUser.id, rootConversationId: admittedOwner.conversationId, turnCount: expectedTurnCount, source: { kind: "root", conversationId: admittedOwner.conversationId } }, activityBudget, {
+								assertCurrent() {
+									if (!live() || owner !== admittedOwner || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd) throw new Error(AGY_HISTORY_FAILURE);
+								},
+								entries: branch, leafId: () => sm.getLeafId(), fingerprint: entries => branchFingerprint([...entries]), expectedFingerprint: expectedBranch,
+								append: (type, data) => pi.appendEntry(type, data),
+							});
+							expectedBranch = saved.fingerprint;
+						} catch {
+							historyFailed = true;
+							throw new Error(AGY_HISTORY_FAILURE);
+						}
+					});
 					sent = !result.notSent;
 					if (!result.success) {
 						await retire(workingOwner);
 						const classification = workingOwner?.settledOutcome?.classification;
 						const verified = classification === "clean" || classification === "verified-interrupted";
-						const reason = result.cancelled ? "AGY request cancelled." : result.usage ? `AGY error: ${result.error ?? "Native request failed."}` : sent ? AGY_COPY.protocol : AGY_COPY.startup;
+						const reason = historyFailed ? AGY_HISTORY_FAILURE + "\nThe task may already have run. Do not retry automatically." : result.cancelled ? "AGY request cancelled." : result.usage ? `AGY error: ${result.error ?? "Native request failed."}` : sent ? AGY_COPY.protocol : AGY_COPY.startup;
 						finish(reason + "\n" + (verified ? AGY_COPY.stopped : AGY_COPY.stopUnknown), true, !!result.cancelled);
 						return;
 					}
@@ -737,12 +757,12 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				return;
 			ctx = c;
 			const all = branch(), user = all.findIndex(e => e.id === pending!.userId), matches = all.slice(user + 1).filter(e => e.type === "message" && e.message?.role === "assistant");
-			if (user < 0 || matches.length !== 1 || fingerprint(matches[0].message) !== pending.fingerprint || branchFingerprint(all.slice(0, all.indexOf(matches[0]))) !== pending.branchFingerprint) {
+			if (user < 0 || matches.length !== 1 || all.at(-1) !== matches[0] || fingerprint(matches[0].message) !== pending.fingerprint || branchFingerprint(all.slice(0, all.indexOf(matches[0]))) !== pending.branchFingerprint) {
 				await retire();
 				notice(AGY_COPY.branch);
 				return;
 			}
-			anchor = { id: matches[0].id, fingerprint: entryFingerprint(matches[0]) };
+			anchor = { id: matches[0].id, fingerprint: entryFingerprint(matches[0]), branchFingerprint: branchFingerprint(all) };
 			refusalEntries.clear();
 			pendingRefusal = undefined;
 			pending = undefined;

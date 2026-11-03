@@ -767,6 +767,7 @@ export function executeTurn(
 	owner: LiveOwner, prompt: string, expectedTurnCount: number, signal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<unknown> | undefined, preview: string, tracer: ControllerTracer,
 	canPublish: () => boolean, canPublishStopping: () => boolean, fresh = false,
+	onToolObservation?: (event: Extract<NativeEvent, { kind: "tool" }>) => void,
 ): Promise<OwnedTurnResult> {
 	const r = owner.runtime, child = owner.child;
 	if (!r || !child || r.revoked || owner.closeBarrier || !child.stdin || r.turn && !r.turn.settled)
@@ -830,6 +831,9 @@ export function executeTurn(
 			let text = "";
 			if (event.kind === "response" && event.textDelta !== undefined) text = turn.sanitizer.feed(event.textDelta);
 			else if (event.kind === "tool") {
+				// Only the owned protocol can deliver this callback; its failure retires this turn.
+				onToolObservation?.(event);
+				if (turn.settled || r.revoked) return;
 				// Tool status is independent of the response's incremental escape state.
 				// A DONE step with neither output nor error is the 1.4.9 denial shape: say what is true, without inferring a denial.
 				const detail = event.info?.error ? sanitizeDisplayText(event.info.error.message).replace(/\.+$/, "")

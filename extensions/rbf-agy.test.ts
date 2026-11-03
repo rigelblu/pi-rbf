@@ -43,7 +43,7 @@ import { afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createRbfAgy, AGY_PROVIDER, AGY_API, AGY_COPY, AGY_PROVENANCE, readAgyPolicy, readAgyCatalogue, sameAgyPolicy, agyPolicyArgs, projectAgyFooter, projectAgyThinking, type AgyRetirementSeal } from "./rbf-agy.js";
-const roots = "/Volumes/tom-ssd/tmp/pi-21/provider-unit";
+const roots = process.env.RBF_AGY_TEST_TMP ?? "/Volumes/tom-ssd/tmp/pi-21.8/provider-unit";
 mkdirSync(roots, { recursive: true });
 const retained: Array<{
 	close(): Promise<void>;
@@ -65,7 +65,7 @@ function harness(mode = "normal", opts: {
 	const holder=join(root,"pipe-holder.cjs"),release=join(root,"release-holder");
  if(mode==='held-pipe')writeFileSync(holder,`const fs=require('node:fs');const log=${JSON.stringify(log)},release=${JSON.stringify(release)};const record=x=>fs.appendFileSync(log,JSON.stringify(x)+'\\n');record({desc_start:true});for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{record({desc_signal:signal});process.exit(4);});let poll=setInterval(()=>{try{if(fs.readFileSync(release,'utf8')==='release'){clearInterval(poll);record({desc_exit:0});process.exit(0);}}catch{}},25);setTimeout(()=>{record({desc_exit:3});process.exit(3);},5000);`);
  const worker = `#!${process.execPath}
-const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.stringify(log)},MODE=${JSON.stringify(mode)};const args=process.argv.slice(2);const record=x=>fs.appendFileSync(LOG,JSON.stringify(x)+'\\n');const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');record({args});if(args[0]==='--version'){console.log(MODE==='old-version'?'1.0.0':'1.4.12');process.exit(0);}if(args[0]==='models'){const done=()=>{console.log(MODE==='catalogue-empty'?'':MODE==='catalogue-bad'?'malformed-catalogue':${JSON.stringify(inventory)});process.exit(0);};if(MODE==='slow-metadata')setTimeout(done,200);else done();return;}if(MODE==='login-error'){console.error('authentication required FAKE_CREDENTIAL_DO_NOT_EXPOSE');process.exit(1);}const cid='fixture-'+process.pid;let count=0,step=0,nonce='',active=false;const initialize=()=>{record({init:true});emit({event:'init',conversation_id:cid,init:{model:MODE==='wrong-init-model'?'other-model':args[args.indexOf('--model')+1],cwd:MODE==='wrong-init-cwd'?process.cwd()+'/other':process.cwd(),tools:[],permission_mode:'default'}});};if(MODE==='slow-init')setTimeout(initialize,1000);else initialize();const result=(status,response,error)=>emit({event:'result',result:{conversation_id:cid,status,response,error,num_turns:count,duration_seconds:0,usage:{input_tokens:1,output_tokens:1,thinking_tokens:0,cache_read_tokens:0,total_tokens:2},...(MODE==='denial'?{denied_actions:[{action:'write_file',display_name:'EditFile'}]}:{})}});const rl=readline.createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);record({input:x});active=true;count++;emit({event:'step_update',step_update:{conversation_id:cid,step_index:step++,step_type:'user_input',state:'DONE'}});const text=x.message.content;const m=text.match(/MAPLE-[A-Z0-9]+/);if(m)nonce=m[0];if(MODE==='bad'){console.log('malformed-native');active=false;return;}const done=()=>{active=false;result(MODE==='error'?'ERROR':'SUCCESS',MODE==='denial'?'':'Native answer '+nonce,MODE==='error'?'Native permission refused':undefined);};if(MODE==='slow')setTimeout(done,400);else done();});rl.on('close',()=>{record({eof:true});if(MODE==='held-pipe'){require('node:child_process').spawn(process.execPath,[${JSON.stringify(holder)}],{stdio:['ignore',1,2]}).unref();process.exit(0);}if(!active){if(MODE==='ignore-eof')setInterval(()=>{},500);else process.exit(0);}});process.on('SIGINT',()=>{record({signal:'SIGINT'});if(active){active=false;result('ERROR',undefined,'interrupted');}process.stdout.write('',()=>process.exit(1));});record({workerReady:true});
+const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.stringify(log)},MODE=${JSON.stringify(mode)};const args=process.argv.slice(2);const record=x=>fs.appendFileSync(LOG,JSON.stringify(x)+'\\n');const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');record({args});if(args[0]==='--version'){console.log(MODE==='old-version'?'1.0.0':'1.4.12');process.exit(0);}if(args[0]==='models'){const done=()=>{console.log(MODE==='catalogue-empty'?'':MODE==='catalogue-bad'?'malformed-catalogue':${JSON.stringify(inventory)});process.exit(0);};if(MODE==='slow-metadata')setTimeout(done,200);else done();return;}if(MODE==='login-error'){console.error('authentication required FAKE_CREDENTIAL_DO_NOT_EXPOSE');process.exit(1);}const cid='fixture-'+process.pid;let count=0,step=0,nonce='',active=false;const initialize=()=>{record({init:true});emit({event:'init',conversation_id:cid,init:{model:MODE==='wrong-init-model'?'other-model':args[args.indexOf('--model')+1],cwd:MODE==='wrong-init-cwd'?process.cwd()+'/other':process.cwd(),tools:[],permission_mode:'default'}});};if(MODE==='slow-init')setTimeout(initialize,1000);else initialize();const result=(status,response,error)=>emit({event:'result',result:{conversation_id:cid,status,response,error,num_turns:count,duration_seconds:0,usage:{input_tokens:1,output_tokens:1,thinking_tokens:0,cache_read_tokens:0,total_tokens:2},...(MODE==='denial'?{denied_actions:[{action:'write_file',display_name:'EditFile'}]}:{})}});const rl=readline.createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);record({input:x});active=true;count++;emit({event:'step_update',step_update:{conversation_id:cid,step_index:step++,step_type:'user_input',state:'DONE'}});if(MODE.startsWith('history')){const ix=step+3;step=ix+1;const tool=(state,info)=>emit({event:'step_update',step_update:{conversation_id:MODE==='history-wrong'?'other-root':cid,step_index:ix,step_type:'tool',state,tool_name:'run_command',...(info?{tool_info:{name:'run_command',...info}}:{})}});if(MODE==='history-many'){for(let n=0;n<256;n++)tool('ACTIVE');tool('DONE');}else if(MODE==='history-missing')tool('DONE');else{tool('ACTIVE',{parameters:{CommandLine:'printf hello'}});if(MODE==='history-hold')return;tool(MODE==='history-error'?'ERROR':'DONE',{parameters:{CommandLine:'printf hello'},...(MODE==='history-error'?{error:{type:'CommandError',message:'permission denied'}}:{output:MODE==='history-long'?['line1','line2','line3','line4','line5','line6'].join(String.fromCharCode(10)):'hello'})});}}const text=x.message.content;const m=text.match(/MAPLE-[A-Z0-9]+/);if(m)nonce=m[0];if(MODE==='bad'){console.log('malformed-native');active=false;return;}const done=()=>{active=false;result(MODE==='error'?'ERROR':'SUCCESS',MODE==='denial'?'':'Native answer '+nonce,MODE==='error'?'Native permission refused':undefined);};if(MODE==='slow')setTimeout(done,400);else done();});rl.on('close',()=>{record({eof:true});if(MODE==='held-pipe'){require('node:child_process').spawn(process.execPath,[${JSON.stringify(holder)}],{stdio:['ignore',1,2]}).unref();process.exit(0);}if(!active){if(MODE==='ignore-eof')setInterval(()=>{},500);else process.exit(0);}});process.on('SIGINT',()=>{record({signal:'SIGINT'});if(active){active=false;result('ERROR',undefined,'interrupted');}process.stdout.write('',()=>process.exit(1));});record({workerReady:true});
 `;
 	writeFileSync(exe, worker);
 	chmodSync(exe, 0o700);
@@ -77,7 +77,7 @@ const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.s
 	const sm = { getBranch: () => entries, getEntries: () => entries, getLeafId: () => entries.at(-1)?.id ?? null, getSessionId: () => `pi-${root}`, getSessionFile: () => opts.persist === false ? undefined : join(root, 'pi.jsonl') };
 	const ctx: any = { mode: opts.mode ?? 'tui', cwd: root, sessionManager: sm, model, ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } };
 	const append = (value: any) => { const entry = { id: `e${++seq}`, parentId: sm.getLeafId(), ...value }; entries.push(entry); return entry; };
-	const pi: any = { on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]), registerFlag: vi.fn(), getFlag: () => opts.policy, appendEntry: (type: string, data: any) => append({ type: 'custom', customType: type, data }), registerProvider: (_id: string, value: any) => registration = value };
+	const pi: any = { on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]), registerFlag: vi.fn(), registerEntryRenderer: vi.fn(), getFlag: () => opts.policy, appendEntry: (type: string, data: any) => append({ type: 'custom', customType: type, data }), registerProvider: (_id: string, value: any) => registration = value };
 	createRbfAgy({ executable: exe, piVersion: opts.piVersion ?? '1.4.0', argv: opts.argv ?? [], seal: opts.seal ?? {}, trace: opts.trace })(pi);
 	const emit = async (name: string, event: any = {}) => {
 		let out: any;
@@ -831,4 +831,51 @@ describe('placeholder-free catalogue', () => {
 		expect(rows.map((m: any) => m.id)).toEqual([real.id]);
 		expect(h.logs()).toEqual([]);
 	});
+});
+
+
+import { AGY_ACTIVITY, AGY_HISTORY_FAILURE, renderAgyActivity } from './lib/agy-history.js';
+const reports = (h: ReturnType<typeof harness>) => h.entries.filter(e => e.customType === AGY_ACTIVITY);
+describe('durable AGY observations through the real provider', () => {
+ it('saves separate root reports before the assistant and permits exactly the unchanged contextual follow-up', async () => {
+  const h=harness('history'); const first=await h.request('Inspect one command');
+  expect(first.stopReason).toBe('stop'); expect(reports(h).map(e=>e.data.state)).toEqual(['ACTIVE','DONE']);
+  expect(reports(h)[0].data).toMatchObject({schemaVersion:1,piSessionId:h.ctx.sessionManager.getSessionId(),inputEntryId:h.entries[0].id,turnCount:1,stepIndex:4,sequence:1,source:{kind:'root'}});
+  expect(reports(h)[1].data.command.text).toBe('printf hello'); expect(reports(h)[1].data.output.text).toBe('hello');
+  expect(body(first)).not.toContain('printf hello'); expect(body(first)).not.toContain('hello'); expect(first.content.every((c:any)=>c.type==='text')).toBe(true);
+  await h.persist(first); expect(h.entries.at(-1).message).toBe(first);
+  const second=await h.request('Follow up'); expect(second.stopReason).toBe('stop'); await h.persist(second);
+  expect(inputs(h)).toHaveLength(2); expect(reports(h).map(e=>e.data.turnCount)).toEqual([1,1,2,2]);
+ });
+ it.each(['foreign custom','changed prefix'])('refuses a follow-up after %s even though all assistant messages still match', async fault=>{
+  const h=harness('history');await h.persist(await h.request('First'));
+  if(fault==='foreign custom')h.pi.appendEntry('unrelated-extension',{note:'foreign'});else h.entries[0].message.content[0].text='changed';
+  expect(body(await h.request('Second'))).toContain('cannot be verified');expect(inputs(h)).toHaveLength(1);
+ });
+ it.each(['throw','throw after append','extra entry','prefix mutation'])('retires without retry on activity storage fault: %s', async fault=>{
+  const h=harness('history'),append=h.pi.appendEntry;
+  h.pi.appendEntry=(type:string,data:any)=>{if(type!==AGY_ACTIVITY)return append(type,data);if(fault==='throw')throw Error('disk');append(type,data);if(fault==='throw after append')throw Error('disk after memory');if(fault==='extra entry')append('foreign',{});if(fault==='prefix mutation')h.entries[0].message.content[0].text='changed';};
+  const result=await h.request('First');expect(result.stopReason).toBe('error');expect(body(result)).toContain(AGY_HISTORY_FAILURE);expect(body(result)).toContain("The task may already have run. Do not retry automatically.");expect(inputs(h)).toHaveLength(1);
+  expect(body(await h.request('No retry'))).toContain('context has ended');expect(inputs(h)).toHaveLength(1);
+ });
+ it('writes no observation to a replacement branch',async()=>{
+  const h=harness('history'),append=h.pi.appendEntry;
+  h.pi.appendEntry=(type:string,data:any)=>{if(type!==AGY_ACTIVITY)return append(type,data);h.entries.splice(0,h.entries.length,{id:'destination',parentId:null,type:'message',message:{role:'user',content:'other branch'}});};
+  expect(body(await h.request('Original'))).toContain(AGY_HISTORY_FAILURE);expect(reports(h)).toHaveLength(0);expect(inputs(h)).toHaveLength(1);
+ });
+ it('never records wrong native conversation events',async()=>{const h=harness('history-wrong');expect((await h.request('Task')).stopReason).toBe('error');expect(reports(h)).toHaveLength(0);expect(inputs(h)).toHaveLength(1);});
+ it('stops visibly at the observation-count bound and preserves the accepted reports',async()=>{
+  const h=harness('history-many');const result=await h.request('Many reports');expect(body(result)).toContain(AGY_HISTORY_FAILURE);expect(reports(h)).toHaveLength(256);expect(reports(h).every(e=>e.data.state==='ACTIVE')).toBe(true);expect(inputs(h)).toHaveLength(1);
+ });
+ it.each(['history-error','history-missing'])('keeps native errors and absent details honest: %s',async mode=>{
+  const h=harness(mode);await h.request('Task');const data=reports(h).at(-1).data;
+  if(mode==='history-error')expect(data.error).toMatchObject({type:{text:'CommandError'},message:{text:'permission denied'}});else{expect(data.command).toBeUndefined();expect(data.output).toBeUndefined();}
+ });
+ it('keeps an interrupted ACTIVE report historical, with no synthetic completion',async()=>{
+  const h=harness('history-hold'),controller=new AbortController(),pending=h.request('Task',{signal:controller.signal});
+  await vi.waitFor(()=>expect(reports(h)).toHaveLength(1),{timeout:3000,interval:10});controller.abort();expect((await pending).stopReason).toBe('aborted');expect(reports(h).map(e=>e.data.state)).toEqual(['ACTIVE']);expect(inputs(h)).toHaveLength(1);
+ });
+ it('registers historical rendering independently of selected model and never creates records without observations',async()=>{
+  const h=harness();await h.request('No tools');expect(h.pi.registerEntryRenderer).toHaveBeenCalledWith(AGY_ACTIVITY,expect.any(Function));expect(reports(h)).toHaveLength(0);
+ });
 });
