@@ -44,7 +44,7 @@ rl.on('line', line => {
   if (scenario === 'eof' || scenario === 'no-preview-eof') { process.stdout.end(); return; }
   if (scenario === 'oversize-frame') { process.stdout.write(Buffer.alloc(1024 * 1024 + 1, 65)); return; }
   if (scenario === 'oversize-request') { for (let n=0;n<12;n++) response('z'.repeat(200 * 1024)); return; }
-  if (scenario === 'late') { response('STALE'); active = false; result('SUCCESS','STALE'); process.stdout.write('', () => process.exit(0)); return; }
+  if (scenario === 'late') { record({lateResponse:'STALE'}); response('STALE'); active = false; result('SUCCESS','STALE'); process.stdout.write('', () => process.exit(0)); return; }
   const errors = ['error','no-preview-error','capped-error'];
   if (errors.includes(scenario)) { active = false; result('ERROR',undefined,'Native permission refused'); return; }
   if (scenario === 'normal') response(' beta','DONE');

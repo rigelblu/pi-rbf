@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createRbfAgy, parseAgyCatalogue, toAgyProviderModel } from "../rbf-agy.js";
 import { createAgyStreamFixture } from "./agy-stream-fixture.js";
 
@@ -22,11 +22,23 @@ export default function (pi: ExtensionAPI) {
   const cachedModels=parseAgyCatalogue("gemini-3.8-flash-low\tFlash (low)\ngemini-3.8-flash-medium\tFlash (medium)\ngemini-3.8-flash-high\tFlash (high)").map(toAgyProviderModel);
   const factoryPi={...pi,registerProvider:(name:string,config:any)=>pi.registerProvider(name,{...config,models:cachedModels})} as ExtensionAPI;
   createRbfAgy({executable:fake.executable,argv:[],seal:{},trace(event,data){if(event==="native_result")nativeTerminal=true;log({kind:"trace",event,...data});}})(factoryPi);
+  pi.registerProvider("pi21-fake-neighbor",{api:"offline-neighbor",baseUrl:"stdio://fake",apiKey:"offline",models:[{id:"neighbor",name:"Offline neighbor",reasoning:false,input:["text"],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:10000,maxTokens:1000}],streamSimple(){throw new Error("Offline neighbor prompts are blocked");}});
   enabled=true;
  } catch(error) {
   log({kind:"setup_error",message:String(error)});
   pi.on("session_start",(_event,ctx)=>ctx.ui.notify("Offline AGY candidate setup failed. All prompts are blocked.","error"));
  }
+ pi.registerCommand("offline-agy-depart",{description:"Offline streaming lifecycle check",handler:async(args,ctx)=>{
+  const operation=args.trim();log({kind:"departure_begin",operation});
+  if(operation==="new"){await ctx.newSession();return;}
+  if(operation==="reload"){await ctx.reload();return;}
+  if(operation==="model"){const model=ctx.modelRegistry.find("pi21-fake-neighbor","neighbor");if(!model || !await pi.setModel(model))throw new Error("Offline neighbor selection failed");log({kind:"departure_done",operation});return;}
+  if(operation==="tree"){
+   const user=ctx.sessionManager.getBranch().find((e:any)=>e.type==="message"&&e.message.role==="user");
+   if(!user?.parentId)throw new Error("Offline tree target is missing");
+   await ctx.navigateTree(user.parentId,{summarize:false});log({kind:"departure_done",operation});
+  }
+ }});
  const text=(message:any)=>message.content?.filter((b:any)=>b.type==="text").map((b:any)=>b.text).join("\n") ?? "";
  pi.on("message_update",event=>{
   if(event.message.role!=="assistant")return;
@@ -43,7 +55,7 @@ export default function (pi: ExtensionAPI) {
    while(enabled && Date.now()<deadline){
     const model=ctx.modelRegistry.find("agy-harness","gemini-3.8-flash");
     if(model && (ctx.model?.provider===model.provider && ctx.model?.id===model.id || await pi.setModel(model))){
-     log({kind:"ready",enabled,model:model.provider+"/"+model.id,loaded:ctx.sessionManager.getBranch().filter((e:any)=>e.type==="message"&&e.message.role==="assistant").map((e:any)=>{const value=text(e.message);return{bytes:Buffer.byteLength(value),sha256:createHash("sha256").update(value).digest("hex"),stopReason:e.message.stopReason};})});
+     log({kind:"ready",enabled,hostVersion:VERSION,sourceHashes:Object.fromEntries(["../rbf-agy.ts","../lib/agy-native.ts"].map(file=>[file,createHash("sha256").update(readFileSync(new URL(file,import.meta.url))).digest("hex")])),model:model.provider+"/"+model.id,loaded:ctx.sessionManager.getBranch().filter((e:any)=>e.type==="message"&&e.message.role==="assistant").map((e:any)=>{const value=text(e.message);return{bytes:Buffer.byteLength(value),sha256:createHash("sha256").update(value).digest("hex"),stopReason:e.message.stopReason};})});
      return;
     }
     await new Promise(resolve=>setTimeout(resolve,25));
