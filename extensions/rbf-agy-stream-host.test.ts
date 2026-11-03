@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
@@ -26,6 +26,28 @@ const run=async(profile:ReturnType<typeof createAgyStreamProfile>,scenario:strin
  return {marks:JSON.parse(result.stdout),raw:readFileSync(plan.out)};
 };
 const receipt=(path:string,kind:string,count=1)=>({waitJsonl:{path,field:"kind",value:kind,count}});
+describe("AGY discovery on cold Pi startup",()=>{
+ for(const populated of [false,true]){
+  it(populated?"selects Flash/high from the discovery store without inference":"rejects Flash with an empty discovery store",()=>{
+   const profile=createAgyStreamProfile(),store=join(profile.agent,"models-store.json");
+   if(!populated)writeFileSync(store,"{}\n");
+   const result=spawnSync(host,["--no-extensions","--no-skills","--no-prompt-templates","-e",resolve(import.meta.dirname,"rbf-agy.ts"),"--session-dir",profile.sessions,"--provider","agy-harness","--model","gemini-3.8-flash","--thinking","high","--mode","rpc"],{
+    cwd:profile.root,env:{...process.env,PI_OFFLINE:"1",PI_CODING_AGENT_DIR:profile.agent},encoding:"utf8",input:'{"id":"cold-start","type":"get_state"}\n',timeout:10000,
+   });
+   writeFileSync(join(profile.root,"cold-start-result.json"),JSON.stringify(result,null,2));
+   expect(result.error).toBeUndefined();
+   if(!populated){
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Unknown provider "agy-harness"');
+    return;
+   }
+   expect(result.status,result.stderr).toBe(0);
+   const response=result.stdout.trim().split("\n").map(line=>JSON.parse(line)).find(event=>event.id==="cold-start");
+   expect(response).toMatchObject({type:"response",command:"get_state",success:true,data:{model:{provider:"agy-harness",id:"gemini-3.8-flash"},thinkingLevel:"high",isStreaming:false,messageCount:0,pendingMessageCount:0}});
+  },15000);
+ }
+});
+
 describe("AGY streaming in actual daily Pi TUI",()=>{
  for(const [scenario,expected] of [["normal","alpha beta"],["short","new"],["empty",""],["same","old long preview"],["long","L".repeat(256*1024)],["error",null],["cancel",null],["oversize-frame",null]] as const){
   it(scenario+" uses one saved authoritative result and reopens exactly",async()=>{

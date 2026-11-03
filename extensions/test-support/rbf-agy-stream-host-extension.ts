@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createRbfAgy, parseAgyCatalogue, toAgyProviderModel } from "../rbf-agy.js";
+import { createRbfAgy } from "../rbf-agy.js";
 import { createAgyStreamFixture } from "./agy-stream-fixture.js";
 
 export default function (pi: ExtensionAPI) {
@@ -18,10 +18,7 @@ export default function (pi: ExtensionAPI) {
   if(!root || !isAbsolute(root) || !existsSync(join(root,"offline-profile"))) throw new Error("Missing exclusive offline test profile");
   const scenario=process.env.RBF_AGY_STREAM_SCENARIO ?? "normal";
   const fake=createAgyStreamFixture(root,scenario,Number(process.env.RBF_AGY_STREAM_HOLD_MS ?? 1800));
-  // Supply a fake startup cache; streaming/admission remain the production factory's handlers.
-  const cachedModels=parseAgyCatalogue("gemini-3.8-flash-low\tFlash (low)\ngemini-3.8-flash-medium\tFlash (medium)\ngemini-3.8-flash-high\tFlash (high)").map(toAgyProviderModel);
-  const factoryPi={...pi,registerProvider:(name:string,config:any)=>pi.registerProvider(name,{...config,models:cachedModels})} as ExtensionAPI;
-  createRbfAgy({executable:fake.executable,argv:[],seal:{},trace(event,data){if(event==="native_result")nativeTerminal=true;log({kind:"trace",event,...data});}})(factoryPi);
+  createRbfAgy({executable:fake.executable,argv:[],seal:{},trace(event,data){if(event==="native_result")nativeTerminal=true;log({kind:"trace",event,...data});}})(pi);
   pi.registerProvider("pi21-fake-neighbor",{api:"offline-neighbor",baseUrl:"stdio://fake",apiKey:"offline",models:[{id:"neighbor",name:"Offline neighbor",reasoning:false,input:["text"],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:10000,maxTokens:1000}],streamSimple(){throw new Error("Offline neighbor prompts are blocked");}});
   enabled=true;
  } catch(error) {
