@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { createRbfAgy, AGY_API, AGY_PROVIDER, parseAgyCatalogue, toAgyProviderModel } from "./rbf-agy.js";
@@ -18,7 +18,8 @@ function harness(scenario = "normal") {
  const entries: any[] = [], events: any[] = [], published: any[] = [], trace: any[] = [], handlers = new Map<string, Function[]>();
  const model = { ...toAgyProviderModel(parseAgyCatalogue("gemini-3.8-flash-high\tFlash (high)")[0]), provider: AGY_PROVIDER, api: AGY_API, baseUrl: "stdio://fake" };
  const sm = { getSessionId: () => session, getSessionFile: () => join(root,"session.jsonl"), getEntries: () => entries, getBranch: () => entries, getLeafId: () => entries.at(-1)?.id ?? null };
- const append = (entry: any) => { const value = { id: String(++sequence), parentId: sm.getLeafId(), ...entry }; entries.push(value); return value; };
+ writeFileSync(sm.getSessionFile(), JSON.stringify({ type: "session", version: 3, id: session, cwd: root, timestamp: new Date().toISOString() }) + "\n");
+ const append = (entry: any) => { const value = { id: String(++sequence), parentId: sm.getLeafId(), ...entry }; entries.push(value); appendFileSync(sm.getSessionFile(), JSON.stringify(value) + "\n"); return value; };
  const ctx: any = { mode: "tui", cwd: root, model, sessionManager: sm, ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } };
  const pi: any = { on: (name: string, fn: Function) => handlers.set(name,[...(handlers.get(name) ?? []),fn]), registerEntryRenderer() {}, registerFlag() {}, getFlag() {}, registerProvider: (_name: string, value: any) => registration = value, appendEntry: (customType: string, data: any) => append({ type: "custom", customType, data }) };
  createRbfAgy({ executable: fake.executable, piVersion: "1.4.0", argv: [], seal: {}, trace: (event,data) => trace.push({event,...data}) })(pi);

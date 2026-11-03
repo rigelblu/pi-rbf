@@ -837,3 +837,32 @@ Native AGY owns its existing authentication and policy. With no `--agy-settings`
 `AGY context: unknown` replaces unknown capacity/price metrics. The two recurring token/cost notices are removed. AGY tokens/cost remain untracked in Pi, and its numeric totals still exclude AGY. Native usage is cumulative conversation data, not per-turn Pi accounting. Existing neighbor statistics remain unchanged. Cleanup concerns only the owned handle: positive or unverified stop copy still warns that commands AGY started may be running.
 
 The focused fake suite has104passing tests and strict TypeScript PASS; actual daily-Pi fake-only cases are indexed in [the final receipt](../rb-drive/agents/v0.x/test-results/pi-21-provider-redesign-2026-11-02/final-offline-proof/README.md). Real C8/H1 needs a new named request budget and policy choice. H3 is a read-only monochrome capture review. No real prompt, installation or release is authorized by these instructions. Candidate rollback means ending only its owned test session; daily extensions/settings/auth were not changed. Later delivery requires its own authority, exact backups and both provider files.
+
+# 🔵⋯ AGY clean-turn recovery preview — pi-21.4
+
+Run `bash /Volumes/tom-ssd/src/worktrees/pi-rbf/pi-21.4/rbf/scripts/pi-21.4-preview.sh`.
+This opens an isolated Pi profile and empty workspace with the candidate extension.
+Launch submits no task. Select `/model agy-harness/gemini-3.8-flash`; thinking is `low`.
+The preview uses native AGY authentication and permissions. It does not install the candidate.
+
+After a native `SUCCESS`, Pi must save both the matching answer and recovery checkpoint.
+Ordinary `/reload` and reopening that exact saved Pi session can then resume its native conversation.
+Only the newly submitted text is sent. Prior prompts, answers and tools are never replayed.
+After `/quit`, use the launcher's `--session /absolute/saved-preview.jsonl` recipe.
+
+Keep **one active Pi process per native conversation**, with Pi as its only writer.
+Other native clients, historical branches and whole-file rollback are outside this preview's scope.
+Recovery compares local saved evidence, the exact returned native ID, settings, cumulative turn count and step frontier.
+It does not independently inspect native history before input or provide a cross-process lock.
+Metrics remain unknown. Legacy provenance-only sessions, changed or copied session files,
+image history, incomplete completion evidence and possible-write gaps refuse continuation.
+
+A zero-write refusal can be crossed only through its exact saved certificate and a later new request.
+An unknown outcome requires checking changes and running commands before starting new work with `/new`.
+If the answer is visible but checkpoint saving cannot be confirmed, Pi warns that recovery may be unavailable.
+The current factory closes admission; a later load may qualify fully surviving evidence after fresh validation and sync.
+
+Pi can repair a complete valid JSON tail's missing final newline before the extension loads.
+The extension validates the bytes it then sees, not the original pre-load bytes; partial/malformed records still refuse.
+The preview's explicit `--session` recipe checks the raw file before Pi opens it.
+Real native continuation and recognition of the same work remain the human verification step.

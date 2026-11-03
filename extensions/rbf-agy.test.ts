@@ -40,10 +40,11 @@ describe("family effort resolution", () => {
 	});
 });
 import { afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, appendFileSync, existsSync, readFileSync, chmodSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createRbfAgy, AGY_PROVIDER, AGY_API, AGY_COPY, AGY_PROVENANCE, readAgyPolicy, readAgyCatalogue, sameAgyPolicy, agyPolicyArgs, projectAgyFooter, projectAgyThinking, type AgyRetirementSeal } from "./rbf-agy.js";
-const roots = process.env.RBF_AGY_TEST_ROOT ?? process.env.RBF_AGY_TEST_TMP ?? "/Volumes/tom-ssd/tmp/pi-21.7/provider-unit";
+const roots = process.env.PI214_TEST_ROOT ?? process.env.RBF_AGY_TEST_ROOT ?? process.env.RBF_AGY_TEST_TMP;
+if (!roots) throw new Error("Resolve PI214_TEST_ROOT with eng-use-external-tmp before tests");
 mkdirSync(roots, { recursive: true });
 const retained: Array<{
 	close(): Promise<void>;
@@ -52,7 +53,8 @@ afterEach(async () => {
 	for (const h of retained.splice(0))
 		await h.close();
 });
-function harness(mode = "normal", opts: {
+export function harness(mode = "normal", opts: {
+	root?: string;
 	seal?: AgyRetirementSeal;
 	policy?: string;
 	mode?: string;
@@ -61,22 +63,24 @@ function harness(mode = "normal", opts: {
 	piVersion?: string;
 	trace?: (event: string, payload: any) => void;
 } = {}) {
-	const root = mkdtempSync(join(roots, "case-")), log = join(root, "native.jsonl"), exe = join(root, "fake-agy.cjs");
+	const root = opts.root ?? mkdtempSync(join(roots!, "case-")), log = join(root, "native.jsonl"), exe = join(root, "fake-agy.cjs");
 	const holder=join(root,"pipe-holder.cjs"),release=join(root,"release-holder");
  if(mode==='held-pipe')writeFileSync(holder,`const fs=require('node:fs');const log=${JSON.stringify(log)},release=${JSON.stringify(release)};const record=x=>fs.appendFileSync(log,JSON.stringify(x)+'\\n');record({desc_start:true});for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{record({desc_signal:signal});process.exit(4);});let poll=setInterval(()=>{try{if(fs.readFileSync(release,'utf8')==='release'){clearInterval(poll);record({desc_exit:0});process.exit(0);}}catch{}},25);setTimeout(()=>{record({desc_exit:3});process.exit(3);},5000);`);
  const worker = `#!${process.execPath}
-const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.stringify(log)},MODE=${JSON.stringify(mode)};const args=process.argv.slice(2);const record=x=>fs.appendFileSync(LOG,JSON.stringify(x)+'\\n');const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');record({args});if(args[0]==='--version'){console.log(MODE==='old-version'?'1.0.0':'1.4.12');process.exit(0);}if(args[0]==='models'){const done=()=>{console.log(MODE==='catalogue-empty'?'':MODE==='catalogue-bad'?'malformed-catalogue':${JSON.stringify(inventory)});process.exit(0);};if(MODE==='slow-metadata')setTimeout(done,200);else done();return;}if(MODE==='login-error'){console.error('authentication required FAKE_CREDENTIAL_DO_NOT_EXPOSE');process.exit(1);}const cid='fixture-'+process.pid;let count=0,step=0,nonce='',active=false;const initialize=()=>{record({init:true});emit({event:'init',conversation_id:cid,init:{model:MODE==='wrong-init-model'?'other-model':args[args.indexOf('--model')+1],cwd:MODE==='wrong-init-cwd'?process.cwd()+'/other':process.cwd(),tools:[],permission_mode:'default'}});};if(MODE==='slow-init')setTimeout(initialize,1000);else initialize();const result=(status,response,error)=>emit({event:'result',result:{conversation_id:cid,status,response,error,num_turns:count,duration_seconds:0,usage:{input_tokens:1,output_tokens:1,thinking_tokens:0,cache_read_tokens:0,total_tokens:2},...(MODE==='denial'?{denied_actions:[{action:'write_file',display_name:'EditFile'}]}:{})}});const rl=readline.createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);record({input:x});active=true;count++;emit({event:'step_update',step_update:{conversation_id:cid,step_index:step++,step_type:'user_input',state:'DONE'}});if(MODE.startsWith('history')){const ix=step+3;step=ix+1;const tool=(state,info)=>emit({event:'step_update',step_update:{conversation_id:MODE==='history-wrong'?'other-root':cid,step_index:ix,step_type:'tool',state,tool_name:'run_command',...(info?{tool_info:{name:'run_command',...info}}:{})}});if(MODE==='history-many'){for(let n=0;n<256;n++)tool('ACTIVE');tool('DONE');}else if(MODE==='history-missing')tool('DONE');else{tool('ACTIVE',{parameters:{CommandLine:'printf hello'}});if(MODE==='history-hold')return;tool(MODE==='history-error'?'ERROR':'DONE',{parameters:{CommandLine:'printf hello'},...(MODE==='history-error'?{error:{type:'CommandError',message:'permission denied'}}:{output:MODE==='history-long'?['line1','line2','line3','line4','line5','line6'].join(String.fromCharCode(10)):'hello'})});}}const text=x.message.content;const m=text.match(/MAPLE-[A-Z0-9]+/);if(m)nonce=m[0];if(MODE==='bad'){console.log('malformed-native');active=false;return;}const done=()=>{active=false;result(MODE==='error'?'ERROR':'SUCCESS',MODE==='denial'?'':'Native answer '+nonce,MODE==='error'?'Native permission refused':undefined);};if(MODE==='slow')setTimeout(done,400);else done();});rl.on('close',()=>{record({eof:true});if(MODE==='held-pipe'){require('node:child_process').spawn(process.execPath,[${JSON.stringify(holder)}],{stdio:['ignore',1,2]}).unref();process.exit(0);}if(!active){if(MODE==='ignore-eof')setInterval(()=>{},500);else process.exit(0);}});process.on('SIGINT',()=>{record({signal:'SIGINT'});if(active){active=false;result('ERROR',undefined,'interrupted');}process.stdout.write('',()=>process.exit(1));});record({workerReady:true});
+const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.stringify(log)},MODE=${JSON.stringify(mode)};const args=process.argv.slice(2);const record=x=>fs.appendFileSync(LOG,JSON.stringify(x)+'\\n');const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');record({args});if(args[0]==='--version'){console.log(MODE==='old-version'?'1.0.0':'1.4.12');process.exit(0);}if(args[0]==='models'){const done=()=>{console.log(MODE==='catalogue-empty'?'':MODE==='catalogue-bad'?'malformed-catalogue':${JSON.stringify(inventory)});process.exit(0);};if(MODE==='slow-metadata')setTimeout(done,200);else done();return;}if(MODE==='login-error'){console.error('authentication required FAKE_CREDENTIAL_DO_NOT_EXPOSE');process.exit(1);}const stateFile=${JSON.stringify(join(root, 'native-state.json'))};const resume=args.includes('--conversation')?args[args.indexOf('--conversation')+1]:null;let saved=resume&&fs.existsSync(stateFile)?JSON.parse(fs.readFileSync(stateFile,'utf8')):null;const cid=MODE==='wrong-resume-id'?'wrong-id':resume??'fixture-'+process.pid;let count=saved?.count??0,step=saved?.step??0,nonce=saved?.nonce??'',active=false;const initialize=()=>{record({init:true});emit({event:'init',conversation_id:cid,init:{model:MODE==='wrong-init-model'?'other-model':args[args.indexOf('--model')+1],cwd:MODE==='wrong-init-cwd'?process.cwd()+'/other':process.cwd(),tools:[],permission_mode:MODE==='wrong-resume-mode'?'other-mode':'default'}});};if(MODE==='slow-init')setTimeout(initialize,1000);else initialize();const result=(status,response,error)=>emit({event:'result',result:{conversation_id:cid,status,response,error,num_turns:count,duration_seconds:0,usage:{input_tokens:1,output_tokens:1,thinking_tokens:0,cache_read_tokens:0,total_tokens:2},...(MODE==='denial'?{denied_actions:[{action:'write_file',display_name:'EditFile'}]}:{})}});const rl=readline.createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);record({input:x});active=true;count++;emit({event:'step_update',step_update:{conversation_id:cid,step_index:step++,step_type:'user_input',state:'DONE'}});if(MODE.startsWith('history')){const ix=step+3;step=ix+1;const tool=(state,info)=>emit({event:'step_update',step_update:{conversation_id:MODE==='history-wrong'?'other-root':cid,step_index:ix,step_type:'tool',state,tool_name:'run_command',...(info?{tool_info:{name:'run_command',...info}}:{})}});if(MODE==='history-many'){for(let n=0;n<256;n++)tool('ACTIVE');tool('DONE');}else if(MODE==='history-missing')tool('DONE');else{tool('ACTIVE',{parameters:{CommandLine:'printf hello'}});if(MODE==='history-hold')return;tool(MODE==='history-error'?'ERROR':'DONE',{parameters:{CommandLine:'printf hello'},...(MODE==='history-error'?{error:{type:'CommandError',message:'permission denied'}}:{output:MODE==='history-long'?['line1','line2','line3','line4','line5','line6'].join(String.fromCharCode(10)):'hello'})});}}const text=x.message.content;const m=text.match(/MAPLE-[A-Z0-9]+/);if(m)nonce=m[0];if(MODE==='bad'){console.log('malformed-native');active=false;return;}const done=()=>{active=false;fs.writeFileSync(stateFile,JSON.stringify({count,step,nonce}));result(MODE==='error'?'ERROR':'SUCCESS',MODE==='denial'?'':'Native answer '+nonce,MODE==='error'?'Native permission refused':undefined);};if(MODE==='slow')setTimeout(done,400);else done();});rl.on('close',()=>{record({eof:true});if(MODE==='held-pipe'){require('node:child_process').spawn(process.execPath,[${JSON.stringify(holder)}],{stdio:['ignore',1,2]}).unref();process.exit(0);}if(!active){if(MODE==='ignore-eof')setInterval(()=>{},500);else process.exit(0);}});process.on('SIGINT',()=>{record({signal:'SIGINT'});if(active){active=false;result('ERROR',undefined,'interrupted');}process.stdout.write('',()=>process.exit(1));});record({workerReady:true});
 `;
 	writeFileSync(exe, worker);
 	chmodSync(exe, 0o700);
-	let seq = 0;
-	const entries: any[] = [];
+	const sessionFile = join(root, 'pi.jsonl');
+	if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ type: 'session', version: 3, id: `pi-${root}`, cwd: root, timestamp: new Date().toISOString() }) + '\n');
+	const entries: any[] = readFileSync(sessionFile, 'utf8').trim().split('\n').slice(1).map(line => JSON.parse(line));
+	let seq = entries.length;
 	let registration: any;
 	const handlers = new Map<string, Function[]>();
 	let model: any = full(toAgyProviderModel(parseAgyCatalogue(inventory).find(m => m.id === 'gemini-3.8-flash')!));
 	const sm = { getBranch: () => entries, getEntries: () => entries, getLeafId: () => entries.at(-1)?.id ?? null, getSessionId: () => `pi-${root}`, getSessionFile: () => opts.persist === false ? undefined : join(root, 'pi.jsonl') };
 	const ctx: any = { mode: opts.mode ?? 'tui', cwd: root, sessionManager: sm, model, ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } };
-	const append = (value: any) => { const entry = { id: `e${++seq}`, parentId: sm.getLeafId(), ...value }; entries.push(entry); return entry; };
+	const append = (value: any) => { const entry = { id: `e${++seq}`, parentId: sm.getLeafId(), ...value }; entries.push(entry); appendFileSync(sessionFile, JSON.stringify(entry) + "\n"); return entry; };
 	const pi: any = { on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]), registerFlag: vi.fn(), registerEntryRenderer: vi.fn(), getFlag: () => opts.policy, appendEntry: (type: string, data: any) => append({ type: 'custom', customType: type, data }), registerProvider: (_id: string, value: any) => registration = value };
 	createRbfAgy({ executable: exe, piVersion: opts.piVersion ?? '1.4.0', argv: opts.argv ?? [], seal: opts.seal ?? {}, trace: opts.trace })(pi);
 	const emit = async (name: string, event: any = {}) => {
@@ -163,15 +167,15 @@ describe('provider task and persisted follow-up', () => {
 		expect(body(await h.request('Third'))).toContain('context has ended');
 		expect(inputs(h)).toHaveLength(2);
 	});
-	it('does not retire the running owner when a concurrent provider call refuses busy', async () => {
+	it('refuses busy and invalidates the original result when a concurrent call changed the saved branch', async () => {
 		const h = harness('slow');
 		const pending = h.request('First');
 		await vi.waitFor(() => expect(inputs(h)).toHaveLength(1), { timeout: 3000, interval: 10 });
 		const busy = await h.request('Second');
 		expect(body(busy)).toContain('busy');
-		expect((await pending).stopReason).toBe('stop');
+		expect((await pending).stopReason).toBe('error');
 		expect(inputs(h)).toHaveLength(1);
-		expect(h.logs().filter(x => x.signal)).toHaveLength(0);
+		expect(h.entries.filter(e => e.customType === 'rbf-agy-completion/v1')).toHaveLength(0);
 	});
 });
 describe('review regressions: branch, anchor and availability', () => {
@@ -195,7 +199,7 @@ describe('review regressions: branch, anchor and availability', () => {
 			anchor.message.content[0].text = 'MUTATED';
 		else
 			anchor.parentId = 'other-parent';
-		expect(body(await h.request('Follow-up'))).toContain('cannot be verified');
+		expect(body(await h.request('Follow-up'))).toContain('history no longer matches');
 		expect(inputs(h)).toHaveLength(1);
 	});
 	it('preserves accepted SUCCESS when cancellation arrives after native terminal commitment', async () => {
@@ -222,8 +226,8 @@ describe('review regressions: branch, anchor and availability', () => {
 		await h.persist(first);
 		const refusal = await h.request('Changed effort', { reasoning: 'medium' });
 		await h.persist(refusal);
-		h.entries.at(-1).message.content[0].text = 'UNTRUSTED';
-		expect(body(await h.request('Original effort'))).toContain('cannot be verified');
+		[...h.entries].reverse().find(e => e.message?.role === 'assistant').message.content[0].text = 'UNTRUSTED';
+		expect(body(await h.request('Original effort'))).toContain('history no longer matches');
 		expect(inputs(h)).toHaveLength(1);
 	});
 	it('ends a newly acquired owner if provenance persistence cannot be verified', async () => {
@@ -784,9 +788,13 @@ describe('startup cancellation owns its acquired child', () => {
 });
 
 describe('cancellation progress projection',()=>{
- it('shows stopping within the current scope after its signal becomes aborted',async()=>{
+ it('reports the stop outcome without a transient footer label',async()=>{
   const h=harness('slow'),abort=new AbortController();const pending=h.request('Task',{signal:abort.signal});await vi.waitFor(()=>expect(inputs(h)).toHaveLength(1));abort.abort();
-  expect(h.ctx.ui.setStatus.mock.calls.some((call:any[])=>call[0]==='rbf-agy'&&call[1]==='AGY — stopping')).toBe(true);expect((await pending).stopReason).toBe('aborted');expect(inputs(h)).toHaveLength(1);
+  const result = await pending;
+  expect(result.stopReason).toBe('aborted');
+  expect(body(result)).toMatch(/AGY (stopped|stop could not be verified)/);
+  expect(h.ctx.ui.setStatus).not.toHaveBeenCalled();
+  expect(inputs(h)).toHaveLength(1);
  });
 });
 
@@ -833,6 +841,120 @@ describe('placeholder-free catalogue', () => {
 	});
 });
 
+import { AGY_COMPLETION, AGY_DISPATCH, AGY_REFUSAL, RECOVERY_COPY } from "./lib/agy-recovery.js";
+describe("clean completed turn recovery across fresh factories", () => {
+	it("reopens exact native identity twice with cumulative count/frontier and only new text", async () => {
+		const seal: AgyRetirementSeal = {}, first = harness("normal", { seal });
+		await first.persist(await first.request("Remember MAPLE-RECOVER1."));
+		const original = first.entries.find(e => e.customType === AGY_PROVENANCE).data.conversationId;
+		await first.close();
+		const reloaded = harness("normal", { root: first.root, seal });
+		const answer = await reloaded.request("Recall my label after reload.");
+		expect(answer.stopReason).toBe("stop"); expect(body(answer)).toContain("MAPLE-RECOVER1");
+		await reloaded.persist(answer); await reloaded.close();
+		const restarted = harness("normal", { root: first.root, seal: {} });
+		const third = await restarted.request("Recall after process restart.");
+		expect(third.stopReason).toBe("stop"); await restarted.persist(third);
+		expect(inputs(restarted).map(x => x.input.message.content)).toEqual(["Remember MAPLE-RECOVER1.", "Recall my label after reload.", "Recall after process restart."]);
+		expect(conversations(restarted).slice(1).map(x => x.args[x.args.indexOf("--conversation") + 1])).toEqual([original, original]);
+		expect(restarted.entries.filter(e => e.customType === AGY_COMPLETION).map(e => [e.data.acceptedCount, e.data.frontier])).toEqual([[1, 0], [2, 1], [3, 2]]);
+	});
+	it.each(["wrong-resume-id", "wrong-resume-mode"])("refuses %s init before any new native input", async mode => {
+		const first = harness(); await first.persist(await first.request("First")); await first.close();
+		const next = harness(mode, { root: first.root });
+		expect(body(await next.request("Second"))).toBe(RECOVERY_COPY.unavailable);
+		expect(inputs(next)).toHaveLength(1);
+	});
+	it("certifies a restored zero-write settings refusal and admits a corrected request after another reopen", async () => {
+		const first = harness(); await first.persist(await first.request("First")); await first.close();
+		const second = harness("normal", { root: first.root });
+		const refusal = await second.request("Wrong effort", { reasoning: "medium" }); await second.persist(refusal); await second.close();
+		expect(second.entries.filter(e => e.customType === AGY_REFUSAL)).toHaveLength(1);
+		const third = harness("normal", { root: first.root });
+		expect((await third.request("Correct effort")).stopReason).toBe("stop");
+		expect(inputs(third).map(x => x.input.message.content)).toEqual(["First", "Correct effort"]);
+	});
+	it("does not recover a native SUCCESS whose Pi assistant was never saved", async () => {
+		const first = harness(); expect((await first.request("First")).stopReason).toBe("stop"); await first.close();
+		const next = harness("normal", { root: first.root });
+		expect(body(await next.request("Second"))).toBe(RECOVERY_COPY.unknown); expect(inputs(next)).toHaveLength(1);
+	});
+	it.each([false, true])("closes current admission after completion append throws; surviving complete bytes=%s", async survived => {
+		const first = harness(), append = first.pi.appendEntry;
+		first.pi.appendEntry = (type: string, data: any) => { if (type !== AGY_COMPLETION || survived) append(type, data); if (type === AGY_COMPLETION) throw new Error("simulated acknowledgement failure"); };
+		const answer = await first.request("Remember MAPLE-ACK1."); await first.persist(answer);
+		expect(first.ctx.ui.notify).toHaveBeenCalledWith(RECOVERY_COPY.checkpoint, "warning");
+		expect(body(await first.registration.streamSimple(first.ctx.model, { messages: [] }, { reasoning: "high" }).result())).toContain("context has ended");
+		await first.close(); const next = harness("normal", { root: first.root });
+		const resumed = await next.request("Second");
+		expect(resumed.stopReason).toBe(survived ? "stop" : "error");
+		expect(inputs(next)).toHaveLength(survived ? 2 : 1);
+	});
+	it("requires the dispatch intent to reach disk before native stdin", async () => {
+		const h = harness(), append = h.pi.appendEntry;
+		h.pi.appendEntry = (type: string, data: any) => { if (type !== AGY_DISPATCH) return append(type, data); h.entries.push({ id: "memory-only-intent", parentId: h.ctx.sessionManager.getLeafId(), type: "custom", customType: type, data }); };
+		expect((await h.request("Must never reach native")).stopReason).toBe("error"); expect(inputs(h)).toHaveLength(0);
+	});
+});
+
+describe("outstanding admission invalidation", () => {
+	it.each(["model", "effort", "policy"])("does not publish a completion after running %s changes", async kind => {
+		const path = join(roots!, `policy-${Date.now()}-${kind}.json`); writeFileSync(path, "{}");
+		const h = harness("slow", { policy: path }), pending = h.request("First");
+		await vi.waitFor(() => expect(inputs(h)).toHaveLength(1));
+		if (kind === "model") await h.select(full(toAgyProviderModel(parseAgyCatalogue(inventory).find(m => m.id === "claude-opus-5-5")!)));
+		else if (kind === "effort") await h.emit("thinking_level_select", { level: "medium", previousLevel: "high" });
+		else writeFileSync(path, '{"enableTerminalSandbox":false}');
+		const answer = await pending; expect(answer.stopReason).toBe("error"); await h.persist(answer);
+		expect(h.entries.filter(e => e.customType === AGY_COMPLETION)).toHaveLength(0);
+		expect(inputs(h)).toHaveLength(1); expect(body(answer)).not.toContain("message was not sent");
+	});
+});
+
+describe("restored refusal and crash gap boundaries", () => {
+	it.each(["catalogue-bad", "old-version", "wrong-resume-id"])("certifies zero-write %s and permits only a later new request", async mode => {
+		const first = harness(); await first.persist(await first.request("First")); await first.close();
+		const second = harness(mode, { root: first.root }); const error = await second.request("Never-sent.");
+		expect(body(error)).toBe(RECOVERY_COPY.unavailable); await second.persist(error); await second.close();
+		expect(inputs(second)).toHaveLength(1); expect(second.entries.filter(e => e.customType === AGY_REFUSAL)).toHaveLength(1);
+		const next = harness("normal", { root: first.root }); expect((await next.request("Only-new.")).stopReason).toBe("stop");
+		expect(inputs(next).map(x => x.input.message.content)).toEqual(["First", "Only-new."]);
+	});
+	it("certifies cancellation during restored metadata without replay on later reopen", async () => {
+		const first = harness(); await first.persist(await first.request("First")); await first.close();
+		const next = harness("slow-metadata", { root: first.root }), abort = new AbortController();
+		const before = next.logs().filter(x => x.args?.[0] === "models").length;
+		const pending = next.request("Never-sent.", { signal: abort.signal });
+		await vi.waitFor(() => expect(next.logs().filter(x => x.args?.[0] === "models").length).toBeGreaterThan(before)); abort.abort();
+		const error = await pending; expect(body(error)).toBe(RECOVERY_COPY.cancelled); await next.persist(error); await next.close();
+		const restored = harness("normal", { root: first.root }); expect((await restored.request("Only-new.")).stopReason).toBe("stop");
+		expect(inputs(restored).map(x => x.input.message.content)).toEqual(["First", "Only-new."]);
+	});
+	it("does not upgrade legacy provenance to a recovery checkpoint", async () => {
+		const h = harness(); h.pi.appendEntry(AGY_PROVENANCE, { conversationId: "legacy-id", cwd: h.root, sessionId: h.ctx.sessionManager.getSessionId() });
+		expect(body(await h.request("Do not send"))).toBe(RECOVERY_COPY.missing); expect(inputs(h)).toHaveLength(0); expect(conversations(h)).toHaveLength(0);
+	});
+	it("refuses a saved intent whose append acknowledgement failed before native write", async () => {
+		const h = harness(), append = h.pi.appendEntry;
+		h.pi.appendEntry = (type: string, data: any) => { append(type, data); if (type === AGY_DISPATCH) throw new Error("lost intent acknowledgement"); };
+		expect((await h.request("Possibly dispatched intent")).stopReason).toBe("error"); expect(inputs(h)).toHaveLength(0); await h.close();
+		const next = harness("normal", { root: h.root }); expect(body(await next.request("New request"))).toBe(RECOVERY_COPY.unknown); expect(inputs(next)).toHaveLength(0);
+	});
+	it("refuses malformed post-write outcome after a fresh factory", async () => {
+		const first = harness("bad"); await first.persist(await first.request("First")); await first.close();
+		const next = harness("normal", { root: first.root }); expect(body(await next.request("Never retry uncertain work"))).toBe(RECOVERY_COPY.unknown); expect(inputs(next)).toHaveLength(1);
+	});
+});
+
+describe("captured recovery scope", () => {
+	it("refuses a same-ID session-file replacement while metadata awaits", async () => {
+		const h = harness("slow-metadata"), pending = h.request("Do not send");
+		await vi.waitFor(() => expect(h.logs().some(x => x.args?.[0] === "models")).toBe(true));
+		const copy = join(h.root, "copy.jsonl"); writeFileSync(copy, readFileSync(h.ctx.sessionManager.getSessionFile())); h.ctx.sessionManager.getSessionFile = () => copy;
+		expect((await pending).stopReason).toBe("error"); expect(inputs(h)).toHaveLength(0); expect(conversations(h)).toHaveLength(0);
+	});
+});
+
 
 import { AGY_ACTIVITY, AGY_HISTORY_FAILURE, renderAgyActivity } from './lib/agy-history.js';
 const reports = (h: ReturnType<typeof harness>) => h.entries.filter(e => e.customType === AGY_ACTIVITY);
@@ -843,14 +965,28 @@ describe('durable AGY observations through the real provider', () => {
   expect(reports(h)[0].data).toMatchObject({schemaVersion:1,piSessionId:h.ctx.sessionManager.getSessionId(),inputEntryId:h.entries[0].id,turnCount:1,stepIndex:4,sequence:1,source:{kind:'root'}});
   expect(reports(h)[1].data.command.text).toBe('printf hello'); expect(reports(h)[1].data.output.text).toBe('hello');
   expect(body(first)).not.toContain('printf hello'); expect(body(first)).not.toContain('hello'); expect(first.content.every((c:any)=>c.type==='text')).toBe(true);
-  await h.persist(first); expect(h.entries.at(-1).message).toBe(first);
+  await h.persist(first); expect(h.entries.at(-2)?.message).toBe(first);
   const second=await h.request('Follow up'); expect(second.stopReason).toBe('stop'); await h.persist(second);
   expect(inputs(h)).toHaveLength(2); expect(reports(h).map(e=>e.data.turnCount)).toEqual([1,1,2,2]);
+ });
+ it('recovers a completed turn with saved activity after a fresh factory', async () => {
+  const first = harness('history');
+  const answer = await first.request('Remember MAPLE-HISTORY1.');
+  expect(answer.stopReason).toBe('stop');
+  expect(reports(first)).toHaveLength(2);
+  await first.persist(answer);
+  await first.close();
+  const next = harness('history', { root: first.root });
+  const resumed = await next.request('Recall the label.');
+  expect(resumed.stopReason).toBe('stop');
+  expect(body(resumed)).toContain('MAPLE-HISTORY1');
+  await next.persist(resumed);
+  expect(reports(next).map(e => e.data.turnCount)).toEqual([1, 1, 2, 2]);
  });
  it.each(['foreign custom','changed prefix'])('refuses a follow-up after %s even though all assistant messages still match', async fault=>{
   const h=harness('history');await h.persist(await h.request('First'));
   if(fault==='foreign custom')h.pi.appendEntry('unrelated-extension',{note:'foreign'});else h.entries[0].message.content[0].text='changed';
-  expect(body(await h.request('Second'))).toContain('cannot be verified');expect(inputs(h)).toHaveLength(1);
+  expect(body(await h.request('Second'))).toBe(RECOVERY_COPY.mismatch);expect(inputs(h)).toHaveLength(1);
  });
  it.each(['throw','throw after append','extra entry','prefix mutation'])('retires without retry on activity storage fault: %s', async fault=>{
   const h=harness('history'),append=h.pi.appendEntry;

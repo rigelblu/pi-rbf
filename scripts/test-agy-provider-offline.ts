@@ -135,7 +135,7 @@ else {
 	}
 	else if (name === "abort-and-shutdown") {
 		expectedInputs = 1;
-		steps.push({ waitJsonl: { path: log, field: "event", value: "input", count: 1 }, timeout: 10 }, {key:"escape"},{waitJsonl:{path:log,field:"signal",value:"SIGINT",count:1},timeout:2},{wait:"AGY — stopping",timeout:1},snapshot("stopping80"),resize(120),snapshot("stopping120"),{writeFixtureFile:{path:releaseFile,text:"release"}},wait("test_turn_end",1),snapshot("aborted120"));
+		steps.push({ waitJsonl: { path: log, field: "event", value: "input", count: 1 }, timeout: 10 }, {key:"escape"},{waitJsonl:{path:log,field:"signal",value:"SIGINT",count:1},timeout:2},{sleep:.3},snapshot("stopping80"),resize(120),snapshot("stopping120"),{writeFixtureFile:{path:releaseFile,text:"release"}},wait("test_turn_end",1),snapshot("aborted120"));
 	}
  else if(name === "unknown-warning") {
   expectedConversations=2;
@@ -250,7 +250,7 @@ if (name === "protocol-errors" && (lastAssistant(turns[0])?.stopReason !== "erro
 if (name === "abort-and-shutdown" && (calls.filter(x => x.signal === "SIGINT").length !== 1 || lastAssistant(turns[0])?.stopReason !== "aborted"))
 	throw new Error("Owned-child Escape cancellation missing");
 if(name === "abort-and-shutdown") {
- for(const label of ["stopping80","stopping120"]){if(!readFileSync(join(out,label+".txt"),"utf8").includes("AGY — stopping"))throw new Error("Stopping state not visible: "+label);}
+ for(const label of ["stopping80","stopping120"]){if(readFileSync(join(out,label+".txt"),"utf8").includes("AGY — stopping"))throw new Error("Removed stopping label still visible: "+label);}
  const released=calls.findIndex(x=>x.event==="interrupt_release_observed"),terminal=calls.findIndex(x=>x.event==="interrupt_result");
  if(released<0||terminal<=released||!events.some(e=>e.event==="provider_retired"&&e.classification==="verified-interrupted"))throw new Error("Interruption completion was not released/verified after stopping captures");
 }
@@ -274,7 +274,7 @@ else if (conversations.some(c => c.args.includes("--settings") || c.args.include
 if(name === "lifecycle-guards") {
  const actions=events.filter(x=>x.event==="lifecycle").map(x=>x.action);
  if(["current","summary","return","fork","resume","copy"].some(action=>!actions.includes(action))||!events.some(x=>x.event==="test_compact_before"&&x.reason==="manual")||!events.some(x=>x.event==="compact_result"&&x.outcome==="error"&&/cancelled/i.test(x.error))||!events.some(x=>x.event==="test_tree_before"&&x.summary))throw new Error("Public lifecycle/summary/compact controls not exercised");
- if(turns.length!==8||turns.slice(3).some(turn=>lastAssistant(turn)?.stopReason!=="error"||!assistantText(lastAssistant(turn)).includes("context has ended")))throw new Error("Tree/fork/saved/copy context refusal false");
+ if(turns.length!==8||turns.slice(3).some(turn=>{const t=assistantText(lastAssistant(turn));return lastAssistant(turn)?.stopReason!=="error"||!t.includes("Your message was not sent.")||!(t.includes("context has ended")||t.includes("history no longer matches this Pi branch"));}))throw new Error("Tree/fork/saved/copy context refusal false");
  if(JSON.stringify(inputs.map(x=>x.input.message.content))!==JSON.stringify([first,second,second]))throw new Error("Eligible exact follow-up sequence changed");
  const changes=events.filter(x=>x.event==="lifecycle"&&["fork","resume","copy"].includes(x.action));
  if(changes.length!==3||changes.some(x=>x.from===x.to)||changes.find(x=>x.action==="resume")?.to!==changes[0].original||changes.find(x=>x.action==="copy")?.to!==join(sessions,"copied-provenance.jsonl"))throw new Error("Replacement target/identity receipts false");
@@ -283,7 +283,7 @@ if(name === "lifecycle-guards") {
 if(name === "unknown-warning") {
  if(turns.length!==2||lastAssistant(turns[0])?.stopReason!=="error"||!assistantText(lastAssistant(turns[0])).includes("outcome is unknown")||lastAssistant(turns[1])?.stopReason!=="stop"||assistantText(lastAssistant(turns[1]))!=="AGY_FAKE_DONE ")throw new Error("Unknown prior context silently reused or relabelled");
  const released=calls.findIndex(x=>x.event==="release_observed"),result=calls.findIndex(x=>x.event==="result");if(released<0||result<=released)throw new Error("Earlier-work running capture did not precede terminal release");
- for(const label of ["warning-running80","warning-running120"]){const text=readFileSync(join(out,label+".txt"),"utf8").replace(/\s+/g," ");if(!text.includes("Earlier AGY work")||!text.includes("AGY stop could not be verified. Commands it started may still be running.")||!text.includes("AGY — running")||text.includes("AGY stopped."))throw new Error("Earlier unknown warning missing or current running child labelled stopped");}
+ for(const label of ["warning-running80","warning-running120"]){const text=readFileSync(join(out,label+".txt"),"utf8").replace(/\s+/g," ");if(!text.includes("Earlier AGY work")||!text.includes("AGY stop could not be verified. Commands it started may still be running.")||text.includes("AGY — running")||text.includes("AGY stopped."))throw new Error("Earlier unknown warning missing or current running child labelled stopped");}
 }
 if(name === "positive-clearing") {
  for(const label of ["positive80","positive120"]){if(!readFileSync(join(out,label+".txt"),"utf8").includes("AGY stopped. Commands it started may still be running."))throw new Error("Prior positive disclosure not visible before fresh work");}

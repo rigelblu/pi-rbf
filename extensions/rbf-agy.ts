@@ -92,6 +92,7 @@ import { VERSION, parseArgs, FooterComponent, ThinkingSelectorComponent, type Ex
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model, type RefreshModelsContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { AGY_EXECUTABLE, MIN_PI_VERSION, BOUNDS, parseVersion, versionAtLeast, checkAgyVersion, acquireOwnedChild, executeTurn, closeChildProcess, sanitizeDisplayText, type LiveOwner, type ControllerTracer } from "./lib/agy-native.js";
+import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, RECOVERY_COPY, RecoveryError, readSavedSession, appendEvidence, selectRecoveryCompletion, fingerprint, entryFingerprint, branchFingerprint, type CompletionAnchor, type RecoveryTuple } from "./lib/agy-recovery.js";
 import { AGY_ACTIVITY, AGY_REPORTED_ACTIVITY, renderAgyReportedStep, AGY_HISTORY_FAILURE, newAgyActivityBudget, recordAgyActivity, renderAgyActivity } from "./lib/agy-history.js";
 export const AGY_PROVENANCE = "rbf-agy-conversation/v1";
 export interface AgyRetirementSeal {
@@ -346,11 +347,10 @@ function userText(message: any): string {
 		throw new Error("AGY accepts text-only tasks. Your message was not sent. Remove images and send a new request.");
 	return message.content.map((c: any) => c.text).join("\n");
 }
-function fingerprint(message: any): string {
-	return createHash("sha256").update(JSON.stringify([message?.role, message?.provider, message?.api, message?.model, message?.timestamp, message?.stopReason, message?.content, message?.usage, message?.errorMessage])).digest("hex");
+function recoveryTuple(d: RecoveryTuple): RecoveryTuple {
+	const { sessionId, sessionFile, cwd, conversationId, nativeModel, nativeEffort, policyHash, permissionMode } = d;
+	return { sessionId, sessionFile, cwd, conversationId, nativeModel, nativeEffort, policyHash, permissionMode };
 }
-function entryFingerprint(entry: any): string { return createHash("sha256").update(JSON.stringify([entry?.id, entry?.parentId, entry?.type, entry?.type === "message" ? fingerprint(entry.message) : entry])).digest("hex"); }
-function branchFingerprint(entries: any[]): string { return createHash("sha256").update(JSON.stringify(entries.map(entryFingerprint))).digest("hex"); }
 export function createRbfAgy(options: AgyProviderOptions = {}) {
 	return (pi: ExtensionAPI) => {
 		pi.registerEntryRenderer(AGY_ACTIVITY, (entry, { expanded }, theme) => renderAgyActivity(entry.data, expanded, theme));
@@ -366,30 +366,26 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 		catch { }
 		const v = parseVersion(options.piVersion ?? VERSION), floor = parseVersion(MIN_PI_VERSION)!;
 		const hostOk = !sandbox && v !== null && versionAtLeast(v, floor);
-		let ctx: ExtensionContext | undefined, currentModel: Model<any> | undefined, phase: Phase = "unused", owner: LiveOwner | undefined, generation = 0, sessionId = "", anchor: {
-			id: string;
-			fingerprint: string;
-			branchFingerprint: string;
-		} | undefined;
+		let ctx: ExtensionContext | undefined, currentModel: Model<any> | undefined, phase: Phase = "unused", owner: LiveOwner | undefined, generation = 0, sessionId = "";
 		let pending: {
 			fingerprint: string;
 			userId: string;
 			branchFingerprint: string;
+			dispatchId: string; tuple: RecoveryTuple; acceptedCount: number; frontier: number; epoch: number; modelId: string;
 		} | undefined, policy: AgyPolicy | undefined, policyError: string | undefined, policyFile: unknown;
+		let checkpoint: CompletionAnchor | undefined;
 		let lastMessageTimestamp = 0;
 		let activeRequest: symbol | undefined;
 		let revokePublication: ((closeStream?: boolean) => void) | undefined;
 		let catalog: ProviderModelConfig[] = [], ui: ReturnType<typeof installAgyUi> | undefined;
 		const attempted = new Set<string>();
-		// Local refusal pairs are trusted only after this factory observes their exact
-		// persistence. They never authorize replay, cleanup or reconstruction on reload.
-		const refusalEntries = new Map<string, string>();
+		// Refusals become reusable only after exact saved zero-write certification.
 		let pendingRefusal: {
 			fingerprint: string;
 			userId: string;
 			userFingerprint: string;
 			epoch: number;
-			sid: string;
+			sid: string; checkpoint: CompletionAnchor;
 		} | undefined;
 		const selected = () => currentModel?.provider === AGY_PROVIDER;
 		const notice = (text: string, kind: "info" | "warning" | "error" = "warning") => {
@@ -459,7 +455,6 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 		const clearActivity = () => {
 			try {
 				if (ctx?.mode === "tui") {
-					ctx.ui.setStatus("rbf-agy", undefined);
 					ctx.ui.setWidget("rbf-agy-activity", undefined);
 					ctx.ui.setWidget("rbf-agy-preview", undefined);
 				}
@@ -467,7 +462,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 			catch { }
 		};
 		function branch() { return ctx!.sessionManager.getBranch() as any[]; }
-		function priorUse() { return (ctx!.sessionManager.getEntries() as any[]).some(e => e?.type === "custom" && e.customType === AGY_PROVENANCE || e?.type === "message" && e.message?.role === "assistant" && !["aborted", "error", "length"].includes(e.message.stopReason) && Array.isArray(e.message.content) && e.message.content.some((c: any) => c?.type === "toolCall" && c.name === "agy_controlled")); }
+		function priorUse() { return (ctx!.sessionManager.getEntries() as any[]).some(e => e?.type === "custom" && [AGY_PROVENANCE, AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL].includes(e.customType) || e?.type === "message" && e.message?.role === "assistant" && !["aborted", "error", "length"].includes(e.message.stopReason) && Array.isArray(e.message.content) && e.message.content.some((c: any) => c?.type === "toolCall" && c.name === "agy_controlled")); }
 		async function refreshModels(c: RefreshModelsContext): Promise<ProviderModelConfig[]> {
 			const stored = (c.stored?.models ?? []).filter(m => m.id !== REMOVED_MODEL_ID).map(m => ({ id: m.id, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, cost: m.cost, contextWindow: m.contextWindow, maxTokens: m.maxTokens }));
 			if (!c.allowNetwork) {
@@ -486,18 +481,25 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 			const message: AssistantMessage = { role: "assistant", api: AGY_API, provider: AGY_PROVIDER, model: model.id, content: [], usage: structuredClone(ZERO_USAGE), stopReason: "stop", timestamp: Math.max(Date.now(), lastMessageTimestamp + 1) };
 			lastMessageTimestamp = message.timestamp;
 			const reservation = Symbol("agy-request");
-			const epoch = generation, callSession = ctx?.sessionManager.getSessionId();
+			const epoch = generation, callSession = ctx?.sessionManager.getSessionId(), callFile = ctx?.sessionManager.getSessionFile(), callCwd = ctx?.cwd;
 			let sent = false, claimed = false, createdOwner = false, nativeAttempted = false, finished = false;
 			let requestUser: {
 				id: string;
 				fingerprint: string;
 			} | undefined;
+			let recovery: CompletionAnchor | undefined;
+			let recovering = false;
 			let workingOwner: LiveOwner | undefined;
 			let cancelSetup: (() => void) | undefined;
-			const currentScope = () => epoch === generation && ctx?.sessionManager.getSessionId() === callSession;
-   const live = () => currentScope() && selected() && !streamOptions?.signal?.aborted;
+			let requestBranch: string | undefined;
+			const currentScope = () => epoch === generation && ctx?.sessionManager.getSessionId() === callSession && ctx?.sessionManager.getSessionFile() === callFile && ctx?.cwd === callCwd;
+			const canPublish = () => {
+				try { return currentScope() && selected() && currentModel?.id === model.id && sameAgyPolicy(policy, policyFile) && !streamOptions?.signal?.aborted; }
+				catch { return false; }
+			};
 			let started = false, publicationRevoked = false, preview = "", previewBytes = 0, previewPaused = false, previewClipped = false;
 			const snap = () => ({ ...message, content: message.content.map(c => ({ ...c })) });
+			const live = () => canPublish() && (!requestBranch || branchFingerprint(branch()) === requestBranch);
 			const startText = () => {
 				if (started) return;
 				started = true;
@@ -514,8 +516,8 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				if (error) message.errorMessage = publicationRevoked ? AGY_COPY.ended : clean;
 				startText();
 				message.content = [{ type: "text", text: clean }];
-				if (error && !nativeAttempted && owner?.isIdle && phase === "ready" && requestUser && callSession === sessionId && refusalEntries.size < 64)
-					pendingRefusal = { fingerprint: fingerprint(message), userId: requestUser.id, userFingerprint: requestUser.fingerprint, epoch: generation, sid: sessionId };
+				if (error && !nativeAttempted && recovery && requestUser && callSession === ctx?.sessionManager.getSessionId())
+					pendingRefusal = { fingerprint: fingerprint(message), userId: requestUser.id, userFingerprint: requestUser.fingerprint, epoch: generation, sid: callSession!, checkpoint: recovery };
 				if (!wasStarted && clean) stream.push({ type: "text_delta", contentIndex: 0, delta: clean, partial: snap() });
 				// text_end replaces provisional content; concatenating deltas is not the final answer.
 				stream.push({ type: "text_end", contentIndex: 0, content: clean, partial: snap() });
@@ -544,7 +546,6 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					startText(); preview += delta;
 					message.content = [{ type: "text", text: preview }];
 					stream.push({ type: "text_delta", contentIndex: 0, delta, partial: snap() });
-					ctx!.ui.setStatus("rbf-agy", "AGY — responding");
 				}
 				if (previewClipped || previewBytes === BOUNDS.DISPLAY_ANSWER_RESERVE_BYTES) {
 					previewPaused = true;
@@ -568,7 +569,6 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					if (!latestUser || typeof latestUser.id !== "string" || attempted.has(latestUser.id))
 						throw new Error("AGY will not resend this user message. Your message was not sent. Submit a new task after /new.");
 					requestUser = { id: latestUser.id, fingerprint: entryFingerprint(latestUser) };
-					const settings = resolveAgySelection(model, streamOptions?.reasoning);
 					const prompt = userText(context.messages.at(-1));
 					if (userText(latestUser.message) !== prompt)
 						throw new Error(AGY_COPY.branch);
@@ -580,53 +580,50 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 						if (!live() || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd || branchFingerprint(branch()) !== expectedBranch)
 							throw new Error(AGY_COPY.branch);
 					};
-					if (owner) {
-						if (settings.nativeModel !== owner.launchModel || settings.nativeEffort !== owner.launchEffort)
-							throw new Error(AGY_COPY.settings);
-						const a = entries.findIndex(e => e.id === anchor?.id), after = entries.slice(a + 1);
-						if (!anchor || a < 0 || entryFingerprint(entries[a]) !== anchor.fingerprint || branchFingerprint(entries.slice(0, a + 1)) !== anchor.branchFingerprint || sid !== sessionId || cwd !== owner.canonicalCwd || after.at(-1)?.id !== latestUser.id || after.slice(0, -1).some(e => refusalEntries.get(e.id) !== entryFingerprint(e)))
-							throw new Error(AGY_COPY.branch);
-					}
-					else {
-						if (priorUse())
-							throw new Error(AGY_COPY.ended);
+					const saved = readSavedSession(sm, cwd);
+					if (owner || priorUse()) {
+						recovery = selectRecoveryCompletion(saved, latestUser.id);
+						if (owner && (!checkpoint || recovery.entry.id !== checkpoint.entry.id || sid !== sessionId || cwd !== owner.canonicalCwd))
+							throw new RecoveryError("mismatch");
+						recovering = !owner;
+					} else {
 						let lastAssistant = -1;
-						entries.forEach((e, i) => {
-							if (e.type === "message" && e.message?.role === "assistant")
-								lastAssistant = i;
-						});
+						entries.forEach((e, i) => { if (e.type === "message" && e.message?.role === "assistant") lastAssistant = i; });
 						if (entries.slice(lastAssistant + 1).filter(e => e.type === "message" && e.message?.role === "user").length !== 1)
 							throw new Error("AGY needs one new user message. Your message was not sent. Submit one task at a time.");
-						if (lastAssistant >= 0)
-							notice(AGY_COPY.cold, "info");
+						if (lastAssistant >= 0) notice(AGY_COPY.cold, "info");
 					}
+					const settings = resolveAgySelection(model, streamOptions?.reasoning);
+					if (recovery && (recovery.data.nativeModel !== settings.nativeModel || recovery.data.nativeEffort !== (settings.nativeEffort ?? null) || recovery.data.policyHash !== (policy?.hash ?? null)))
+						throw new Error(AGY_COPY.settings);
 					if (!live())
-						throw new Error("AGY request cancelled before input. Your message was not sent.");
+						throw new Error(recovering ? RECOVERY_COPY.cancelled : "AGY request cancelled before input. Your message was not sent.");
 					claimed = true;
 					activeRequest = reservation;
 					revokePublication = revokeAnswer;
 					workingOwner = owner;
 					phase = "starting";
-					ctx!.ui.setStatus("rbf-agy", "AGY — starting");
 					// Revalidate native availability for every dispatch, including a live owner.
-					catalog = (await readAgyCatalogue(executable, streamOptions?.signal)).map(toAgyProviderModel);
+					try { catalog = (await readAgyCatalogue(executable, streamOptions?.signal)).map(toAgyProviderModel); }
+					catch (error) { if (recovering) throw new Error(streamOptions?.signal?.aborted ? RECOVERY_COPY.cancelled : RECOVERY_COPY.unavailable); throw error; }
 					checkBranch();
 					const listed = catalog.find(m => m.id === model.id);
 					if (!listed || JSON.stringify(resolveAgySelection(listed, streamOptions?.reasoning)) !== JSON.stringify(settings))
 						throw new Error(AGY_COPY.unsupported);
 					if (!owner) {
 						if (!live())
-							throw new Error("AGY request cancelled before input. Your message was not sent.");
+							throw new Error(recovering ? RECOVERY_COPY.cancelled : "AGY request cancelled before input. Your message was not sent.");
 						if (await checkAgyVersion(executable) !== "ok")
-							throw new Error(AGY_COPY.startup);
+							throw new Error(recovering ? (streamOptions?.signal?.aborted ? RECOVERY_COPY.cancelled : RECOVERY_COPY.unavailable) : AGY_COPY.startup);
 						if (!live())
-							throw new Error("AGY request cancelled before input. Your message was not sent.");
+							throw new Error(recovering ? RECOVERY_COPY.cancelled : "AGY request cancelled before input. Your message was not sent.");
 						checkPolicy();
+						checkBranch();
 						if (seal.owner)
 							throw new Error(AGY_COPY.stopUnknown);
 						const lease = Symbol("agy-owned-retirement");
 						seal.owner = lease;
-						owner = acquireOwnedChild(settings, cwd, tracer, executable, agyPolicyArgs(policy));
+						owner = acquireOwnedChild(settings, cwd, tracer, executable, agyPolicyArgs(policy), recovery ? { conversationId: recovery.data.conversationId, permissionMode: recovery.data.permissionMode, acceptedCount: recovery.data.acceptedCount, frontier: recovery.data.frontier } : undefined);
 						workingOwner = owner;
 						createdOwner = true;
 						leases.set(owner, lease);
@@ -646,18 +643,28 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 						if (cancelSetup)
 							streamOptions?.signal?.removeEventListener("abort", cancelSetup);
 						if (!ready.success || !live())
-							throw new Error(AGY_COPY.startup);
+							throw new Error(recovering ? (streamOptions?.signal?.aborted ? RECOVERY_COPY.cancelled : RECOVERY_COPY.unavailable) : AGY_COPY.startup);
 						checkBranch();
-						const parent = sm.getLeafId(), data = { conversationId: owner.conversationId, cwd, sessionId: sid };
-						pi.appendEntry(AGY_PROVENANCE, data);
-						const bound = branch().at(-1);
-						if (!bound || bound.type !== "custom" || bound.customType !== AGY_PROVENANCE || bound.parentId !== parent || JSON.stringify(bound.data) !== JSON.stringify(data) || bound.id !== sm.getLeafId() || branchFingerprint(branch().slice(0, -1)) !== expectedBranch)
-							throw new Error("AGY could not verify session provenance. Your message was not sent. Use /new.");
-						expectedBranch = branchFingerprint(branch());
-						tracer.record("provider_bound", { entryId: bound.id, sessionId: sid, conversationId: owner.conversationId });
+						if (!recovery) {
+							const data = { conversationId: owner.conversationId, cwd, sessionId: sid };
+							try { appendEvidence(pi, sm, cwd, AGY_PROVENANCE, data); }
+							catch { throw new Error("AGY could not verify session provenance. Your message was not sent. Use /new."); }
+							expectedBranch = branchFingerprint(branch());
+							tracer.record("provider_bound", { entryId: sm.getLeafId(), sessionId: sid, conversationId: owner.conversationId });
+						} else {
+							checkpoint = recovery;
+							notice("AGY conversation resumed.", "info");
+						}
 					}
 					checkPolicy();
 					checkBranch();
+					const snapshot = owner!.runtime!.protocol.snapshot();
+					if (!snapshot.permissionMode || snapshot.failure) throw new RecoveryError("unavailable");
+					const tuple: RecoveryTuple = { sessionId: sid, sessionFile: saved.sessionFile, cwd, conversationId: owner!.conversationId, nativeModel: settings.nativeModel, nativeEffort: settings.nativeEffort ?? null, policyHash: policy?.hash ?? null, permissionMode: snapshot.permissionMode };
+					const dispatch = appendEvidence(pi, sm, cwd, AGY_DISPATCH, { ...tuple, userId: latestUser.id, userFingerprint: entryFingerprint(latestUser), prefixHash: expectedBranch, previousCompletionId: recovery?.entry.id ?? null, acceptedCount: snapshot.acceptedCount, frontier: snapshot.acceptedFrontier });
+					expectedBranch = branchFingerprint(branch());
+					checkBranch();
+					requestBranch = expectedBranch;
 					attempted.add(latestUser.id);
 					phase = "running";
 					nativeAttempted = true;
@@ -667,19 +674,18 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					const result = await executeTurn(owner, prompt, expectedTurnCount, streamOptions?.signal, update => {
       const details = update.details as any;
       if (details?.state === "stopping" ? !currentScope() : !live()) return;
-						ctx!.ui.setStatus("rbf-agy", details?.state === "stopping" ? "AGY — stopping" : "AGY — running");
 						if (typeof details?.activity === "string")
 							ctx!.ui.setWidget("rbf-agy-activity", sanitizeDisplayText(details.activity).split("\n").filter(Boolean).slice(-5).map(line => truncateToWidth(line, 100, "…")));
 					}, "", tracer, live, currentScope, false, event => {
 						try {
 							const saved = recordAgyActivity(event, { piSessionId: sid, inputEntryId: latestUser.id, rootConversationId: admittedOwner.conversationId, turnCount: expectedTurnCount, source: { kind: "root", conversationId: admittedOwner.conversationId } }, activityBudget, {
 								assertCurrent() {
-									if (!live() || owner !== admittedOwner || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd) throw new Error(AGY_HISTORY_FAILURE);
+									if (!canPublish() || owner !== admittedOwner || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd) throw new Error(AGY_HISTORY_FAILURE);
 								},
 								entries: branch, leafId: () => sm.getLeafId(), fingerprint: entries => branchFingerprint([...entries]), expectedFingerprint: expectedBranch,
 								append: (type, data) => pi.appendEntry(type, data),
 							});
-							expectedBranch = saved.fingerprint;
+							expectedBranch = requestBranch = saved.fingerprint;
 						} catch {
 							historyFailed = true;
 							throw new Error(AGY_HISTORY_FAILURE);
@@ -708,14 +714,18 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					owner.isIdle = true;
 					phase = "awaiting-anchor";
 					message.content = [{ type: "text", text: sanitizeDisplayText(answer) }];
-					pending = { fingerprint: fingerprint(message), userId: latestUser.id, branchFingerprint: expectedBranch };
+					const terminal = owner.runtime!.protocol.snapshot();
+					pending = { fingerprint: fingerprint(message), userId: latestUser.id, branchFingerprint: expectedBranch, dispatchId: dispatch.id, tuple, acceptedCount: terminal.acceptedCount, frontier: terminal.acceptedFrontier, epoch: generation, modelId: model.id };
 					finish(answer);
 				}
 				catch (error) {
 					const text = error instanceof Error ? error.message : "AGY request failed.";
 					if (claimed && workingOwner) {
 						if (createdOwner || nativeAttempted || !workingOwner.isIdle || streamOptions?.signal?.aborted || !selected() || ctx?.sessionManager.getSessionId() !== callSession || phase === "ended" || workingOwner !== owner)
-							await retire(workingOwner, false);
+							{
+							const closed = await retire(workingOwner, false);
+							if (createdOwner && !nativeAttempted && recovery && closed) { owner = undefined; phase = "unused"; }
+						}
 						else
 							phase = "ready";
 					}
@@ -746,10 +756,9 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 			if (!seal.owner) {
 				phase = "unused";
 				owner = undefined;
-				anchor = undefined;
+				checkpoint = undefined;
 				pending = undefined;
 				attempted.clear();
-				refusalEntries.clear();
 				pendingRefusal = undefined;
 				sessionId = c.sessionManager.getSessionId();
 			}
@@ -777,22 +786,33 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				else
 					await retire();
 			}
+			if ((phase === "running" || phase === "awaiting-anchor") && previous?.id !== event.model.id) await retire();
 			present();
+		});
+		pi.on("thinking_level_select", async (event) => {
+			if (event.level === event.previousLevel) return;
+			if (phase === "running" || phase === "awaiting-anchor") await retire();
+			else if (phase === "starting") { if (owner) generation++; else await retire(); }
 		});
 		pi.on("agent_end", async (event, c) => {
 			ctx = c;
-			if (pendingRefusal && phase === "ready" && pendingRefusal.epoch === generation && c.sessionManager.getSessionId() === pendingRefusal.sid) {
+			if (pendingRefusal && pendingRefusal.epoch === generation && c.sessionManager.getSessionId() === pendingRefusal.sid) {
 				const proof = pendingRefusal;
 				pendingRefusal = undefined;
 				const all = c.sessionManager.getBranch() as any[], i = all.findIndex(e => e.id === proof.userId), user = all[i];
 				const after = all.slice(i + 1).filter(e => e.type === "message");
 				if (i >= 0 && entryFingerprint(user) === proof.userFingerprint && after.length === 1 && fingerprint(after[0].message) === proof.fingerprint && event.messages.some(m => fingerprint(m) === proof.fingerprint)) {
-					refusalEntries.set(user.id, entryFingerprint(user));
-					refusalEntries.set(after[0].id, entryFingerprint(after[0]));
+					try {
+						appendEvidence(pi, c.sessionManager, c.cwd, AGY_REFUSAL, { ...recoveryTuple(proof.checkpoint.data), completionId: proof.checkpoint.entry.id, userId: user.id, userFingerprint: entryFingerprint(user), assistantId: after[0].id, assistantFingerprint: entryFingerprint(after[0]), prefixHash: branchFingerprint(all) });
+					} catch { await retire(); notice(RECOVERY_COPY.checkpoint); }
+
 				}
 			}
 			if (!pending || phase !== "awaiting-anchor" || c.sessionManager.getSessionId() !== sessionId)
 				return;
+			if (pending.epoch !== generation || currentModel?.id !== pending.modelId || !sameAgyPolicy(policy, policyFile)) {
+				await retire(); notice(RECOVERY_COPY.checkpoint); return;
+			}
 			if (!event.messages.some(m => fingerprint(m) === pending!.fingerprint))
 				return;
 			ctx = c;
@@ -802,12 +822,19 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				notice(AGY_COPY.branch);
 				return;
 			}
-			anchor = { id: matches[0].id, fingerprint: entryFingerprint(matches[0]), branchFingerprint: branchFingerprint(all) };
-			refusalEntries.clear();
+			try {
+				const data = { ...pending.tuple, dispatchId: pending.dispatchId, assistantId: matches[0].id, assistantFingerprint: entryFingerprint(matches[0]), prefixHash: branchFingerprint(all), acceptedCount: pending.acceptedCount, frontier: pending.frontier };
+				const entry = appendEvidence(pi, c.sessionManager, c.cwd, AGY_COMPLETION, data);
+				checkpoint = { entry, data };
+			} catch {
+				await retire();
+				notice(RECOVERY_COPY.checkpoint);
+				return;
+			}
 			pendingRefusal = undefined;
 			pending = undefined;
 			phase = "ready";
-			tracer.record("provider_anchor", { entryId: anchor.id });
+			tracer.record("provider_anchor", { entryId: matches[0].id });
 		});
 		pi.on("session_tree", async (event, c) => {
 			ctx = c;

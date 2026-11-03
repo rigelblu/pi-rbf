@@ -368,7 +368,9 @@ export function parseNdjsonFrame(line: string): NativeEvent | null {
 type NativeResultEvent = Extract<NativeEvent, { kind: "result" }>;
 type NativeInitEvent = Extract<NativeEvent, { kind: "init" }>;
 
-export function createOwnedNativeProtocol(expected: { model: string; cwd: string }, callbacks: {
+export interface NativeResume { conversationId: string; permissionMode: string; acceptedCount: number; frontier: number }
+
+export function createOwnedNativeProtocol(expected: { model: string; cwd: string; resume?: NativeResume }, callbacks: {
 	onInit(event: NativeInitEvent): void;
 	onEvent(event: NativeEvent): void;
 	onBoundary(event: NativeResultEvent, accepted: boolean): void;
@@ -378,7 +380,10 @@ export function createOwnedNativeProtocol(expected: { model: string; cwd: string
 	let initDelivered = false;
 	let failure: string | null = null;
 	let closing = false, frozen = false;
-	let acceptedCount = 0, acceptedFrontier = -1, frontier = -1;
+	const resume = expected.resume;
+	if (resume && (!resume.conversationId || !resume.permissionMode || !Number.isSafeInteger(resume.acceptedCount) || resume.acceptedCount < 1 || resume.acceptedCount >= Number.MAX_SAFE_INTEGER || !Number.isSafeInteger(resume.frontier) || resume.frontier < 0)) throw new Error("Invalid native resume baseline");
+	let acceptedCount = resume?.acceptedCount ?? 0, acceptedFrontier = resume?.frontier ?? -1, frontier = acceptedFrontier;
+	let firstResumedInput = !!resume;
 	let setupBytes = 0, idleBytes = 0, requestBytes = 0;
 	let bufferedBytes = 0;
 	const frame = Buffer.allocUnsafe(BOUNDS.MAX_FRAME_BYTES);
@@ -410,10 +415,11 @@ export function createOwnedNativeProtocol(expected: { model: string; cwd: string
 		const event = freezeEvent(parsed);
 		if (request?.terminal) { fail("Native frame followed a terminal in the same available batch"); return; }
 		if (event.kind === "init") {
-			if (init || event.model !== expected.model || event.cwd !== expected.cwd) { fail("Native init identity/settings mismatch"); return; }
+			if (init || event.model !== expected.model || event.cwd !== expected.cwd || (resume && (event.conversationId !== resume.conversationId || event.permissionMode !== resume.permissionMode))) { fail("Native init identity/settings mismatch"); return; }
 			init = event; return;
 		}
 		if (!init || event.conversationId !== init.conversationId) { fail("Native frame has no matching initialized conversation"); return; }
+		if (firstResumedInput && !request?.writeAttempted) { fail("Unexpected historical work before resumed input"); return; }
 		if (event.kind === "result") {
 			if (!request || !request.writeAttempted || event.numTurns !== request.expectedCount) { fail("Unrequested, stale or skipped native terminal"); return; }
 			if (event.status === "SUCCESS" && request.inputIndex === null) { fail("Native success has no new DONE user input"); return; }
@@ -485,6 +491,7 @@ export function createOwnedNativeProtocol(expected: { model: string; cwd: string
 		markWriteAttempt(): void {
 			if (!request || request.writeAttempted || failure !== null || closing || frozen) throw new Error("Native write cannot be attempted");
 			request.writeAttempted = true;
+			firstResumedInput = false;
 		},
 		beginClose(): void { closing = true; },
 		freeze(): void {
@@ -497,7 +504,7 @@ export function createOwnedNativeProtocol(expected: { model: string; cwd: string
 			return Object.freeze({ initialized: init !== null && initDelivered, failure, closing, frozen, bufferedBytes,
 				acceptedCount, acceptedFrontier, frontier, activeRequest: request !== null,
 				writeAttempted: request?.writeAttempted ?? false, expectedCount: request?.expectedCount ?? null,
-				conversationId: init?.conversationId ?? null });
+				conversationId: init?.conversationId ?? null, permissionMode: init?.permissionMode ?? null });
 		},
 	};
 }
@@ -557,7 +564,7 @@ interface OwnedChildRuntime {
 
 // Returns the owned record synchronously, including a pending acquisition. The
 // caller stores it before awaiting ready; no async resolver can hide a handle.
-export function acquireOwnedChild(settings: ResolvedSettings, cwd: string, tracer: ControllerTracer, executable: string, launchArgs: readonly string[] = []): LiveOwner {
+export function acquireOwnedChild(settings: ResolvedSettings, cwd: string, tracer: ControllerTracer, executable: string, launchArgs: readonly string[] = [], resume?: NativeResume): LiveOwner {
 	let resolveReady!: (value: { success: boolean; error?: string }) => void;
 	let readySettled = false, setupTimer: ReturnType<typeof setTimeout> | undefined;
 	const ready = new Promise<{ success: boolean; error?: string }>(resolve => { resolveReady = resolve; });
@@ -611,7 +618,7 @@ export function acquireOwnedChild(settings: ResolvedSettings, cwd: string, trace
 		try { tracer.record(event, payload); }
 		catch { runtime.fail("Candidate evidence recording failed"); }
 	};
-	const protocol = createOwnedNativeProtocol({ model: settings.nativeModel, cwd }, {
+	const protocol = createOwnedNativeProtocol({ model: settings.nativeModel, cwd, resume }, {
 		onInit(event) {
 			if (runtime.revoked || runtime.expired || runtime.acquisition !== "spawned") { runtime.fail("Native init has no live acquisition"); return; }
 			owner.conversationId = event.conversationId; owner.isIdle = true;
@@ -629,13 +636,13 @@ export function acquireOwnedChild(settings: ResolvedSettings, cwd: string, trace
 	});
 	Object.defineProperty(runtime, "protocol", { value: protocol, writable: false, configurable: false });
 	owner = { child: null, conversationId: "", launchModel: settings.nativeModel, launchEffort: settings.nativeEffort,
-		canonicalCwd: cwd, sessionId: "", lastAcceptedTurnCount: 0,
+		canonicalCwd: cwd, sessionId: "", lastAcceptedTurnCount: resume?.acceptedCount ?? 0,
 		isIdle: false, closeBarrier: null, runtime };
 	const setupStarted = performance.now();
 	setupTimer = setTimeout(() => runtime.fail("Setup timeout waiting for init"), BOUNDS.SETUP_TIMEOUT_MS);
 	try {
 		tracer.record("spawn_attempt", { cwd, nativeModel: settings.nativeModel, nativeEffort: settings.nativeEffort });
-		const child = spawn(executable, [...launchArgs, "--model", settings.nativeModel, ...(settings.nativeEffort ? ["--effort", settings.nativeEffort] : []),
+		const child = spawn(executable, [...launchArgs, ...(resume ? ["--conversation", resume.conversationId] : []), "--model", settings.nativeModel, ...(settings.nativeEffort ? ["--effort", settings.nativeEffort] : []),
 			"--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands", "--print="],
 			{ shell: false, detached: false, cwd, stdio: ["pipe", "pipe", "pipe"] });
 		owner.child = child;
