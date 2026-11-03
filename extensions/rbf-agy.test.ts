@@ -43,7 +43,7 @@ import { afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createRbfAgy, AGY_PROVIDER, AGY_API, AGY_COPY, AGY_PROVENANCE, readAgyPolicy, readAgyCatalogue, sameAgyPolicy, agyPolicyArgs, projectAgyFooter, projectAgyThinking, type AgyRetirementSeal } from "./rbf-agy.js";
-const roots = process.env.RBF_AGY_TEST_TMP ?? "/Volumes/tom-ssd/tmp/pi-21.8/provider-unit";
+const roots = process.env.RBF_AGY_TEST_ROOT ?? process.env.RBF_AGY_TEST_TMP ?? "/Volumes/tom-ssd/tmp/pi-21.7/provider-unit";
 mkdirSync(roots, { recursive: true });
 const retained: Array<{
 	close(): Promise<void>;
@@ -357,11 +357,11 @@ describe('native result and process truth', () => {
 		expect(body(answer)).toContain('Native permission refused');
 		expect(inputs(h)).toHaveLength(1);
 	});
-	it('labels empty SUCCESS and cumulative denial without claiming an edit', async () => {
+	it('preserves empty SUCCESS and cumulative denial without fabricating an answer', async () => {
 		const h = harness('denial');
 		const answer = await h.request('Task');
 		expect(answer.stopReason).toBe('stop');
-		expect(body(answer)).toContain('SUCCESS with no answer text');
+		expect(body(answer)).not.toContain('SUCCESS with no answer text');
 		expect(body(answer)).toContain('Denied actions (conversation total): EditFile');
 		expect(body(answer)).toContain('do not prove an edit');
 	});
@@ -647,7 +647,7 @@ describe('removed AGY accounting notices', () => {
 		await h.emit('session_start');
 		expect(accounting(h)).toEqual([]);
 		expect(h.ctx.ui.setWidget).toHaveBeenCalledWith('rbf-agy-accounting', undefined);
-		expect(h.ctx.ui.setWidget.mock.calls.every((call: any[]) => ['rbf-agy-accounting', 'rbf-agy-activity', 'rbf-agy-stop'].includes(call[0]))).toBe(true);
+		expect(h.ctx.ui.setWidget.mock.calls.every((call: any[]) => ['rbf-agy-accounting', 'rbf-agy-activity', 'rbf-agy-stop', 'rbf-agy-preview'].includes(call[0]))).toBe(true);
 	});
 });
 const stopWidget = (h: ReturnType<typeof harness>) => h.ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === 'rbf-agy-stop').at(-1)?.[1];

@@ -233,11 +233,11 @@ if (!["protocol-errors", "abort-and-shutdown", "catalogue", "actual-pi-contract"
 if (name === "denied-empty") {
 	for (const label of ["denial80", "denial120"]) {
 		const text = readFileSync(join(out, label + ".txt"), "utf8").replace(/\s+/g, " ");
-		if (["SUCCESS with no answer text", "Denied actions (conversation total): EditFile", "do not prove an edit was applied"].some(copy => !text.includes(copy)))
+		if (["Denied actions (conversation total): EditFile", "do not prove an edit was applied"].some(copy => !text.includes(copy)) || text.includes("SUCCESS with no answer text"))
 			throw new Error("Required denial copy not visible: " + label);
 	}
 	const answer = lastAssistant(turns[0]);
-	if (answer?.stopReason !== "stop" || !assistantText(answer).includes("SUCCESS with no answer text") || !assistantText(answer).includes("Denied actions (conversation total): EditFile") || !assistantText(answer).includes("do not prove an edit was applied"))
+	if (answer?.stopReason !== "stop" || assistantText(answer).includes("SUCCESS with no answer text") || !assistantText(answer).includes("Denied actions (conversation total): EditFile") || !assistantText(answer).includes("do not prove an edit was applied"))
 		throw new Error("Empty-success/denial disclosure false");
 }
 if(name==="settings-change")for(const label of ["settings-refusal80","settings-refusal120"]){if(!readFileSync(join(out,label+".txt"),"utf8").replace(/\s+/g," ").includes("settings differ"))throw new Error("Settings refusal not visible: "+label);}

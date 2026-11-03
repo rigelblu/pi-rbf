@@ -1,0 +1,54 @@
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { isAbsolute, join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createRbfAgy, parseAgyCatalogue, toAgyProviderModel } from "../rbf-agy.js";
+import { createAgyStreamFixture } from "./agy-stream-fixture.js";
+
+export default function (pi: ExtensionAPI) {
+ let enabled = false, nativeTerminal = false;
+ const root = process.env.RBF_AGY_STREAM_ROOT;
+ const log = (data: Record<string, unknown>) => {
+  if (!root) return;
+  appendFileSync(join(root,"host.jsonl"),JSON.stringify({at:Date.now(),...data})+"\n");
+ };
+ // Register refusal before setup: a failed fake cannot expose another provider.
+ pi.on("input",(_event,ctx)=>enabled && ctx.model?.provider==="agy-harness" ? {action:"continue"} : {action:"handled"});
+ try {
+  if(!root || !isAbsolute(root) || !existsSync(join(root,"offline-profile"))) throw new Error("Missing exclusive offline test profile");
+  const scenario=process.env.RBF_AGY_STREAM_SCENARIO ?? "normal";
+  const fake=createAgyStreamFixture(root,scenario,Number(process.env.RBF_AGY_STREAM_HOLD_MS ?? 1800));
+  // Supply a fake startup cache; streaming/admission remain the production factory's handlers.
+  const cachedModels=parseAgyCatalogue("gemini-3.8-flash-low\tFlash (low)\ngemini-3.8-flash-medium\tFlash (medium)\ngemini-3.8-flash-high\tFlash (high)").map(toAgyProviderModel);
+  const factoryPi={...pi,registerProvider:(name:string,config:any)=>pi.registerProvider(name,{...config,models:cachedModels})} as ExtensionAPI;
+  createRbfAgy({executable:fake.executable,argv:[],seal:{},trace(event,data){if(event==="native_result")nativeTerminal=true;log({kind:"trace",event,...data});}})(factoryPi);
+  enabled=true;
+ } catch(error) {
+  log({kind:"setup_error",message:String(error)});
+  pi.on("session_start",(_event,ctx)=>ctx.ui.notify("Offline AGY candidate setup failed. All prompts are blocked.","error"));
+ }
+ const text=(message:any)=>message.content?.filter((b:any)=>b.type==="text").map((b:any)=>b.text).join("\n") ?? "";
+ pi.on("message_update",event=>{
+  if(event.message.role!=="assistant")return;
+  const value=text(event.message);
+  log({kind:"update",text:value});
+  if(value&&!nativeTerminal)log({kind:"preview",text:value});
+ });
+ pi.on("message_end",event=>{if(event.message.role==="assistant")log({kind:"final",text:text(event.message),stopReason:event.message.stopReason});});
+ pi.on("agent_end",()=>log({kind:"agent_end"}));
+ pi.on("session_start",(_event,ctx)=>{
+  // Discovery completes after session_start; keep input guarded until the fake model is selected.
+  void (async()=>{
+   const deadline=Date.now()+8000;
+   while(enabled && Date.now()<deadline){
+    const model=ctx.modelRegistry.find("agy-harness","gemini-3.8-flash");
+    if(model && (ctx.model?.provider===model.provider && ctx.model?.id===model.id || await pi.setModel(model))){
+     log({kind:"ready",enabled,model:model.provider+"/"+model.id,loaded:ctx.sessionManager.getBranch().filter((e:any)=>e.type==="message"&&e.message.role==="assistant").map((e:any)=>{const value=text(e.message);return{bytes:Buffer.byteLength(value),sha256:createHash("sha256").update(value).digest("hex"),stopReason:e.message.stopReason};})});
+     return;
+    }
+    await new Promise(resolve=>setTimeout(resolve,25));
+   }
+   enabled=false;log({kind:"setup_error",message:"Fake model discovery/selection did not complete"});
+  })().catch(error=>{enabled=false;log({kind:"setup_error",message:String(error)});});
+ });
+}

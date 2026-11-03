@@ -378,6 +378,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 		} | undefined, policy: AgyPolicy | undefined, policyError: string | undefined, policyFile: unknown;
 		let lastMessageTimestamp = 0;
 		let activeRequest: symbol | undefined;
+		let revokePublication: ((closeStream?: boolean) => void) | undefined;
 		let catalog: ProviderModelConfig[] = [], ui: ReturnType<typeof installAgyUi> | undefined;
 		const attempted = new Set<string>();
 		// Local refusal pairs are trusted only after this factory observes their exact
@@ -431,8 +432,9 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				ui = undefined;
 			}
 		};
-		async function retire(captured = owner): Promise<boolean> {
+		async function retire(captured = owner, closePublication = true): Promise<boolean> {
 			if (captured === owner) {
+				if (closePublication) revokePublication?.();
 				generation++;
 				phase = "ended";
 				pending = undefined;
@@ -459,6 +461,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				if (ctx?.mode === "tui") {
 					ctx.ui.setStatus("rbf-agy", undefined);
 					ctx.ui.setWidget("rbf-agy-activity", undefined);
+					ctx.ui.setWidget("rbf-agy-preview", undefined);
 				}
 			}
 			catch { }
@@ -493,29 +496,60 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 			let cancelSetup: (() => void) | undefined;
 			const currentScope = () => epoch === generation && ctx?.sessionManager.getSessionId() === callSession;
    const live = () => currentScope() && selected() && !streamOptions?.signal?.aborted;
-			const finish = (text: string, error = false, aborted = false) => {
-				if (finished)
-					return;
-				finished = true;
-				const clean = sanitizeDisplayText(text);
-				message.stopReason = aborted ? "aborted" : error ? "error" : "stop";
-				if (error)
-					message.errorMessage = clean;
-				const snap = () => ({ ...message, content: message.content.map(c => ({ ...c })) });
+			let started = false, publicationRevoked = false, preview = "", previewBytes = 0, previewPaused = false, previewClipped = false;
+			const snap = () => ({ ...message, content: message.content.map(c => ({ ...c })) });
+			const startText = () => {
+				if (started) return;
+				started = true;
 				message.content = [];
 				stream.push({ type: "start", partial: snap() });
 				message.content = [{ type: "text", text: "" }];
 				stream.push({ type: "text_start", contentIndex: 0, partial: snap() });
+			};
+			const finish = (text: string, error = false, aborted = false) => {
+				if (finished) return;
+				finished = true;
+				const clean = sanitizeDisplayText(text), wasStarted = started;
+				message.stopReason = aborted ? "aborted" : error ? "error" : "stop";
+				if (error) message.errorMessage = publicationRevoked ? AGY_COPY.ended : clean;
+				startText();
 				message.content = [{ type: "text", text: clean }];
 				if (error && !nativeAttempted && owner?.isIdle && phase === "ready" && requestUser && callSession === sessionId && refusalEntries.size < 64)
 					pendingRefusal = { fingerprint: fingerprint(message), userId: requestUser.id, userFingerprint: requestUser.fingerprint, epoch: generation, sid: sessionId };
-				stream.push({ type: "text_delta", contentIndex: 0, delta: clean, partial: snap() });
+				if (!wasStarted && clean) stream.push({ type: "text_delta", contentIndex: 0, delta: clean, partial: snap() });
+				// text_end replaces provisional content; concatenating deltas is not the final answer.
 				stream.push({ type: "text_end", contentIndex: 0, content: clean, partial: snap() });
-				if (error || aborted)
-					stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
-				else
-					stream.push({ type: "done", reason: "stop", message });
+				if (error || aborted) stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
+				else stream.push({ type: "done", reason: "stop", message });
 				stream.end();
+			};
+			const revokeAnswer = (closeStream = true) => {
+				publicationRevoked = true;
+				// Close now, while handling departure; cleanup must not publish into its destination.
+				if (closeStream) finish("", true);
+			};
+			const incomplete = (reason: string) => preview
+				? "Incomplete AGY answer\n" + (previewClipped ? "Only part of the streamed text was retained.\n" : "") + "\n" + preview + "\n\n" + reason
+				: reason;
+			const response = (text: string) => {
+				if (finished || publicationRevoked || !live()) return;
+				const bytes = Buffer.from(text, "utf8");
+				if (previewPaused) { previewClipped ||= bytes.length > 0; return; }
+				let end = Math.min(bytes.length, BOUNDS.DISPLAY_ANSWER_RESERVE_BYTES - previewBytes);
+				while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
+				const delta = bytes.subarray(0, end).toString("utf8");
+				previewBytes += end;
+				previewClipped ||= end < bytes.length;
+				if (delta) {
+					startText(); preview += delta;
+					message.content = [{ type: "text", text: preview }];
+					stream.push({ type: "text_delta", contentIndex: 0, delta, partial: snap() });
+					ctx!.ui.setStatus("rbf-agy", "AGY — responding");
+				}
+				if (previewClipped || previewBytes === BOUNDS.DISPLAY_ANSWER_RESERVE_BYTES) {
+					previewPaused = true;
+					ctx!.ui.setWidget("rbf-agy-preview", ["AGY answer preview paused.", "The complete answer will appear when the task finishes."]);
+				}
 			};
 			void (async () => {
 				try {
@@ -570,6 +604,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 						throw new Error("AGY request cancelled before input. Your message was not sent.");
 					claimed = true;
 					activeRequest = reservation;
+					revokePublication = revokeAnswer;
 					workingOwner = owner;
 					phase = "starting";
 					ctx!.ui.setStatus("rbf-agy", "AGY — starting");
@@ -600,7 +635,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 						// Setup already owns a child; cancellation retires that exact acquisition
 						// instead of waiting for its native init timeout before acting.
 						const acquired = owner;
-						cancelSetup = () => { void retire(acquired).catch(() => { }); };
+						cancelSetup = () => { void retire(acquired, false).catch(() => { }); };
 						streamOptions?.signal?.addEventListener("abort", cancelSetup, { once: true });
 						if (streamOptions?.signal?.aborted)
 							cancelSetup();
@@ -649,21 +684,22 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 							historyFailed = true;
 							throw new Error(AGY_HISTORY_FAILURE);
 						}
-					});
+					}, response);
+					if (finished) return;
 					sent = !result.notSent;
 					if (!result.success) {
-						await retire(workingOwner);
+						await retire(workingOwner, false);
 						const classification = workingOwner?.settledOutcome?.classification;
 						const verified = classification === "clean" || classification === "verified-interrupted";
-						const reason = historyFailed ? AGY_HISTORY_FAILURE + "\nThe task may already have run. Do not retry automatically." : result.cancelled ? "AGY request cancelled." : result.usage ? `AGY error: ${result.error ?? "Native request failed."}` : sent ? AGY_COPY.protocol : AGY_COPY.startup;
-						finish(reason + "\n" + (verified ? AGY_COPY.stopped : AGY_COPY.stopUnknown), true, !!result.cancelled);
+						const reason = historyFailed ? AGY_HISTORY_FAILURE + "\nThe task may already have run. Do not retry automatically." : result.limitExceeded ? "AGY response exceeded the supported output limit. The answer is incomplete." : result.cancelled ? "AGY request cancelled." : result.usage ? `AGY error: ${result.error ?? "Native request failed."}` : sent ? AGY_COPY.protocol : AGY_COPY.startup;
+						finish(incomplete(reason + "\n" + (verified ? AGY_COPY.stopped : AGY_COPY.stopUnknown)), true, !!result.cancelled);
 						return;
 					}
-					let answer = result.answer ?? "AGY returned SUCCESS with no answer text.";
+					let answer = result.answer ?? "";
 					if (result.denials?.length)
 						answer += "\n\nDenied actions (conversation total): " + result.denials.join(", ") + ".\nThese diagnostics do not prove an edit was applied.";
 					if (!live()) {
-						await retire(workingOwner);
+						await retire(workingOwner, false);
 						const classification = workingOwner?.settledOutcome?.classification;
 						const verified = classification === "clean" || classification === "verified-interrupted";
 						finish(answer + "\n\n" + (verified ? AGY_COPY.stopped : AGY_COPY.stopUnknown));
@@ -679,21 +715,23 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					const text = error instanceof Error ? error.message : "AGY request failed.";
 					if (claimed && workingOwner) {
 						if (createdOwner || nativeAttempted || !workingOwner.isIdle || streamOptions?.signal?.aborted || !selected() || ctx?.sessionManager.getSessionId() !== callSession || phase === "ended" || workingOwner !== owner)
-							await retire(workingOwner);
+							await retire(workingOwner, false);
 						else
 							phase = "ready";
 					}
 					else if (claimed && epoch === generation && phase === "starting")
 						phase = "unused";
-					finish(text, true, !!streamOptions?.signal?.aborted);
+					finish(incomplete(text), true, !!streamOptions?.signal?.aborted);
 				}
 				finally {
 					if (cancelSetup)
 						streamOptions?.signal?.removeEventListener("abort", cancelSetup);
 					if (claimed && ctx?.sessionManager.getSessionId() === callSession && (!workingOwner || owner === workingOwner))
 						clearActivity();
-					if (activeRequest === reservation)
+					if (activeRequest === reservation) {
 						activeRequest = undefined;
+						if (revokePublication === revokeAnswer) revokePublication = undefined;
+					}
 				}
 			})().catch(() => finish("AGY provider failed. The task outcome may be unknown. No automatic retry is allowed.", true));
 			return stream;
@@ -733,6 +771,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				await retire();
 			else if (phase === "starting" && (previous?.provider !== event.model.provider || previous?.id !== event.model.id)) {
 				if (owner) {
+					revokePublication?.(false);
 					generation++;
 				}
 				else

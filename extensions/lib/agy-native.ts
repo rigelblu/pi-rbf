@@ -504,7 +504,7 @@ export function createOwnedNativeProtocol(expected: { model: string; cwd: string
 
 interface OwnedTurnResult {
 	success: boolean; answer?: string; error?: string; denials?: string[]; activity?: string;
-	cancelled?: boolean; outcome?: CleanupOutcome; notSent?: boolean; fresh?: boolean;
+	cancelled?: boolean; limitExceeded?: boolean; outcome?: CleanupOutcome; notSent?: boolean; fresh?: boolean;
 	durationSeconds?: number; usage?: NativeUsage;
 	}
 interface OwnedTurn {
@@ -768,6 +768,7 @@ export function executeTurn(
 	onUpdate: AgentToolUpdateCallback<unknown> | undefined, preview: string, tracer: ControllerTracer,
 	canPublish: () => boolean, canPublishStopping: () => boolean, fresh = false,
 	onToolObservation?: (event: Extract<NativeEvent, { kind: "tool" }>) => void,
+	onResponse?: (text: string) => void,
 ): Promise<OwnedTurnResult> {
 	const r = owner.runtime, child = owner.child;
 	if (!r || !child || r.revoked || owner.closeBarrier || !child.stdin || r.turn && !r.turn.settled)
@@ -782,7 +783,14 @@ export function executeTurn(
 		try { onUpdate({ content: [{ type: "text", text: formatRow(state, preview, fresh ? FIXED_NOTICES.freshDisclosure : undefined) }], details: { state, task: prompt, activity: body } }); }
 		catch { if (state !== "stopping") turn.fail("Pi progress delivery failed"); }
 	};
+	const publishResponse = (text: string) => {
+		if (!text || !onResponse || !turn.updatesAllowed || turn.settled || r.revoked) return;
+		if (!canPublish()) { turn.fail("Pi dispatch authority changed"); return; }
+		try { onResponse(text); } catch { turn.fail("Pi answer delivery failed"); }
+	};
 	const finish = (value: OwnedTurnResult) => {
+		if (turn.settled) return;
+		publishResponse(turn.sanitizer.finish());
 		if (turn.settled) return;
 		if (turn.writeAttempted && !turn.writerSettled && !turn.uncertaintyRecorded) {
 			turn.uncertaintyRecorded = true;
@@ -790,7 +798,6 @@ export function executeTurn(
 		}
 		turn.updatesAllowed = false; turn.settled = true;
 		signal?.removeEventListener("abort", abort); clearTimeout(writeDeadlineTimer);
-		appendOwnedActivity(turn, turn.sanitizer.finish());
 		value.notSent = !turn.writeAttempted; value.fresh = fresh;
 		value.activity = (turn.activityClipped ? "[activity truncated]\n" : "") + turn.activity;
 		if (owner.closeBarrier) void owner.closeBarrier.then(outcome => resolve({ ...value, outcome, denials: turn.terminal?.deniedActions?.map(deniedActionName) ?? value.denials }));
@@ -800,11 +807,11 @@ export function executeTurn(
 	const failAndRetire = (reason: string, cancelled: boolean) => {
 		if (turn.settled) return;
 		turn.updatesAllowed = false;
-		revokedResult = { success: false, error: reason, ...(cancelled ? { cancelled: true } : {}) };
+		revokedResult = { success: false, error: reason, ...(cancelled ? { cancelled: true } : {}), ...(reason === "Native stdout/frame byte limit exceeded" ? { limitExceeded: true } : {}) };
 		const barrier = closeChildProcess(owner);
 		// Close revokes the request synchronously, so waiting on retirement here
 		// cannot deadlock the resource predicate that also requires settlement.
-		finish({ success: false, error: reason, ...(cancelled ? { cancelled: true } : {}) });
+		finish(revokedResult);
 		void barrier;
 	};
 	const commit = () => {
@@ -814,8 +821,8 @@ export function executeTurn(
 		const denials = terminal.deniedActions?.map(deniedActionName);
 		const run = { denials, durationSeconds: terminal.durationSeconds, usage: terminal.usage };
 		if (terminal.status === "SUCCESS") {
-			const answer = clipDisplayAnswer(terminal.response!).text;
-			finish({ success: true, answer: answer || FIXED_NOTICES.emptySuccess, ...run });
+			const answer = sanitizeDisplayText(terminal.response!);
+			finish({ success: true, answer, ...run });
 		} else finish({ success: false, error: clipDisplayAnswer(terminal.error!).text || FIXED_NOTICES.taskErrorFallback, ...run });
 	};
 	const abort = () => {
@@ -829,8 +836,11 @@ export function executeTurn(
 		onEvent(event) {
 			if (turn.settled || !turn.updatesAllowed || r.revoked) return;
 			let text = "";
-			if (event.kind === "response" && event.textDelta !== undefined) text = turn.sanitizer.feed(event.textDelta);
-			else if (event.kind === "tool") {
+			if (event.kind === "response" && event.textDelta !== undefined) {
+				publishResponse(turn.sanitizer.feed(event.textDelta));
+				return;
+			}
+			if (event.kind === "tool") {
 				// Only the owned protocol can deliver this callback; its failure retires this turn.
 				onToolObservation?.(event);
 				if (turn.settled || r.revoked) return;
