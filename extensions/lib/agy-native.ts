@@ -1,5 +1,5 @@
-// Native stream-json framing, owned process and bounded cleanup reused from the
-// retained pi-21 tool candidate. No Pi registration, tool grammar or recovery API.
+// AGY native process layer used by the provider: version check, owned child
+// process, one turn execution, and bounded cleanup.
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -7,7 +7,7 @@ import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 
 export interface ControllerTracer { record(event: string, payload: Record<string, unknown>): void }
 export interface ResolvedSettings { nativeModel: string; nativeEffort?: string }
-const FIXED_NOTICES = { emptySuccess:"AGY returned SUCCESS with no answer text.", taskErrorFallback:"AGY returned an error.", freshDisclosure:"Commands the earlier conversation started may still run alongside this one." };
+const FIXED_NOTICES = { taskErrorFallback:"AGY returned an error.", freshDisclosure:"Commands the earlier conversation started may still run alongside this one." };
 function formatRow(state: string, _preview?: string, _body?: string): string { return `AGY — ${state}`; }
 export const BOUNDS = {
 	MAX_PROMPT_BYTES: 256 * 1024,
