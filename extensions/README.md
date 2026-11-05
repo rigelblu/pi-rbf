@@ -825,44 +825,84 @@ Local Pi extension that restores exact logical lines when selecting and copying 
   ```
 - Removal & rollback: restore the backed-up `rbf-clean-markdown-code.ts`, `rbf-tool-parts-indent.ts` and `rbf-path-labels.ts`; delete `rbf-copy-wrapped-text.ts` if it was absent before installation. Then fully restart Pi. Restore the whole four-file installation together; no settings or stored sessions migrate.
 
-# 🔵⋯ AGY provider candidate
-The pi-21.1 candidate adds `agy-harness` alongside Pi's normal providers. Provider513ccab2 and native libraryf830f833 are installed locally for Tom’s dogfooding on2026-11-02; they remain unreleased. Regular Pi now loads the provider and existing `/effort` alias after a full restart. [Installation and rollback](../rb-drive/agents/v0.x/test-results/pi-21-remove-accounting-notices-2026-11-02/README.md). Load `rbf-agy.ts` together with its relative dependency `lib/agy-native.ts` in an isolated daily Pi1.4.0 TUI; project0.85.1 remains the compile/fixture dependency. The retained `rbf-controlled-agy.ts` is the earlier tool route.
+# 🔵⋯ rbf-agy
 
-Use an `enabledModels` filter such as `"agy-harness/*"`. No placeholder is listed. A cold profile has no AGY work models until discovery finishes. Open `/model`, wait for `Model catalogs refreshed.`, press Tab from Scoped to All, then filter the full provider/model name, for example `agy-harness/gemini-3.8-flash`. Select a supported `/thinking` level and type an ordinary task. The current catalogue offers four low/medium/high families and one fixed GPT-OSS row; unsupported levels are unavailable. Native metadata discovery makes no model request. A first selection after other-provider history starts cold and says so.
+## 🟠⋯ Overview
+Local Pi provider extension integrating Google Antigravity (AGY) as an `agy-harness` provider alongside Pi's built-in providers. It manages an owned native child process, streams model responses, renders tool activity in the TUI, persists complete turn records to Pi session history, and supports clean-turn recovery across `/reload` or full Pi restarts.
 
-Only the newly admitted text goes to the owned native AGY child. A confirmed persisted assistant anchor permits a same-child follow-up. Model/effort changes require `/new`; tree departures, fork/resume/reload and copied provenance cannot revive native context. Pi summaries/compaction and automatic retries cannot replay native input. Native tools remain AGY-owned activity rather than Pi tool calls.
+The implementation consists of four files:
+- `extensions/rbf-agy.ts` — provider registration, model catalogue discovery, streaming lifecycle, and TUI presentation
+- `extensions/lib/agy-native.ts` — native child process management and turn execution
+- `extensions/lib/agy-history.ts` — bounded activity capture, schema validation, and history rendering
+- `extensions/lib/agy-recovery.ts` — session file verification, recovery checkpoint selection, and branch fingerprinting
 
-Native AGY owns its existing authentication and policy. With no `--agy-settings`, the provider adds no native permission/sandbox override. An explicitly chosen absolute user-owned JSON file is validated/frozen and passed as native settings; changed/invalid files refuse. No credential copy, generated grant, global policy edit or denied-action retry occurs. The tested accept-edits configuration remains an opt-in real-trial decision.
+## 🟠⋯ Capabilities & Behavior
 
-`AGY context: unknown` replaces unknown capacity/price metrics. The two recurring token/cost notices are removed. AGY tokens/cost remain untracked in Pi, and its numeric totals still exclude AGY. Native usage is cumulative conversation data, not per-turn Pi accounting. Existing neighbor statistics remain unchanged. Cleanup concerns only the owned handle: positive or unverified stop copy still warns that commands AGY started may be running.
+### 🟣⋯ Model and Effort Selection
+- **Provider ID:** `agy-harness`
+- **Model discovery:** configure Pi `enabledModels` with `"agy-harness/*"`. On cold start, open `/model`, wait for `Model catalogs refreshed.`, press `Tab` to switch from Scoped to All, and filter for `agy-harness/`.
+- **Catalogue resolution:** four low/medium/high families resolve to exact native model/effort combinations (`gemini-4-argon`, `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`), plus one fixed row (`gpt-oss-120b-medium`) with no effort parameter, reaching 13 exact native targets.
+- **Effort adjustment:** change effort via Pi `/thinking <level>` or `/effort <level>` before dispatching a task. Unsupported effort levels or changes during an active conversation refuse; switch models or effort with `/new`.
 
-The focused fake suite has104passing tests and strict TypeScript PASS; actual daily-Pi fake-only cases are indexed in [the final receipt](../rb-drive/agents/v0.x/test-results/pi-21-provider-redesign-2026-11-02/final-offline-proof/README.md). Real C8/H1 needs a new named request budget and policy choice. H3 is a read-only monochrome capture review. No real prompt, installation or release is authorized by these instructions. Candidate rollback means ending only its owned test session; daily extensions/settings/auth were not changed. Later delivery requires its own authority, exact backups and both provider files.
+### 🟣⋯ Turn Execution and Direct Prompt Path
+- **Direct input:** only newly admitted prompt text is sent to the owned native AGY child process. Prompts, system instructions, and prior turns are never replayed or forwarded as synthetic context.
+- **Native execution:** tools run inside native AGY rather than as Pi tool calls. Native tool observations are captured as bounded AGY activity.
+- **Authentication & policy:** native AGY owns its authentication and credentials. With no `--agy-settings`, the provider applies no permission or sandbox override.
+- **Optional settings:** `--agy-settings <absolute-file>` specifies a JSON file validated and frozen on startup. It must be a regular file you own, not writable by group or others, and at most 64 KiB. You may edit it. Changes to the settings file during a session refuse further input until `/new`.
 
-# 🔵⋯ AGY clean-turn recovery preview — pi-21.4
+### 🟣⋯ Streaming and Incomplete Output
+- **Real-time streaming:** assistant output streams live into the TUI. Upon completion, the finalized text replaces the preview and is saved whole, even when it is empty.
+- **Preview size cap:** the live preview holds at most 128 KiB. Past that, the preview stops growing and shows `AGY answer preview paused`. AGY keeps running, and the final answer is still saved whole when the task finishes.
+- **Incomplete markings:** error, cancelled, and over-limit answers are visibly labeled `Incomplete AGY answer` so incomplete text is never confused with a verified completion.
 
-Run `bash /Volumes/tom-ssd/src/worktrees/pi-rbf/pi-21.4/rbf/scripts/pi-21.4-preview.sh`.
-This opens an isolated Pi profile and empty workspace with the candidate extension.
-Launch submits no task. Select `/model agy-harness/gemini-3.8-flash`; thinking is `low`.
-The preview uses native AGY authentication and permissions. It does not install the candidate.
+### 🟣⋯ History and Reports
+- **Saved reports:** AGY's tool steps are saved in the Pi session file on this machine and shown in history. They show what AGY reported doing, not a checked outcome.
+- **Inspection:** press `Ctrl+O` (Pi's `app.tools.expand`) to expand and collapse tool output, including AGY's saved reports. It applies to all tool output at once, not one row.
+- **Viewing vs resume:** viewing historical reports does not require an active native child or native continuity.
+- **Limits:** a turn that stops early keeps only the steps reported so far. Sessions from before this release have no saved reports.
 
-After a native `SUCCESS`, Pi must save both the matching answer and recovery checkpoint.
-Ordinary `/reload` and reopening that exact saved Pi session can then resume its native conversation.
-Only the newly submitted text is sent. Prior prompts, answers and tools are never replayed.
-After `/quit`, use the launcher's `--session /absolute/saved-preview.jsonl` recipe.
+### 🟣⋯ Clean-Turn Recovery
+- **Session resumption:** after a clean turn completes, `/reload` or reopening the same saved Pi session resumes the same AGY conversation in a new child process. Prior turns are never replayed.
+- **One Pi per conversation:** Pi is the only writer AGY's history is checked against. Keep each AGY conversation in one Pi process, and don't continue it in AGY's own app.
+- **What AGY can't follow:** AGY keeps one conversation per Pi branch. After `/fork`, a `/tree` move, or switching to a copied session file, the next AGY message is refused, and `/new` starts a fresh conversation. Pi's `/compact` is cancelled while an AGY model is selected.
+- **Integrity checks:** session verification matches exact cumulative turn count, step frontier, and branch history.
+- **Foreign entries:** other extensions' plain custom entries appended to the session log do not disrupt branch verification or end the AGY conversation.
+- **Refusals & checkpoints:** incomplete turns, legacy sessions, or unconfirmed checkpoints cannot resume. If a checkpoint cannot be confirmed on disk, Pi issues a warning that recovery may be unavailable.
 
-Keep **one active Pi process per native conversation**, with Pi as its only writer.
-Other native clients, historical branches and whole-file rollback are outside this preview's scope.
-Recovery compares local saved evidence, the exact returned native ID, settings, cumulative turn count and step frontier.
-It does not independently inspect native history before input or provide a cross-process lock.
-Metrics remain unknown. Legacy provenance-only sessions, changed or copied session files,
-image history, incomplete completion evidence and possible-write gaps refuse continuation.
+### 🟣⋯ Context and Stop Disclosures
+- **Usage truth:** context metrics show `AGY context: unknown`; AGY token usage is cumulative native session data and is not converted into artificial Pi token totals.
+- **Idle stop notice:** stopping an idle child warns that commands started by AGY may still be running in the background.
 
-A zero-write refusal can be crossed only through its exact saved certificate and a later new request.
-An unknown outcome requires checking changes and running commands before starting new work with `/new`.
-If the answer is visible but checkpoint saving cannot be confirmed, Pi warns that recovery may be unavailable.
-The current factory closes admission; a later load may qualify fully surviving evidence after fresh validation and sync.
+## 🟠⋯ Setup & Verification
+- Compile target is Pi 0.85.1; runtime target is Pi 1.4.0 TUI.
+- Automated verification covers 340 unit and protocol tests, 3 host verification scripts, and 15 offline contract scenarios with zero real AGY network or model requests.
 
-Pi can repair a complete valid JSON tail's missing final newline before the extension loads.
-The extension validates the bytes it then sees, not the original pre-load bytes; partial/malformed records still refuse.
-The preview's explicit `--session` recipe checks the raw file before Pi opens it.
-Real native continuation and recognition of the same work remain the human verification step.
+## 🟠⋯ Installation & Rollback
+
+### 🟣⋯ Global Installation
+1. Finish or stop any active AGY turn in Pi, ensuring no native child process is running.
+2. Back up existing installed files in `~/.pi/agent/extensions/`. `cp -n` never overwrites a backup, so a second install keeps the first backup:
+   ```bash
+   cp -n ~/.pi/agent/extensions/rbf-agy.ts ~/.pi/agent/extensions/rbf-agy.ts.bak
+   cp -n ~/.pi/agent/extensions/lib/agy-native.ts ~/.pi/agent/extensions/lib/agy-native.ts.bak
+   ```
+3. Copy all four files into place:
+   ```bash
+   mkdir -p ~/.pi/agent/extensions/lib
+   cp ./extensions/rbf-agy.ts ~/.pi/agent/extensions/rbf-agy.ts
+   cp ./extensions/lib/agy-native.ts ~/.pi/agent/extensions/lib/agy-native.ts
+   cp ./extensions/lib/agy-history.ts ~/.pi/agent/extensions/lib/agy-history.ts
+   cp ./extensions/lib/agy-recovery.ts ~/.pi/agent/extensions/lib/agy-recovery.ts
+   for f in rbf-agy.ts lib/agy-native.ts lib/agy-history.ts lib/agy-recovery.ts; do cmp -s "extensions/$f" "$HOME/.pi/agent/extensions/$f" && echo "ok $f" || echo "MISMATCH $f"; done
+   ```
+   Run it from the repo root. Every line must start with `ok`.
+4. Fully restart Pi.
+
+### 🟣⋯ Rollback
+1. Restore the backed-up files and remove the new libraries:
+   ```bash
+   cp ~/.pi/agent/extensions/rbf-agy.ts.bak ~/.pi/agent/extensions/rbf-agy.ts
+   cp ~/.pi/agent/extensions/lib/agy-native.ts.bak ~/.pi/agent/extensions/lib/agy-native.ts
+   rm -f ~/.pi/agent/extensions/lib/agy-history.ts ~/.pi/agent/extensions/lib/agy-recovery.ts
+   ```
+2. Fully restart Pi. Your saved messages stay readable. The older provider can't resume from the new checkpoints and doesn't draw saved AGY reports.
