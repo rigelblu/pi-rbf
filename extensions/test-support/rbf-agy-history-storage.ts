@@ -2,10 +2,12 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, realpathSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { captureAgyActivity, recordAgyActivity, newAgyActivityBudget, AGY_ACTIVITY, type AgyHistoryGuard, type AgyObservationScope, type NativeToolObservation } from "../lib/agy-history.js";
 
-const base = execFileSync("bash", [join(process.env.HOME!, ".agents/skills/eng-use-external-tmp/scripts/resolve-external-tmp.sh"), "pi-21.8"], { encoding: "utf8" }).trim();
+const base = process.env.RBF_AGY_TEST_ROOT ?? tmpdir();
+mkdirSync(base, { recursive: true });
 const root = join(base, "storage-" + Date.now()); mkdirSync(root);
 const executable = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
 const target = readFileSync(executable, "utf8").split("# cmd-shim-target=")[1]?.trim();

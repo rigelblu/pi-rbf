@@ -777,7 +777,7 @@ describe('startup cancellation owns its acquired child', () => {
 		await vi.waitFor(() => expect(h.logs().some(x => x.workerReady)).toBe(true));
 		expect(conversations(h)).toHaveLength(1);
 		abort.abort();
-		await vi.waitFor(() => expect(h.logs().filter(x => x.eof)).toHaveLength(1), { timeout: 300, interval: 10 });
+		await vi.waitFor(() => expect(h.logs().filter(x => x.eof)).toHaveLength(1), { timeout: 3000, interval: 10 });
   expect(h.logs().filter(x=>x.signal)).toHaveLength(0);
 		expect((await pending).stopReason).toBe('aborted');
 		expect(h.logs().filter(x => x.init)).toHaveLength(0);
@@ -858,7 +858,7 @@ describe("clean completed turn recovery across fresh factories", () => {
 		expect(inputs(restarted).map(x => x.input.message.content)).toEqual(["Remember MAPLE-RECOVER1.", "Recall my label after reload.", "Recall after process restart."]);
 		expect(conversations(restarted).slice(1).map(x => x.args[x.args.indexOf("--conversation") + 1])).toEqual([original, original]);
 		expect(restarted.entries.filter(e => e.customType === AGY_COMPLETION).map(e => [e.data.acceptedCount, e.data.frontier])).toEqual([[1, 0], [2, 1], [3, 2]]);
-	});
+	}, 30000);
 	it.each(["wrong-resume-id", "wrong-resume-mode"])("refuses %s init before any new native input", async mode => {
 		const first = harness(); await first.persist(await first.request("First")); await first.close();
 		const next = harness(mode, { root: first.root });

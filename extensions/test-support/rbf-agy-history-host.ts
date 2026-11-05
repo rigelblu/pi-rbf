@@ -2,13 +2,15 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseAgyCatalogue, toAgyProviderModel, AGY_API, AGY_PROVIDER } from "../rbf-agy.js";
 import { replayScreen } from "./rbf-pty-screen.js";
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), support = join(workspace, "extensions/test-support");
-const base = execFileSync("bash", [join(process.env.HOME!, ".agents/skills/eng-use-external-tmp/scripts/resolve-external-tmp.sh"), "pi-21.8"], { encoding: "utf8" }).trim();
+const base = process.env.RBF_AGY_TEST_ROOT ?? tmpdir();
+mkdirSync(base, { recursive: true });
 const caseName = process.env.RBF_AGY_HISTORY_CASE ?? "host";
 if (!/^host(?:-[a-zA-Z0-9-]+)?$/.test(caseName)) throw new Error("Invalid isolated host case name");
 const root = join(base, caseName), profile = join(root, "profile"), sessions = join(root, "sessions");

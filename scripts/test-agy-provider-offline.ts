@@ -22,7 +22,7 @@ if (!["off", "before", "after"].includes(statusOrder))
 if (statusOrder !== "off" && name !== "presentation-and-usage")
 	throw new Error("Status composition belongs to the presentation case");
 const statusFile = statusOrder === "off" ? undefined : realpathSync(args.get("--status-extension") ?? "");
-const sourceFiles = [candidate, join(dirname(candidate), "lib/agy-native.ts"), ...(statusFile ? [statusFile] : [])];
+const sourceFiles = [candidate, join(dirname(candidate), "lib/agy-native.ts"), join(dirname(candidate), "lib/agy-history.ts"), join(dirname(candidate), "lib/agy-recovery.ts"), ...(statusFile ? [statusFile] : [])];
 const sourceHashes = () => Object.fromEntries(sourceFiles.map(file => [file, createHash("sha256").update(readFileSync(file)).digest("hex")]));
 const beforeHashes = sourceHashes();
 reserveAgyOfflineRoot(out); // refuse stale profile/auth/receipt reuse before any child process
@@ -274,7 +274,11 @@ else if (conversations.some(c => c.args.includes("--settings") || c.args.include
 if(name === "lifecycle-guards") {
  const actions=events.filter(x=>x.event==="lifecycle").map(x=>x.action);
  if(["current","summary","return","fork","resume","copy"].some(action=>!actions.includes(action))||!events.some(x=>x.event==="test_compact_before"&&x.reason==="manual")||!events.some(x=>x.event==="compact_result"&&x.outcome==="error"&&/cancelled/i.test(x.error))||!events.some(x=>x.event==="test_tree_before"&&x.summary))throw new Error("Public lifecycle/summary/compact controls not exercised");
- if(turns.length!==8||turns.slice(3).some(turn=>{const t=assistantText(lastAssistant(turn));return lastAssistant(turn)?.stopReason!=="error"||!t.includes("Your message was not sent.")||!(t.includes("context has ended")||t.includes("history no longer matches this Pi branch"));}))throw new Error("Tree/fork/saved/copy context refusal false");
+	if (turns.length !== 8 || turns.slice(3).some((turn, i) => {
+		const a = lastAssistant(turn), t = assistantText(a);
+		const expected = i < 2 ? "context has ended" : "history no longer matches this Pi branch";
+		return a?.stopReason !== "error" || !t.includes("Your message was not sent.") || !t.includes(expected);
+	})) throw new Error("Tree/fork/saved/copy context refusal false");
  if(JSON.stringify(inputs.map(x=>x.input.message.content))!==JSON.stringify([first,second,second]))throw new Error("Eligible exact follow-up sequence changed");
  const changes=events.filter(x=>x.event==="lifecycle"&&["fork","resume","copy"].includes(x.action));
  if(changes.length!==3||changes.some(x=>x.from===x.to)||changes.find(x=>x.action==="resume")?.to!==changes[0].original||changes.find(x=>x.action==="copy")?.to!==join(sessions,"copied-provenance.jsonl"))throw new Error("Replacement target/identity receipts false");

@@ -2,6 +2,7 @@
 import {execFileSync,spawnSync} from "node:child_process";
 import {mkdirSync,readFileSync,writeFileSync,realpathSync,renameSync,existsSync} from "node:fs";
 import {dirname,join,resolve} from "node:path";
+import {tmpdir} from "node:os";
 import {fileURLToPath,pathToFileURL} from "node:url";
 import {createHash,randomUUID} from "node:crypto";
 import {AGY_ACTIVITY,AGY_REPORTED_ACTIVITY,captureAgyActivity,captureAgyReportedStep,newAgyActivityBudget,recordAgyReportedStep,type AgyHistoryGuard,type AgyObservationScope,type AgyReportedStep} from "../lib/agy-history.js";
@@ -10,7 +11,8 @@ import {replayScreen} from "./rbf-pty-screen.js";
 
 if(process.argv[2]!=="check")throw Error("Use check; this helper never submits a prompt");
 const workspace=resolve(dirname(fileURLToPath(import.meta.url)),"../.."),support=join(workspace,"extensions/test-support");
-const base=execFileSync("bash",[join(process.env.HOME!,".agents/skills/eng-use-external-tmp/scripts/resolve-external-tmp.sh"),"pi-21.8"],{encoding:"utf8"}).trim();
+const base=process.env.RBF_AGY_TEST_ROOT ?? tmpdir();
+mkdirSync(base, { recursive: true });
 const root=join(base,"opaque-proof-"+Date.now());mkdirSync(root);
 const profile=join(root,"profile"),sessions=join(root,"sessions");mkdirSync(profile);mkdirSync(sessions);
 const pi=execFileSync("which",["pi"],{encoding:"utf8"}).trim();
@@ -47,7 +49,7 @@ for(const definition of definitions){
 	for(const cols of [80,120])for(const reopen of [false,true]){
 		const label=definition.name+"-"+cols+(reopen?"-reopen":""),raw=join(root,label+".raw"),count=rows(events).filter(e=>e.kind==="ready").length;
 		const argv=[pi,"--no-extensions","--no-skills","--no-prompt-templates","--model",AGY_PROVIDER+"/gemini-3.8-flash","--thinking","high","--session",file,"--session-dir",sessions,"--tui-mode","fullscreen","-e",join(support,"rbf-agy-history-candidate.ts")];
-		const plan={argv,cwd:workspace,env:{PI_CODING_AGENT_DIR:profile},cols,rows:60,timeout:30,out:raw,steps:[{waitJsonl:{path:events,field:"kind",value:"ready",count:count+1}},{reloadReady:{path:ready,loads:1,command:"/history-ready"}},{sleep:.2},{snapshot:"collapsed"},{key:"ctrl-o"},{sleep:.2},{snapshot:"expanded"},{paste:"/quit"},{key:"enter"},{waitExit:5}]};
+		const plan={argv,cwd:workspace,env:{PI_CODING_AGENT_DIR:profile},cols,rows:60,timeout:30,out:raw,steps:[{waitJsonl:{path:events,field:"kind",value:"ready",count:count+1}},{reloadReady:{path:ready,loads:1,command:"/history-ready"}},{sleep:.2},{snapshot:"collapsed"},{key:"ctrl-o"},{wait:"to expand tools|Parameters:",timeout:10},{snapshot:"expanded"},{paste:"/quit"},{key:"enter"},{waitExit:5}]};
 		writeFileSync(join(root,label+"-plan.json"),JSON.stringify(plan));
 		const result=spawnSync("python3",[join(support,"rbf-row-gate-drive.py")],{input:JSON.stringify(plan),encoding:"utf8",timeout:35000});writeFileSync(join(root,label+"-result.json"),JSON.stringify({code:result.status,stdout:result.stdout,stderr:result.stderr}));if(result.status!==0)throw Error(label+": "+result.stderr+result.stdout);
 		const marks=JSON.parse(result.stdout),bytes=readFileSync(raw),collapsed=replayScreen(bytes.subarray(0,marks.collapsed),cols,60).lines.join("\n"),expanded=replayScreen(bytes.subarray(0,marks.expanded),cols,60).lines.join("\n");writeFileSync(join(root,label+"-collapsed.txt"),collapsed);writeFileSync(join(root,label+"-expanded.txt"),expanded);
