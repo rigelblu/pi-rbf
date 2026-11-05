@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, appendFileSync, symlinkSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, readSavedSession, appendEvidence, selectRecoveryCompletion, branchFingerprint, entryFingerprint } from "./lib/agy-recovery.js";
+import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, readSavedSession, appendEvidence, selectRecoveryCompletion, historyFingerprint, entryFingerprint, RecoveryError } from "./lib/agy-recovery.js";
+import { AGY_ACTIVITY } from "./lib/agy-history.js";
 
 const fault = vi.hoisted(() => ({ sync: 0, failAt: 0 }));
 vi.mock("node:fs", async original => {
@@ -25,9 +26,9 @@ function fixture() {
 	const tuple = { sessionId: header.id, sessionFile: file, cwd, conversationId: "native-one", nativeModel: "gemini-3.8-flash-low", nativeEffort: "low", policyHash: null, permissionMode: "request-review" };
 	const checkpoint = () => {
 		const u = user();
-		const d = appendEvidence(pi, sm, cwd, AGY_DISPATCH, { ...tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: branchFingerprint(entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
+		const d = appendEvidence(pi, sm, cwd, AGY_DISPATCH, { ...tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
 		const a = assistant();
-		const c = appendEvidence(pi, sm, cwd, AGY_COMPLETION, { ...tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: branchFingerprint(entries), acceptedCount: 1, frontier: 1 });
+		const c = appendEvidence(pi, sm, cwd, AGY_COMPLETION, { ...tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(entries), acceptedCount: 1, frontier: 1 });
 		return { u, d, a, c };
 	};
 	return { cwd, file, entries, sm, pi, header, save, append, user, assistant, tuple, checkpoint };
@@ -64,13 +65,13 @@ describe("saved clean-turn recovery evidence", () => {
 	});
 	it("classifies a saved unmatched dispatch as unknown work", () => {
 		const h = fixture(); const { c } = h.checkpoint(); const u = h.user();
-		appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: branchFingerprint(h.entries), previousCompletionId: c.id, acceptedCount: 1, frontier: 1 });
+		appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(h.entries), previousCompletionId: c.id, acceptedCount: 1, frontier: 1 });
 		const next = h.user();
 		expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id)).toThrow(/unknown outcome/);
 	});
 	it("accepts only exact certified zero-write refusal pairs", () => {
 		const h = fixture(); const { c } = h.checkpoint(); const u = h.user("unsupported setting"), a = h.assistant();
-		appendEvidence(h.pi, h.sm, h.cwd, AGY_REFUSAL, { ...h.tuple, completionId: c.id, userId: u.id, userFingerprint: entryFingerprint(u), assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: branchFingerprint(h.entries) });
+		appendEvidence(h.pi, h.sm, h.cwd, AGY_REFUSAL, { ...h.tuple, completionId: c.id, userId: u.id, userFingerprint: entryFingerprint(u), assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(h.entries) });
 		const next = h.user();
 		expect(selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id).entry.id).toBe(c.id);
 		a.message.content[0].text = "mutated refusal"; h.save();
@@ -94,8 +95,8 @@ describe("saved clean-turn recovery evidence", () => {
 		if (kind === "image-user") u.message.content = [{ type: "image", data: "a", mimeType: "image/png" }];
 		if (kind === "tool-assistant") a.message.content = [{ type: "toolCall", name: "unknown" }];
 		if (kind === "old-user") { const extra = { ...u, id: "extra-user", parentId: u.id }; h.entries.splice(1, 0, extra); d.parentId = extra.id; }
-		d.data.userFingerprint = entryFingerprint(u); d.data.prefixHash = branchFingerprint(h.entries.slice(0, h.entries.indexOf(d)));
-		c.data.assistantFingerprint = entryFingerprint(a); c.data.prefixHash = branchFingerprint(h.entries.slice(0, h.entries.indexOf(c)));
+		d.data.userFingerprint = entryFingerprint(u); d.data.prefixHash = historyFingerprint(h.entries.slice(0, h.entries.indexOf(d)));
+		c.data.assistantFingerprint = entryFingerprint(a); c.data.prefixHash = historyFingerprint(h.entries.slice(0, h.entries.indexOf(c)));
 		h.save(); const next = h.user(); expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id)).toThrow();
 	});
 	it.each(["compaction", "branch_summary", "custom_message", "image-record"])("refuses context-changing %s after a completion", kind => {
@@ -110,6 +111,87 @@ describe("saved clean-turn recovery evidence", () => {
 
 	it("refuses a non-regular session descriptor", () => {
 		const h = fixture(); h.sm.getSessionFile = () => h.cwd; expect(() => readSavedSession(h.sm, h.cwd)).toThrow();
+	});
+
+	it.each(["before-dispatch", "between-completion-and-user", "between-dispatch-and-activity", "between-answer-and-completion"])("permits foreign custom entry placement: %s", placement => {
+		const h = fixture();
+		const u = h.user();
+		if (placement === "before-dispatch") {
+			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "before dispatch" } });
+		}
+		const d = appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(h.entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
+		if (placement === "between-dispatch-and-activity") {
+			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "between dispatch and activity" } });
+			h.append({
+				type: "custom",
+				customType: AGY_ACTIVITY,
+				data: {
+					schemaVersion: 1,
+					piSessionId: d.data.sessionId,
+					inputEntryId: d.data.userId,
+					rootConversationId: d.data.conversationId,
+					turnCount: d.data.acceptedCount + 1,
+					source: { kind: "root", conversationId: d.data.conversationId },
+					stepIndex: 1,
+					sequence: 1,
+					toolName: "run_command",
+					state: "DONE",
+				},
+			});
+		}
+		const a = h.assistant();
+		if (placement === "between-answer-and-completion") {
+			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "between answer and completion" } });
+		}
+		const c = appendEvidence(h.pi, h.sm, h.cwd, AGY_COMPLETION, { ...h.tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(h.entries), acceptedCount: 1, frontier: 1 });
+		if (placement === "between-completion-and-user") {
+			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "between completion and user" } });
+		}
+		const next = h.user("next question");
+		const selected = selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id);
+		expect(selected.entry.id).toBe(c.id);
+	});
+
+	it.each(["unknown-agy-type", "v2-activity-after-dispatch", "custom_message-after-dispatch", "model_change-between-dispatch-and-activity"])("rejects invalid entries as mismatch: %s", kind => {
+		const h = fixture();
+		const u = h.user();
+		const d = appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(h.entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
+		if (kind === "unknown-agy-type") {
+			h.append({ type: "custom", customType: "rbf-agy-unknown/v1", data: {} });
+		} else if (kind === "v2-activity-after-dispatch") {
+			h.append({ type: "custom", customType: "rbf-agy-activity/v2", data: {} });
+		} else if (kind === "custom_message-after-dispatch") {
+			h.append({ type: "custom_message", message: { role: "user", content: "custom" } });
+		} else if (kind === "model_change-between-dispatch-and-activity") {
+			h.append({ type: "model_change", provider: "agy-harness", modelId: "other" });
+			h.append({
+				type: "custom",
+				customType: AGY_ACTIVITY,
+				data: {
+					schemaVersion: 1,
+					piSessionId: d.data.sessionId,
+					inputEntryId: d.data.userId,
+					rootConversationId: d.data.conversationId,
+					turnCount: d.data.acceptedCount + 1,
+					source: { kind: "root", conversationId: d.data.conversationId },
+					stepIndex: 1,
+					sequence: 1,
+					toolName: "run_command",
+					state: "DONE",
+				},
+			});
+		}
+		const a = h.assistant();
+		appendEvidence(h.pi, h.sm, h.cwd, AGY_COMPLETION, { ...h.tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(h.entries), acceptedCount: 1, frontier: 1 });
+		const next = h.user("next question");
+		let thrown: unknown;
+		try {
+			selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(RecoveryError);
+		expect((thrown as RecoveryError).kind).toBe("mismatch");
 	});
 
 });

@@ -108,4 +108,15 @@ describe("AGY streaming in actual daily Pi TUI",()=>{
   },30000);
  }
 
+
+ it("continues after another extension's entry lands after the answer",async()=>{
+  const profile=createAgyStreamProfile(),log=join(profile.root,"host.jsonl");
+  const steps=[receipt(log,"ready"),{paste:"Summarize the change."},{key:"enter"},receipt(log,"agent_end"),{paste:"Follow-up must reach AGY."},{key:"enter"},receipt(log,"agent_end",2)];
+  await run(profile,"normal",steps,"persistence",undefined,"foreign");
+  const events=jsonl(log),native=jsonl(join(profile.root,"native.jsonl"));
+  expect(events.filter(e=>e.kind==="persistence_fault")).toHaveLength(1);expect(native.filter(e=>e.input)).toHaveLength(2);
+  expect(events.filter(e=>e.kind==="trace"&&e.event==="provider_anchor").length).toBeGreaterThanOrEqual(1);
+  const finals=events.filter(e=>e.kind==="final");expect(finals).toHaveLength(2);expect(finals[0].stopReason).toBe("stop");expect(finals[1].stopReason).toBe("stop");
+  console.log("AGY foreign entry receipt: "+profile.root);
+ },30000);
 });

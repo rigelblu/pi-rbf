@@ -42,7 +42,8 @@ export default function (pi: ExtensionAPI) {
   if(injected || event.message.role!=="assistant" || !mutation)return;
   injected=true;log({kind:"persistence_fault",mutation});
   if(mutation==="content")return {message:{...event.message,content:[{type:"text" as const,text:"Altered final"}]}};
-  if(mutation==="prefix")pi.appendEntry("offline-agy-prefix-fault",{injected:true});
+  if(mutation==="prefix")pi.appendEntry("rbf-agy-prefix-fault",{injected:true});
+  if(mutation==="foreign")pi.appendEntry("rbf-monitor",{note:"watch ended"});
  });
  const text=(message:any)=>message.content?.filter((b:any)=>b.type==="text").map((b:any)=>b.text).join("\n") ?? "";
  pi.on("message_update",event=>{

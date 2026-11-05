@@ -40,6 +40,10 @@ export function fingerprint(message: any): string {
 }
 export function entryFingerprint(entry: any): string { return hash(entry); }
 export function branchFingerprint(entries: readonly any[]): string { return hash(entries.map(entryFingerprint)); }
+/** Another extension's plain custom entry. Pi never sends these to the model, so AGY's history checks skip them. */
+export function isForeignEntry(entry: any): boolean { return entry?.type === "custom" && !/^rbf-agy-/.test(typeof entry.customType === "string" ? entry.customType : ""); }
+/** The branch as AGY's history checks see it: without other extensions' plain custom entries. */
+export function historyFingerprint(entries: readonly any[]): string { return branchFingerprint(entries.filter(e => !isForeignEntry(e))); }
 const mismatch = (): never => { throw new RecoveryError("mismatch"); };
 const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 const digest = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
@@ -109,9 +113,10 @@ export function selectRecoveryCompletion(saved: SavedSession, newUserId: string)
 	const entries = saved.branch;
 	// Match branchFingerprint's JSON array encoding with one linear prefix pass.
 	const prefixes: string[] = [], prefix = createHash("sha256").update("[");
+	let included = 0;
 	for (let i = 0; i <= entries.length; i++) {
 		prefixes.push(prefix.copy().update("]").digest("hex"));
-		if (i < entries.length) prefix.update((i ? "," : "") + JSON.stringify(entryFingerprint(entries[i])));
+		if (i < entries.length && !isForeignEntry(entries[i])) prefix.update((included++ ? "," : "") + JSON.stringify(entryFingerprint(entries[i])));
 	}
 	let completion: CompletionAnchor | undefined, completionIndex = -1;
 	let intent: { entry: any; index: number } | undefined;
@@ -127,9 +132,12 @@ export function selectRecoveryCompletion(saved: SavedSession, newUserId: string)
 		const e = entries[i];
 		if (started && !passive.has(e.type)) return mismatch();
 		if (e.type !== "custom") continue;
+		if (isForeignEntry(e)) continue;
 		if (e.customType === AGY_ACTIVITY) {
 			const activity = parseAgyActivity(e.data), dispatch = intent?.entry.data;
-			const previousType = entries[i - 1]?.customType;
+			let p = i - 1;
+			while (p >= 0 && isForeignEntry(entries[p])) p--;
+			const previousType = entries[p]?.customType;
 			if (!activity || !dispatch || (previousType !== AGY_DISPATCH && previousType !== AGY_ACTIVITY) ||
 				activity.source.kind !== "root" || activity.piSessionId !== dispatch.sessionId ||
 				activity.inputEntryId !== dispatch.userId || activity.rootConversationId !== dispatch.conversationId ||
@@ -138,7 +146,7 @@ export function selectRecoveryCompletion(saved: SavedSession, newUserId: string)
 			continue;
 		}
 		if (![AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL].includes(e.customType)) {
-			if (e.customType !== "rbf-agy-conversation/v1" && (started || /^rbf-agy-/.test(e.customType ?? ""))) return mismatch();
+			if (e.customType !== "rbf-agy-conversation/v1") return mismatch();
 			continue;
 		}
 		const d = e.data;

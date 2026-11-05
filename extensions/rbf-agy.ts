@@ -92,7 +92,7 @@ import { VERSION, parseArgs, FooterComponent, ThinkingSelectorComponent, type Ex
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model, type RefreshModelsContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { AGY_EXECUTABLE, MIN_PI_VERSION, BOUNDS, parseVersion, versionAtLeast, checkAgyVersion, acquireOwnedChild, executeTurn, closeChildProcess, sanitizeDisplayText, type LiveOwner, type ControllerTracer } from "./lib/agy-native.js";
-import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, RECOVERY_COPY, RecoveryError, readSavedSession, appendEvidence, selectRecoveryCompletion, fingerprint, entryFingerprint, branchFingerprint, type CompletionAnchor, type RecoveryTuple } from "./lib/agy-recovery.js";
+import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, RECOVERY_COPY, RecoveryError, readSavedSession, appendEvidence, selectRecoveryCompletion, fingerprint, entryFingerprint, historyFingerprint, isForeignEntry, type CompletionAnchor, type RecoveryTuple } from "./lib/agy-recovery.js";
 import { AGY_ACTIVITY, AGY_REPORTED_ACTIVITY, renderAgyReportedStep, AGY_HISTORY_FAILURE, newAgyActivityBudget, recordAgyActivity, renderAgyActivity } from "./lib/agy-history.js";
 export const AGY_PROVENANCE = "rbf-agy-conversation/v1";
 export interface AgyRetirementSeal {
@@ -499,7 +499,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 			};
 			let started = false, publicationRevoked = false, preview = "", previewBytes = 0, previewPaused = false, previewClipped = false;
 			const snap = () => ({ ...message, content: message.content.map(c => ({ ...c })) });
-			const live = () => canPublish() && (!requestBranch || branchFingerprint(branch()) === requestBranch);
+			const live = () => canPublish() && (!requestBranch || historyFingerprint(branch()) === requestBranch);
 			const startText = () => {
 				if (started) return;
 				started = true;
@@ -575,9 +575,9 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					if (!prompt.trim() || Buffer.byteLength(prompt) > BOUNDS.MAX_PROMPT_BYTES)
 						throw new Error("AGY needs nonempty text of at most 256 KiB. Your message was not sent.");
 					const cwd = realpathSync(ctx!.cwd), sid = sm.getSessionId();
-					let expectedBranch = branchFingerprint(entries);
+					let expectedBranch = historyFingerprint(entries);
 					const checkBranch = () => {
-						if (!live() || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd || branchFingerprint(branch()) !== expectedBranch)
+						if (!live() || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd || historyFingerprint(branch()) !== expectedBranch)
 							throw new Error(AGY_COPY.branch);
 					};
 					const saved = readSavedSession(sm, cwd);
@@ -649,7 +649,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 							const data = { conversationId: owner.conversationId, cwd, sessionId: sid };
 							try { appendEvidence(pi, sm, cwd, AGY_PROVENANCE, data); }
 							catch { throw new Error("AGY could not verify session provenance. Your message was not sent. Use /new."); }
-							expectedBranch = branchFingerprint(branch());
+							expectedBranch = historyFingerprint(branch());
 							tracer.record("provider_bound", { entryId: sm.getLeafId(), sessionId: sid, conversationId: owner.conversationId });
 						} else {
 							checkpoint = recovery;
@@ -662,7 +662,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 					if (!snapshot.permissionMode || snapshot.failure) throw new RecoveryError("unavailable");
 					const tuple: RecoveryTuple = { sessionId: sid, sessionFile: saved.sessionFile, cwd, conversationId: owner!.conversationId, nativeModel: settings.nativeModel, nativeEffort: settings.nativeEffort ?? null, policyHash: policy?.hash ?? null, permissionMode: snapshot.permissionMode };
 					const dispatch = appendEvidence(pi, sm, cwd, AGY_DISPATCH, { ...tuple, userId: latestUser.id, userFingerprint: entryFingerprint(latestUser), prefixHash: expectedBranch, previousCompletionId: recovery?.entry.id ?? null, acceptedCount: snapshot.acceptedCount, frontier: snapshot.acceptedFrontier });
-					expectedBranch = branchFingerprint(branch());
+					expectedBranch = historyFingerprint(branch());
 					checkBranch();
 					requestBranch = expectedBranch;
 					attempted.add(latestUser.id);
@@ -682,7 +682,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 								assertCurrent() {
 									if (!canPublish() || owner !== admittedOwner || sm.getSessionId() !== sid || realpathSync(ctx!.cwd) !== cwd) throw new Error(AGY_HISTORY_FAILURE);
 								},
-								entries: branch, leafId: () => sm.getLeafId(), fingerprint: entries => branchFingerprint([...entries]), expectedFingerprint: expectedBranch,
+								entries: branch, leafId: () => sm.getLeafId(), fingerprint: entries => historyFingerprint([...entries]), expectedFingerprint: expectedBranch,
 								append: (type, data) => pi.appendEntry(type, data),
 							});
 							expectedBranch = requestBranch = saved.fingerprint;
@@ -803,7 +803,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				const after = all.slice(i + 1).filter(e => e.type === "message");
 				if (i >= 0 && entryFingerprint(user) === proof.userFingerprint && after.length === 1 && fingerprint(after[0].message) === proof.fingerprint && event.messages.some(m => fingerprint(m) === proof.fingerprint)) {
 					try {
-						appendEvidence(pi, c.sessionManager, c.cwd, AGY_REFUSAL, { ...recoveryTuple(proof.checkpoint.data), completionId: proof.checkpoint.entry.id, userId: user.id, userFingerprint: entryFingerprint(user), assistantId: after[0].id, assistantFingerprint: entryFingerprint(after[0]), prefixHash: branchFingerprint(all) });
+						appendEvidence(pi, c.sessionManager, c.cwd, AGY_REFUSAL, { ...recoveryTuple(proof.checkpoint.data), completionId: proof.checkpoint.entry.id, userId: user.id, userFingerprint: entryFingerprint(user), assistantId: after[0].id, assistantFingerprint: entryFingerprint(after[0]), prefixHash: historyFingerprint(all) });
 					} catch { await retire(); notice(RECOVERY_COPY.checkpoint); }
 
 				}
@@ -817,13 +817,13 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 				return;
 			ctx = c;
 			const all = branch(), user = all.findIndex(e => e.id === pending!.userId), matches = all.slice(user + 1).filter(e => e.type === "message" && e.message?.role === "assistant");
-			if (user < 0 || matches.length !== 1 || all.at(-1) !== matches[0] || fingerprint(matches[0].message) !== pending.fingerprint || branchFingerprint(all.slice(0, all.indexOf(matches[0]))) !== pending.branchFingerprint) {
+			if (user < 0 || matches.length !== 1 || [...all].reverse().find(e => !isForeignEntry(e)) !== matches[0] || fingerprint(matches[0].message) !== pending.fingerprint || historyFingerprint(all.slice(0, all.indexOf(matches[0]))) !== pending.branchFingerprint) {
 				await retire();
 				notice(AGY_COPY.branch);
 				return;
 			}
 			try {
-				const data = { ...pending.tuple, dispatchId: pending.dispatchId, assistantId: matches[0].id, assistantFingerprint: entryFingerprint(matches[0]), prefixHash: branchFingerprint(all), acceptedCount: pending.acceptedCount, frontier: pending.frontier };
+				const data = { ...pending.tuple, dispatchId: pending.dispatchId, assistantId: matches[0].id, assistantFingerprint: entryFingerprint(matches[0]), prefixHash: historyFingerprint(all), acceptedCount: pending.acceptedCount, frontier: pending.frontier };
 				const entry = appendEvidence(pi, c.sessionManager, c.cwd, AGY_COMPLETION, data);
 				checkpoint = { entry, data };
 			} catch {

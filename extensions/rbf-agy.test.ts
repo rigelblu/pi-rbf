@@ -64,10 +64,10 @@ export function harness(mode = "normal", opts: {
 	trace?: (event: string, payload: any) => void;
 } = {}) {
 	const root = opts.root ?? mkdtempSync(join(roots!, "case-")), log = join(root, "native.jsonl"), exe = join(root, "fake-agy.cjs");
-	const holder=join(root,"pipe-holder.cjs"),release=join(root,"release-holder");
+	const holder=join(root,"pipe-holder.cjs"),release=join(root,"release-holder"),releaseHistory=join(root,"release-history");
  if(mode==='held-pipe')writeFileSync(holder,`const fs=require('node:fs');const log=${JSON.stringify(log)},release=${JSON.stringify(release)};const record=x=>fs.appendFileSync(log,JSON.stringify(x)+'\\n');record({desc_start:true});for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{record({desc_signal:signal});process.exit(4);});let poll=setInterval(()=>{try{if(fs.readFileSync(release,'utf8')==='release'){clearInterval(poll);record({desc_exit:0});process.exit(0);}}catch{}},25);setTimeout(()=>{record({desc_exit:3});process.exit(3);},5000);`);
  const worker = `#!${process.execPath}
-const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.stringify(log)},MODE=${JSON.stringify(mode)};const args=process.argv.slice(2);const record=x=>fs.appendFileSync(LOG,JSON.stringify(x)+'\\n');const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');record({args});if(args[0]==='--version'){console.log(MODE==='old-version'?'1.0.0':'1.4.12');process.exit(0);}if(args[0]==='models'){const done=()=>{console.log(MODE==='catalogue-empty'?'':MODE==='catalogue-bad'?'malformed-catalogue':${JSON.stringify(inventory)});process.exit(0);};if(MODE==='slow-metadata')setTimeout(done,200);else done();return;}if(MODE==='login-error'){console.error('authentication required FAKE_CREDENTIAL_DO_NOT_EXPOSE');process.exit(1);}const stateFile=${JSON.stringify(join(root, 'native-state.json'))};const resume=args.includes('--conversation')?args[args.indexOf('--conversation')+1]:null;let saved=resume&&fs.existsSync(stateFile)?JSON.parse(fs.readFileSync(stateFile,'utf8')):null;const cid=MODE==='wrong-resume-id'?'wrong-id':resume??'fixture-'+process.pid;let count=saved?.count??0,step=saved?.step??0,nonce=saved?.nonce??'',active=false;const initialize=()=>{record({init:true});emit({event:'init',conversation_id:cid,init:{model:MODE==='wrong-init-model'?'other-model':args[args.indexOf('--model')+1],cwd:MODE==='wrong-init-cwd'?process.cwd()+'/other':process.cwd(),tools:[],permission_mode:MODE==='wrong-resume-mode'?'other-mode':'default'}});};if(MODE==='slow-init')setTimeout(initialize,1000);else initialize();const result=(status,response,error)=>emit({event:'result',result:{conversation_id:cid,status,response,error,num_turns:count,duration_seconds:0,usage:{input_tokens:1,output_tokens:1,thinking_tokens:0,cache_read_tokens:0,total_tokens:2},...(MODE==='denial'?{denied_actions:[{action:'write_file',display_name:'EditFile'}]}:{})}});const rl=readline.createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);record({input:x});active=true;count++;emit({event:'step_update',step_update:{conversation_id:cid,step_index:step++,step_type:'user_input',state:'DONE'}});if(MODE.startsWith('history')){const ix=step+3;step=ix+1;const tool=(state,info)=>emit({event:'step_update',step_update:{conversation_id:MODE==='history-wrong'?'other-root':cid,step_index:ix,step_type:'tool',state,tool_name:'run_command',...(info?{tool_info:{name:'run_command',...info}}:{})}});if(MODE==='history-many'){for(let n=0;n<256;n++)tool('ACTIVE');tool('DONE');}else if(MODE==='history-missing')tool('DONE');else{tool('ACTIVE',{parameters:{CommandLine:'printf hello'}});if(MODE==='history-hold')return;tool(MODE==='history-error'?'ERROR':'DONE',{parameters:{CommandLine:'printf hello'},...(MODE==='history-error'?{error:{type:'CommandError',message:'permission denied'}}:{output:MODE==='history-long'?['line1','line2','line3','line4','line5','line6'].join(String.fromCharCode(10)):'hello'})});}}const text=x.message.content;const m=text.match(/MAPLE-[A-Z0-9]+/);if(m)nonce=m[0];if(MODE==='bad'){console.log('malformed-native');active=false;return;}const done=()=>{active=false;fs.writeFileSync(stateFile,JSON.stringify({count,step,nonce}));result(MODE==='error'?'ERROR':'SUCCESS',MODE==='denial'?'':'Native answer '+nonce,MODE==='error'?'Native permission refused':undefined);};if(MODE==='slow')setTimeout(done,400);else done();});rl.on('close',()=>{record({eof:true});if(MODE==='held-pipe'){require('node:child_process').spawn(process.execPath,[${JSON.stringify(holder)}],{stdio:['ignore',1,2]}).unref();process.exit(0);}if(!active){if(MODE==='ignore-eof')setInterval(()=>{},500);else process.exit(0);}});process.on('SIGINT',()=>{record({signal:'SIGINT'});if(active){active=false;result('ERROR',undefined,'interrupted');}process.stdout.write('',()=>process.exit(1));});record({workerReady:true});
+const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.stringify(log)},MODE=${JSON.stringify(mode)},RELEASE_HISTORY=${JSON.stringify(releaseHistory)};const args=process.argv.slice(2);const record=x=>fs.appendFileSync(LOG,JSON.stringify(x)+'\\n');const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');record({args});if(args[0]==='--version'){console.log(MODE==='old-version'?'1.0.0':'1.4.12');process.exit(0);}if(args[0]==='models'){const done=()=>{console.log(MODE==='catalogue-empty'?'':MODE==='catalogue-bad'?'malformed-catalogue':${JSON.stringify(inventory)});process.exit(0);};if(MODE==='slow-metadata')setTimeout(done,200);else done();return;}if(MODE==='login-error'){console.error('authentication required FAKE_CREDENTIAL_DO_NOT_EXPOSE');process.exit(1);}const stateFile=${JSON.stringify(join(root, 'native-state.json'))};const resume=args.includes('--conversation')?args[args.indexOf('--conversation')+1]:null;let saved=resume&&fs.existsSync(stateFile)?JSON.parse(fs.readFileSync(stateFile,'utf8')):null;const cid=MODE==='wrong-resume-id'?'wrong-id':resume??'fixture-'+process.pid;let count=saved?.count??0,step=saved?.step??0,nonce=saved?.nonce??'',active=false;const initialize=()=>{record({init:true});emit({event:'init',conversation_id:cid,init:{model:MODE==='wrong-init-model'?'other-model':args[args.indexOf('--model')+1],cwd:MODE==='wrong-init-cwd'?process.cwd()+'/other':process.cwd(),tools:[],permission_mode:MODE==='wrong-resume-mode'?'other-mode':'default'}});};if(MODE==='slow-init')setTimeout(initialize,1000);else initialize();const result=(status,response,error)=>emit({event:'result',result:{conversation_id:cid,status,response,error,num_turns:count,duration_seconds:0,usage:{input_tokens:1,output_tokens:1,thinking_tokens:0,cache_read_tokens:0,total_tokens:2},...(MODE==='denial'?{denied_actions:[{action:'write_file',display_name:'EditFile'}]}:{})}});const rl=readline.createInterface({input:process.stdin});rl.on('line',line=>{const x=JSON.parse(line);record({input:x});active=true;count++;emit({event:'step_update',step_update:{conversation_id:cid,step_index:step++,step_type:'user_input',state:'DONE'}});const finish=()=>{const text=x.message.content;const m=text.match(/MAPLE-[A-Z0-9]+/);if(m)nonce=m[0];if(MODE==='bad'){console.log('malformed-native');active=false;return;}const done=()=>{active=false;fs.writeFileSync(stateFile,JSON.stringify({count,step,nonce}));result(MODE==='error'?'ERROR':'SUCCESS',MODE==='denial'?'':'Native answer '+nonce,MODE==='error'?'Native permission refused':undefined);};if(MODE==='slow')setTimeout(done,400);else done();};if(MODE.startsWith('history')){const ix=step+3;step=ix+1;const tool=(state,info)=>emit({event:'step_update',step_update:{conversation_id:MODE==='history-wrong'?'other-root':cid,step_index:ix,step_type:'tool',state,tool_name:'run_command',...(info?{tool_info:{name:'run_command',...info}}:{})}});if(MODE==='history-many'){for(let n=0;n<256;n++)tool('ACTIVE');tool('DONE');finish();return;}if(MODE==='history-missing'){tool('DONE');finish();return;}tool('ACTIVE',{parameters:{CommandLine:'printf hello'}});if(MODE==='history-hold')return;const resumeHistory=()=>{tool(MODE==='history-error'?'ERROR':'DONE',{parameters:{CommandLine:'printf hello'},...(MODE==='history-error'?{error:{type:'CommandError',message:'permission denied'}}:{output:MODE==='history-long'?['line1','line2','line3','line4','line5','line6'].join(String.fromCharCode(10)):'hello'})});finish();};if(MODE==='history-gate'){let poll=setInterval(()=>{try{if(fs.readFileSync(RELEASE_HISTORY,'utf8')==='release'){clearInterval(poll);resumeHistory();}}catch{}},10);return;}resumeHistory();return;}finish();});rl.on('close',()=>{record({eof:true});if(MODE==='held-pipe'){require('node:child_process').spawn(process.execPath,[${JSON.stringify(holder)}],{stdio:['ignore',1,2]}).unref();process.exit(0);}if(!active){if(MODE==='ignore-eof')setInterval(()=>{},500);else process.exit(0);}});process.on('SIGINT',()=>{record({signal:'SIGINT'});if(active){active=false;result('ERROR',undefined,'interrupted');}process.stdout.write('',()=>process.exit(1));});record({workerReady:true});
 `;
 	writeFileSync(exe, worker);
 	chmodSync(exe, 0o700);
@@ -101,7 +101,7 @@ const fs=require('node:fs'),readline=require('node:readline');const LOG=${JSON.s
 			}
 		},
 		async request(text: string, extra: any = {}) { await ready; const message = { role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() }; append({ type: 'message', message }); return registration.streamSimple(model, { systemPrompt: 'NEVER FORWARD THIS SYSTEM', messages: [message] }, { reasoning: 'high', ...extra }).result(); },
-		async persist(message: any) { await emit('message_end', { message }); append({ type: 'message', message }); await emit('agent_end', { messages: [message] }); },
+		async persist(message: any, between?: () => void) { await emit('message_end', { message }); append({ type: 'message', message }); between?.(); await emit('agent_end', { messages: [message] }); },
 		async select(m: any) { const previousModel = model; model = m; ctx.model = m; await emit('model_select', { model: m, previousModel }); },
 		async close() { await ready; await emit('session_shutdown'); },
 	};
@@ -983,11 +983,84 @@ describe('durable AGY observations through the real provider', () => {
   await next.persist(resumed);
   expect(reports(next).map(e => e.data.turnCount)).toEqual([1, 1, 2, 2]);
  });
- it.each(['foreign custom','changed prefix'])('refuses a follow-up after %s even though all assistant messages still match', async fault=>{
-  const h=harness('history');await h.persist(await h.request('First'));
-  if(fault==='foreign custom')h.pi.appendEntry('unrelated-extension',{note:'foreign'});else h.entries[0].message.content[0].text='changed';
-  expect(body(await h.request('Second'))).toBe(RECOVERY_COPY.mismatch);expect(inputs(h)).toHaveLength(1);
- });
+	it('allows a follow-up after another extension appends a custom entry between turns', async () => {
+		const h = harness('history');
+		const first = await h.request('Remember MAPLE-MONITOR1.');
+		expect(first.stopReason).toBe('stop');
+		await h.persist(first);
+		h.pi.appendEntry('rbf-monitor', { note: 'watch ended' });
+		const second = await h.request('Recall the label.');
+		expect(second.stopReason).toBe('stop');
+		expect(body(second)).toContain('MAPLE-MONITOR1');
+		await h.persist(second);
+		expect(inputs(h)).toHaveLength(2);
+	});
+	it.each(['rbf-agy-unknown/v1', 'custom_message'])('still refuses follow-up after non-foreign custom entry between turns: %s', async kind => {
+		const h = harness('history');
+		await h.persist(await h.request('First'));
+		if (kind === 'custom_message') {
+			const entry = { id: `e${h.entries.length + 1}`, parentId: h.entries.at(-1)?.id ?? null, type: 'custom_message', message: { role: 'user', content: 'custom' } };
+			h.entries.push(entry);
+			appendFileSync(join(h.root, 'pi.jsonl'), JSON.stringify(entry) + '\n');
+		} else {
+			h.pi.appendEntry(kind, { note: 'unknown agy' });
+		}
+		expect(body(await h.request('Second'))).toBe(RECOVERY_COPY.mismatch);
+		expect(inputs(h)).toHaveLength(1);
+	});
+	it('allows a foreign custom entry after the stream ends and before the answer is saved', async () => {
+		const h = harness('history');
+		const first = await h.request('First');
+		expect(first.stopReason).toBe('stop');
+		h.pi.appendEntry('rbf-monitor', { note: 'mid-turn between dispatch and completion' });
+		await h.persist(first);
+		const second = await h.request('Second');
+		expect(second.stopReason).toBe('stop');
+		await h.persist(second);
+		expect(inputs(h)).toHaveLength(2);
+	});
+	it('allows foreign custom entry mid-turn while the turn streams', async () => {
+		const h = harness('history-gate');
+		const pending = h.request('First');
+		await vi.waitFor(() => expect(reports(h)).toHaveLength(1), { timeout: 3000, interval: 10 });
+		h.pi.appendEntry('rbf-monitor', { note: 'watch ended' });
+		writeFileSync(join(h.root, 'release-history'), 'release', { flag: 'wx', mode: 0o600 });
+		const first = await pending;
+		expect(first.stopReason).toBe('stop');
+		expect(body(first)).toContain('Native answer');
+		await h.persist(first);
+		const dispatchIndex = h.entries.findIndex(e => e.customType === AGY_DISPATCH);
+		const monitorIndex = h.entries.findIndex(e => e.customType === 'rbf-monitor');
+		const assistantIndex = h.entries.findIndex(e => e.message?.role === 'assistant');
+		const completionIndex = h.entries.findIndex(e => e.customType === AGY_COMPLETION);
+		expect(monitorIndex).toBeGreaterThan(dispatchIndex);
+		expect(monitorIndex).toBeLessThan(assistantIndex);
+		expect(completionIndex).toBeGreaterThan(assistantIndex);
+		const second = await h.request('Second');
+		expect(second.stopReason).toBe('stop');
+		expect(body(second)).toContain('Native answer');
+		await h.persist(second);
+		expect(inputs(h)).toHaveLength(2);
+	});
+	it('anchors completion when foreign custom entry appears after the answer before agent_end', async () => {
+		const h = harness('history');
+		const first = await h.request('First');
+		expect(first.stopReason).toBe('stop');
+		await h.persist(first, () => {
+			h.pi.appendEntry('rbf-monitor', { note: 'after answer before agent_end' });
+		});
+		const second = await h.request('Second');
+		expect(second.stopReason).toBe('stop');
+		await h.persist(second);
+		expect(inputs(h)).toHaveLength(2);
+	});
+	it('refuses a follow-up after changed prefix even though all assistant messages still match', async () => {
+		const h = harness('history');
+		await h.persist(await h.request('First'));
+		h.entries[0].message.content[0].text = 'changed';
+		expect(body(await h.request('Second'))).toBe(RECOVERY_COPY.mismatch);
+		expect(inputs(h)).toHaveLength(1);
+	});
  it.each(['throw','throw after append','extra entry','prefix mutation'])('retires without retry on activity storage fault: %s', async fault=>{
   const h=harness('history'),append=h.pi.appendEntry;
   h.pi.appendEntry=(type:string,data:any)=>{if(type!==AGY_ACTIVITY)return append(type,data);if(fault==='throw')throw Error('disk');append(type,data);if(fault==='throw after append')throw Error('disk after memory');if(fault==='extra entry')append('foreign',{});if(fault==='prefix mutation')h.entries[0].message.content[0].text='changed';};
