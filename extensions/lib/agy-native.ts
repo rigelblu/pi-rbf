@@ -644,7 +644,7 @@ export function acquireOwnedChild(settings: ResolvedSettings, cwd: string, trace
 		tracer.record("spawn_attempt", { cwd, nativeModel: settings.nativeModel, nativeEffort: settings.nativeEffort });
 		const child = spawn(executable, [...launchArgs, ...(resume ? ["--conversation", resume.conversationId] : []), "--model", settings.nativeModel, ...(settings.nativeEffort ? ["--effort", settings.nativeEffort] : []),
 			"--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands", "--print="],
-			{ shell: false, detached: false, cwd, stdio: ["pipe", "pipe", "pipe"] });
+			{ shell: false, detached: false, cwd, env: { ...process.env, PWD: cwd }, stdio: ["pipe", "pipe", "pipe"] });
 		owner.child = child;
 		child.on("spawn", () => {
 			runtime.spawnObserved = true; runtime.acquisition = "spawned";
