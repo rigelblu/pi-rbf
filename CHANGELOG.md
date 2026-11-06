@@ -6,6 +6,22 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.33.0 (2026-11-05)
+## 🟠⋯ Added for End Users
+- 2026-11-05 - feat | choose native AGY model families and supported efforts through Pi's usual model controls, then run an ordinary task and same-conversation follow-ups directly through AGY, without operating AGY's own TUI. Install the four AGY files and fully restart Pi (#pi-21.1)
+- 2026-11-05 - feat | read AGY answers as they stream, with the complete final answer kept in history. Interrupted, cancelled and over-limit output is marked `Incomplete AGY answer` (#pi-21.7)
+- 2026-11-05 - feat | inspect the commands AGY ran and the output it reported in history, including after reopening Pi. Press `Ctrl+O` to expand and collapse them (#pi-21.8)
+- 2026-11-05 - feat | resume the same AGY conversation after `/reload` or restarting Pi. Sessions saved before this release still can't resume and need `/new` (#pi-21.4)
+
+## 🟠⋯ Fixed for End Users
+- 2026-11-05 - fix | keep the AGY conversation going when other extensions write to the session, such as todos, monitor watches and `/cd`. Their entries no longer end it (#pi-21.4)
+- 2026-11-05 - fix | start AGY from a folder you reached through a symlink. It used to refuse to start there (#pi-21.1)
+
+## 🟠⋯ Changed for End Users
+- 2026-11-05 - change | the footer's starting, running and stopping labels for AGY are gone (#pi-21.4)
+
+---
+
 # 🔵⋯ v0.32.1 (2026-11-22)
 ## 🟠⋯ Fixed for End Users
 - 2026-11-22 - fix | click, drag, scroll or move the mouse over shell-command groups in Pi 1.6.0 without Pi exiting. The groups view no longer reads a private Pi field to route the mouse, and a fault in its own routing now turns the groups off with one warning instead of exiting Pi. Header and member clicks, links and drag-copy inside groups work as before on Pi 0.85.1 and 1.6.0. Update only `rbf-shell-command-groups.ts` and fully restart Pi. Known Pi 1.6.0 gaps outside the mouse: a session reopened after a mid-command kill miscounts its group (`#pi-59`). `v0.33.0` and `v0.33.1` were cut on the separate `#pi-21` stack, not on this line (#pi-57)

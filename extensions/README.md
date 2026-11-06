@@ -880,6 +880,8 @@ The implementation consists of four files:
 ## 🟠⋯ Installation & Rollback
 
 ### 🟣⋯ Global Installation
+Install from a checkout of v0.33.0. Other revisions may not match the files this section describes.
+
 1. Finish or stop any active AGY turn in Pi, ensuring no native child process is running.
 2. Back up existing installed files in `~/.pi/agent/extensions/`. `cp -n` never overwrites a backup, so a second install keeps the first backup:
    ```bash
