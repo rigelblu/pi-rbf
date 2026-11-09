@@ -6,6 +6,15 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.33.1 (2026-11-09)
+## 🟠⋯ Fixed for End Users
+- 2026-11-09 - fix | roll back safely from a later release: an AGY chat that release started is refused with nothing sent, instead of AGY answering it with none of the chat's context. Start it over with `/new` (#pi-21.3)
+
+## 🟠⋯ Improved for Builders
+- 2026-11-09 - improve (technical) | run the AGY offline cases and host checks on Pi 1.5.0, the Pi in daily use, without them reporting installs to pi.dev (#pi-21.3)
+
+---
+
 # 🔵⋯ v0.33.0 (2026-11-05)
 ## 🟠⋯ Added for End Users
 - 2026-11-05 - feat | choose native AGY model families and supported efforts through Pi's usual model controls, then run an ordinary task and same-conversation follow-ups directly through AGY, without operating AGY's own TUI. Install the four AGY files and fully restart Pi (#pi-21.1)

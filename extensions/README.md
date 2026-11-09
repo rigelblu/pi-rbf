@@ -868,19 +868,20 @@ The implementation consists of four files:
 - **Integrity checks:** session verification matches exact cumulative turn count, step frontier, and branch history.
 - **Foreign entries:** other extensions' plain custom entries appended to the session log do not disrupt branch verification or end the AGY conversation.
 - **Refusals & checkpoints:** incomplete turns, legacy sessions, or unconfirmed checkpoints cannot resume. If a checkpoint cannot be confirmed on disk, Pi issues a warning that recovery may be unavailable.
+- **Chats from a later release:** a session holding AGY records this release doesn't know, such as a chat a later release started on AGY's ACP route, refuses its first message with nothing sent: `AGY history no longer matches this Pi branch. Your message was not sent. Use /new to start a new conversation.` Start it over with `/new`. Since v0.33.1; v0.33.0 would send that message into a new AGY conversation with none of the chat's context.
 
 ### 🟣⋯ Context and Stop Disclosures
 - **Usage truth:** context metrics show `AGY context: unknown`; AGY token usage is cumulative native session data and is not converted into artificial Pi token totals.
 - **Idle stop notice:** stopping an idle child warns that commands started by AGY may still be running in the background.
 
 ## 🟠⋯ Setup & Verification
-- Compile target is Pi 0.85.1; runtime target is Pi 1.4.0 TUI.
-- Automated verification covers 340 unit and protocol tests, 3 host verification scripts, and 15 offline contract scenarios with zero real AGY network or model requests.
+- Compile target is Pi 0.85.1; runtime target is Pi 1.5.0 TUI (since v0.33.1; v0.33.0 was verified on Pi 1.4.0).
+- Automated verification covers 346 unit and protocol tests, 3 host verification scripts, and 15 offline contract scenarios with zero real AGY network or model requests. The offline scenarios and host checks run on Pi 1.5.0 only and refuse other Pi versions until they're revalidated.
 
 ## 🟠⋯ Installation & Rollback
 
 ### 🟣⋯ Global Installation
-Install from a checkout of v0.33.0. Other revisions may not match the files this section describes.
+Install from a checkout of v0.33.1. Other revisions may not match the files this section describes. Upgrading from v0.33.0 changes only `rbf-agy.ts`; the three `lib/` files are identical.
 
 1. Finish or stop any active AGY turn in Pi, ensuring no native child process is running.
 2. Back up existing installed files in `~/.pi/agent/extensions/`. `cp -n` never overwrites a backup, so a second install keeps the first backup:
@@ -908,3 +909,5 @@ Install from a checkout of v0.33.0. Other revisions may not match the files this
    rm -f ~/.pi/agent/extensions/lib/agy-history.ts ~/.pi/agent/extensions/lib/agy-recovery.ts
    ```
 2. Fully restart Pi. Your saved messages stay readable. The older provider can't resume from the new checkpoints and doesn't draw saved AGY reports.
+
+The `.bak` files hold what was installed before your first install, because `cp -n` keeps the first backup. To go back from v0.33.1 to v0.33.0 instead, restore v0.33.0's `rbf-agy.ts` from your own copy of it; the `lib/` files are the same.
