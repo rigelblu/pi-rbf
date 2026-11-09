@@ -1134,10 +1134,26 @@ describe("pi-21.3 rollback guard", () => {
 		return h;
 	}
 	/** Sends one message and returns what the fake executable saw during that send only. */
-	async function send(h: ReturnType<typeof harness>) {
+	async function send(h: ReturnType<typeof harness>, text = "Continue where we left off") {
 		await h.ready;
-		const before = h.logs().length, answer = await h.request("Continue where we left off");
+		const before = h.logs().length, answer = await h.request(text);
 		return { answer, during: h.logs().slice(before) };
+	}
+	const MISMATCH = "AGY history no longer matches this Pi branch. Your message was not sent. Use /new to start a new conversation.";
+	const NO_CHECKPOINT = "This AGY conversation has no verified recovery checkpoint. Your message was not sent. Use /new to start a new conversation.";
+	/** Every AGY record in the file, on any branch. A refusal must not add a CLI record: that would hand an ACP chat to the CLI route for good. */
+	const agyRecords = (h: ReturnType<typeof harness>) => h.entries.filter(e => e.type === "custom" && String(e.customType).startsWith("rbf-agy-")).map(e => e.customType);
+	const ACP_RECORDS = [ACP_CONVERSATION, ACP_DISPATCH, ACP_COMPLETION];
+	/** Saves the refusal the way Pi does (message_end, then agent_end, where the CLI writes its refusal record), then sends once more. */
+	async function saveThenRefuseAgain(h: ReturnType<typeof harness>, answer: any, copy: string) {
+		await h.persist(answer);
+		expect(agyRecords(h)).toEqual(ACP_RECORDS);
+		const again = await send(h, "Try once more");
+		expect(again.answer.stopReason).toBe("error");
+		expect(body(again.answer)).toBe(copy);
+		expect(again.during).toEqual([]);
+		await h.persist(again.answer);
+		expect(agyRecords(h)).toEqual(ACP_RECORDS);
 	}
 	const subcommand = (calls: any[], name: string) => calls.filter(x => x.args?.[0] === name);
 	const printChildren = (calls: any[]) => calls.filter(x => x.args?.some((a: string) => a.startsWith("--print")));
@@ -1145,13 +1161,14 @@ describe("pi-21.3 rollback guard", () => {
 	it("refuses the first message when the ACP records sit on the current branch", async () => {
 		const h = acpSession(false), { answer, during } = await send(h);
 		expect(answer.stopReason).toBe("error");
-		expect(body(answer)).toBe("AGY history no longer matches this Pi branch. Your message was not sent. Use /new to start a new conversation.");
+		expect(body(answer)).toBe(MISMATCH);
 		expect(subcommand(during, "models")).toEqual([]);
 		expect(subcommand(during, "--version")).toEqual([]);
 		expect(printChildren(during)).toEqual([]);
 		expect(during).toEqual([]);
 		expect(h.entries.filter(e => e.customType === AGY_PROVENANCE)).toEqual([]);
 		expect(h.ctx.ui.notify).not.toHaveBeenCalledWith(AGY_COPY.cold, expect.anything());
+		await saveThenRefuseAgain(h, answer, MISMATCH);
 	});
 
 	it("refuses the first message when the ACP records sit only on another branch", async () => {
@@ -1159,12 +1176,13 @@ describe("pi-21.3 rollback guard", () => {
 		expect(h.ctx.sessionManager.getBranch().some((e: any) => String(e.customType).startsWith("rbf-agy-acp-"))).toBe(false);
 		expect(h.entries.some(e => e.customType === ACP_COMPLETION)).toBe(true);
 		expect(answer.stopReason).toBe("error");
-		expect(body(answer)).toBe("This AGY conversation has no verified recovery checkpoint. Your message was not sent. Use /new to start a new conversation.");
+		expect(body(answer)).toBe(NO_CHECKPOINT);
 		expect(subcommand(during, "models")).toEqual([]);
 		expect(subcommand(during, "--version")).toEqual([]);
 		expect(printChildren(during)).toEqual([]);
 		expect(during).toEqual([]);
 		expect(h.entries.filter(e => e.customType === AGY_PROVENANCE)).toEqual([]);
+		await saveThenRefuseAgain(h, answer, NO_CHECKPOINT);
 	});
 
 	it("still starts fresh when the session holds only other extensions' custom entries", async () => {
