@@ -95,6 +95,8 @@ import { AGY_EXECUTABLE, MIN_PI_VERSION, BOUNDS, parseVersion, versionAtLeast, c
 import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, RECOVERY_COPY, RecoveryError, readSavedSession, appendEvidence, selectRecoveryCompletion, fingerprint, entryFingerprint, historyFingerprint, isForeignEntry, type CompletionAnchor, type RecoveryTuple } from "./lib/agy-recovery.js";
 import { AGY_ACTIVITY, AGY_REPORTED_ACTIVITY, renderAgyReportedStep, AGY_HISTORY_FAILURE, newAgyActivityBudget, recordAgyActivity, renderAgyActivity } from "./lib/agy-history.js";
 export const AGY_PROVENANCE = "rbf-agy-conversation/v1";
+/** Every custom entry type this release writes or renders. An `rbf-agy-*` entry outside this set came from another release, so `priorUse()` hands the session to recovery, which refuses it, instead of starting a cold conversation. */
+export const AGY_KNOWN_ENTRY_TYPES: ReadonlySet<string> = new Set([AGY_PROVENANCE, AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, AGY_ACTIVITY, AGY_REPORTED_ACTIVITY]);
 export interface AgyRetirementSeal {
 	owner?: symbol;
 	/** Presentation only; never an admission or resource-release condition. */
@@ -462,7 +464,7 @@ export function createRbfAgy(options: AgyProviderOptions = {}) {
 			catch { }
 		};
 		function branch() { return ctx!.sessionManager.getBranch() as any[]; }
-		function priorUse() { return (ctx!.sessionManager.getEntries() as any[]).some(e => e?.type === "custom" && [AGY_PROVENANCE, AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL].includes(e.customType) || e?.type === "message" && e.message?.role === "assistant" && !["aborted", "error", "length"].includes(e.message.stopReason) && Array.isArray(e.message.content) && e.message.content.some((c: any) => c?.type === "toolCall" && c.name === "agy_controlled")); }
+		function priorUse() { return (ctx!.sessionManager.getEntries() as any[]).some(e => e?.type === "custom" && ([AGY_PROVENANCE, AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL].includes(e.customType) || !isForeignEntry(e) && !AGY_KNOWN_ENTRY_TYPES.has(e.customType)) || e?.type === "message" && e.message?.role === "assistant" && !["aborted", "error", "length"].includes(e.message.stopReason) && Array.isArray(e.message.content) && e.message.content.some((c: any) => c?.type === "toolCall" && c.name === "agy_controlled")); }
 		async function refreshModels(c: RefreshModelsContext): Promise<ProviderModelConfig[]> {
 			const stored = (c.stored?.models ?? []).filter(m => m.id !== REMOVED_MODEL_ID).map(m => ({ id: m.id, name: m.name, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap, input: m.input, cost: m.cost, contextWindow: m.contextWindow, maxTokens: m.maxTokens }));
 			if (!c.allowNetwork) {

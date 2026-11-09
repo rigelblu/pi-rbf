@@ -1104,3 +1104,87 @@ describe('durable AGY observations through the real provider', () => {
   const h=harness();await h.request('No tools');expect(h.pi.registerEntryRenderer).toHaveBeenCalledWith(AGY_ACTIVITY,expect.any(Function));expect(h.pi.registerEntryRenderer).toHaveBeenCalledWith("rbf-agy-activity/v2",expect.any(Function));expect(reports(h)).toHaveLength(0);
  });
 });
+
+describe("pi-21.3 rollback guard", () => {
+	// v0.33.1 refuses the first message in a chat that holds ACP records, which only a later release writes.
+	// The record names are literals here on purpose: v0.33.x does not export them.
+	const ACP_CONVERSATION = "rbf-agy-acp-conversation/v1", ACP_DISPATCH = "rbf-agy-acp-dispatch/v1", ACP_COMPLETION = "rbf-agy-acp-completion/v1";
+	const stamp = (n: number) => new Date(Date.UTC(2026, 10, 9, 12, 0, n)).toISOString();
+	/** Writes a Pi session file that already holds an ACP chat; `offBranch` leaves the current branch before its first AGY send. */
+	function acpSession(offBranch: boolean) {
+		const root = mkdtempSync(join(roots!, "rollback-")), sessionId = `pi-${root}`, acpSessionId = "acp-7f3a91c2-5d04-4e8b-a1b6-0c92e3d47f15";
+		const entry = (id: string, parentId: string | null, n: number, body: object) => ({ id, parentId, timestamp: stamp(n), ...body });
+		const model = "gemini-3.8-flash";
+		const acp: any[] = [
+			entry("00000011", "00000010", 2, { type: "message", message: { role: "user", content: [{ type: "text", text: "Summarise this repo" }], timestamp: Date.parse(stamp(2)) } }),
+			entry("00000012", "00000011", 3, { type: "custom", customType: ACP_CONVERSATION, data: { acpSessionId, cwd: root, piSessionId: sessionId } }),
+			entry("00000013", "00000012", 4, { type: "custom", customType: ACP_DISPATCH, data: { acpSessionId, userId: "00000011", model, effort: "high", promptBytes: 19 } }),
+			entry("00000014", "00000013", 5, { type: "message", message: { role: "assistant", content: [{ type: "text", text: "A package of Pi extensions." }], api: AGY_API, provider: AGY_PROVIDER, model, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.parse(stamp(5)) } }),
+			entry("00000015", "00000014", 6, { type: "custom", customType: ACP_COMPLETION, data: { acpSessionId, dispatchId: "00000013", assistantId: "00000014", model, effort: "high", stopReason: "end_turn" } }),
+		];
+		const lines = [{ type: "session", version: 3, id: sessionId, cwd: root, timestamp: stamp(0) }, entry("00000010", null, 1, { type: "model_change", provider: AGY_PROVIDER, modelId: model }), ...acp];
+		writeFileSync(join(root, "pi.jsonl"), lines.map(l => JSON.stringify(l)).join("\n") + "\n");
+		const h = harness("normal", { root });
+		if (offBranch) {
+			// After /tree back to the model change: the ACP entries stay in the file but leave the current branch.
+			const off = new Set(acp.map(e => e.id)), sm = h.ctx.sessionManager, byId = () => new Map(h.entries.map((e: any) => [e.id, e]));
+			sm.getLeafId = () => h.entries.filter((e: any) => !off.has(e.id)).at(-1)?.id ?? null;
+			sm.getBranch = () => { const map = byId(), out: any[] = []; for (let id = sm.getLeafId(); id; id = map.get(id).parentId) out.unshift(map.get(id)); return out; };
+		}
+		return h;
+	}
+	/** Sends one message and returns what the fake executable saw during that send only. */
+	async function send(h: ReturnType<typeof harness>) {
+		await h.ready;
+		const before = h.logs().length, answer = await h.request("Continue where we left off");
+		return { answer, during: h.logs().slice(before) };
+	}
+	const subcommand = (calls: any[], name: string) => calls.filter(x => x.args?.[0] === name);
+	const printChildren = (calls: any[]) => calls.filter(x => x.args?.some((a: string) => a.startsWith("--print")));
+
+	it("refuses the first message when the ACP records sit on the current branch", async () => {
+		const h = acpSession(false), { answer, during } = await send(h);
+		expect(answer.stopReason).toBe("error");
+		expect(body(answer)).toBe("AGY history no longer matches this Pi branch. Your message was not sent. Use /new to start a new conversation.");
+		expect(subcommand(during, "models")).toEqual([]);
+		expect(subcommand(during, "--version")).toEqual([]);
+		expect(printChildren(during)).toEqual([]);
+		expect(during).toEqual([]);
+		expect(h.entries.filter(e => e.customType === AGY_PROVENANCE)).toEqual([]);
+		expect(h.ctx.ui.notify).not.toHaveBeenCalledWith(AGY_COPY.cold, expect.anything());
+	});
+
+	it("refuses the first message when the ACP records sit only on another branch", async () => {
+		const h = acpSession(true), { answer, during } = await send(h);
+		expect(h.ctx.sessionManager.getBranch().some((e: any) => String(e.customType).startsWith("rbf-agy-acp-"))).toBe(false);
+		expect(h.entries.some(e => e.customType === ACP_COMPLETION)).toBe(true);
+		expect(answer.stopReason).toBe("error");
+		expect(body(answer)).toBe("This AGY conversation has no verified recovery checkpoint. Your message was not sent. Use /new to start a new conversation.");
+		expect(subcommand(during, "models")).toEqual([]);
+		expect(subcommand(during, "--version")).toEqual([]);
+		expect(printChildren(during)).toEqual([]);
+		expect(during).toEqual([]);
+		expect(h.entries.filter(e => e.customType === AGY_PROVENANCE)).toEqual([]);
+	});
+
+	it("still starts fresh when the session holds only other extensions' custom entries", async () => {
+		const h = harness();
+		h.pi.appendEntry("rbf-cache-guardian/state", { warmedAt: 1 });
+		h.pi.appendEntry("some-other-extension", { note: "plain custom entry" });
+		const { answer, during } = await send(h);
+		expect(answer.stopReason).toBe("stop");
+		expect(subcommand(during, "models")).toHaveLength(1);
+		expect(subcommand(during, "--version")).toHaveLength(1);
+		expect(printChildren(during)).toHaveLength(1);
+		expect(inputs(h)).toHaveLength(1);
+	});
+
+	it("does not treat the activity types v0.33.x writes as another release's records", async () => {
+		const h = harness();
+		h.pi.appendEntry("rbf-agy-activity/v1", { note: "known CLI activity type" });
+		h.pi.appendEntry("rbf-agy-activity/v2", { note: "known reported-step type" });
+		const { answer, during } = await send(h);
+		expect(answer.stopReason).toBe("stop");
+		expect(printChildren(during)).toHaveLength(1);
+	});
+});
