@@ -45,7 +45,7 @@ const home = join(out, "empty-home"), tmp = join(out, "tmp");
 for (const p of [work, profile, sessions, home, tmp])
 	mkdirSync(p, { mode: 0o700 });
 const metadata = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
-if (metadata.version !== "1.4.0")
+if (metadata.version !== "1.5.0")
 	throw new Error("Revalidate actual-host recipe for this new Pi version");
 const theme = args.get("--theme") ?? "dark";
 if (!["dark", "light"].includes(theme))
@@ -171,7 +171,7 @@ if (name === "presentation-and-usage") {
 	steps.push(...submit("/session"), { sleep: .4 }, snapshot("session80"), resize(120), snapshot("session120"), resize(80), ...choose("pi21-fake-neighbor/fixture"), ...submit("Known neighbor accounting fixture."), wait("test_turn_end", 3), ...submit("/session"), { sleep: .3 }, snapshot("mixed80"), resize(120), snapshot("mixed120"), resize(80), ...choose("agy-harness/gemini-3.8-flash"), ...submit("/reload"), { reloadReady: { path: ready, loads: 2, command: "/pi21-offline-ready", clearDraft: true } }, snapshot("reloaded80"), ...submit("/new"), { reloadReady: { path: ready, loads: 3, command: "/pi21-offline-ready", clearDraft: true } }, snapshot("clean-new80"), resize(120), snapshot("clean-new120"));
 }
 steps.push(...submit("/quit"), { waitExit: 6 });
-const raw = join(out, "terminal.raw"), plan = { argv: [node, join(pkg, "dist/cli.js"), "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "-e", wrapper, "--session-dir", sessions, "--provider", "agy-harness", "--model", "gemini-3.8-flash", "--tui-mode", "fullscreen", ...(name === "policy-and-startup" ? ["--agy-settings", policyFile] : []), ...(name === "actual-pi-contract" ? ["--no-session"] : [])], cwd: work, inheritEnv: false, env: { HOME: home, XDG_CONFIG_HOME: join(home, "config"), XDG_DATA_HOME: join(home, "data"), XDG_STATE_HOME: join(home, "state"), TMPDIR: tmp, LANG: "en_US.UTF-8", SHELL: "/bin/zsh", PI_CODING_AGENT_DIR: profile, PATH: [dirname(node), ...toolDirs, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":") }, cols: 80, rows: 35, timeout: 100, out: raw, steps };
+const raw = join(out, "terminal.raw"), plan = { argv: [node, join(pkg, "dist/cli.js"), "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "-e", wrapper, "--session-dir", sessions, "--provider", "agy-harness", "--model", "gemini-3.8-flash", "--tui-mode", "fullscreen", ...(name === "policy-and-startup" ? ["--agy-settings", policyFile] : []), ...(name === "actual-pi-contract" ? ["--no-session"] : [])], cwd: work, inheritEnv: false, env: { HOME: home, XDG_CONFIG_HOME: join(home, "config"), XDG_DATA_HOME: join(home, "data"), XDG_STATE_HOME: join(home, "state"), TMPDIR: tmp, LANG: "en_US.UTF-8", SHELL: "/bin/zsh", PI_CODING_AGENT_DIR: profile, PI_TELEMETRY: "0", PATH: [dirname(node), ...toolDirs, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":") }, cols: 80, rows: 35, timeout: 100, out: raw, steps };
 writeFileSync(join(out, "plan.json"), JSON.stringify(plan, null, 2));
 console.log(`[${name}] starting actual Pi ${metadata.version} TUI with factory-injected fake; zero real requests`);
 const result = spawnSync("python3", [join(root, "extensions/test-support/rbf-row-gate-drive.py")], { input: JSON.stringify(plan), encoding: "utf8", timeout: 110000 });

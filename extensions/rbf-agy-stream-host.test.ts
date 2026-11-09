@@ -12,7 +12,7 @@ if(!existsSync(host))throw new Error("Daily Pi host missing; no fallback permitt
 const hash=(text:string)=>createHash("sha256").update(text).digest("hex");
 const jsonl=(file:string)=>readFileSync(file,"utf8").trim().split("\n").filter(Boolean).map(x=>JSON.parse(x));
 const run=async(profile:ReturnType<typeof createAgyStreamProfile>,scenario:string,steps:any[],name="turn",session?:string,mutation?:string)=>{
- const plan={cwd:profile.root,argv:[host,"--no-extensions","--no-skills","--no-prompt-templates","-e",wrapper,"--session-dir",profile.sessions,"--tui-mode","fullscreen",...(session?["--session",session]:[])],env:{PI_CODING_AGENT_DIR:profile.agent,RBF_AGY_STREAM_ROOT:profile.root,RBF_AGY_STREAM_SCENARIO:scenario,RBF_AGY_STREAM_HOLD_MS:"1800",RBF_AGY_STREAM_MUTATION:mutation ?? ""},cols:100,rows:38,timeout:20,out:join(profile.root,name+".raw"),steps};
+ const plan={cwd:profile.root,argv:[host,"--no-extensions","--no-skills","--no-prompt-templates","-e",wrapper,"--session-dir",profile.sessions,"--tui-mode","fullscreen",...(session?["--session",session]:[])],env:{PI_CODING_AGENT_DIR:profile.agent,PI_TELEMETRY:"0",RBF_AGY_STREAM_ROOT:profile.root,RBF_AGY_STREAM_SCENARIO:scenario,RBF_AGY_STREAM_HOLD_MS:"1800",RBF_AGY_STREAM_MUTATION:mutation ?? ""},cols:100,rows:38,timeout:20,out:join(profile.root,name+".raw"),steps};
  writeFileSync(join(profile.root,name+"-plan.json"),JSON.stringify(plan,null,2));
  const result=await new Promise<{status:number|null;stderr:string;stdout:string}>((resolve,reject)=>{
   const child=spawn("python3",[driver],{stdio:["pipe","pipe","pipe"]});let stdout="",stderr="";

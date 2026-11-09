@@ -48,7 +48,7 @@ for (const cols of [80, 120]) {
 	function run(label: string, steps: unknown[]) {
 		const countsBefore = nativeCounts();
 		const raw = join(root, `${cols}-${label}.raw`);
-		const plan = { cwd: root, argv: [pi, "--no-extensions", "--no-skills", "--no-prompt-templates", "--model", "agy-harness/gemini-3.8-flash", "--thinking", "high", "--session", file, "--session-dir", sessions, "--tui-mode", "fullscreen", ...bundleArgs, "-e", join(support, "rbf-agy-history-candidate.ts")], env: { PI_CODING_AGENT_DIR: profile, TERM_PROGRAM: "Apple_Terminal", KITTY_WINDOW_ID: "", TMUX: "", STY: "", PI_TELEMETRY_DISABLED: "1" }, cols, rows: 60, timeout: 30, out: raw, steps };
+		const plan = { cwd: root, argv: [pi, "--no-extensions", "--no-skills", "--no-prompt-templates", "--model", "agy-harness/gemini-3.8-flash", "--thinking", "high", "--session", file, "--session-dir", sessions, "--tui-mode", "fullscreen", ...bundleArgs, "-e", join(support, "rbf-agy-history-candidate.ts")], env: { PI_CODING_AGENT_DIR: profile, TERM_PROGRAM: "Apple_Terminal", KITTY_WINDOW_ID: "", TMUX: "", STY: "", PI_TELEMETRY_DISABLED: "1", PI_TELEMETRY: "0" }, cols, rows: 60, timeout: 30, out: raw, steps };
 		writeFileSync(join(root, `${cols}-${label}-plan.json`), JSON.stringify(plan, null, 2));
 		const result = spawnSync("python3", [join(support, "rbf-row-gate-drive.py")], { input: JSON.stringify(plan), encoding: "utf8", timeout: 35000 });
 		writeFileSync(join(root, `${cols}-${label}-result.json`), JSON.stringify({ code: result.status, stderr: result.stderr, stdout: result.stdout }, null, 2));

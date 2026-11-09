@@ -15,7 +15,7 @@ describe("clean recovery in actual daily Pi TUI with fake native", () => {
 		writeFileSync(join(agent, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low", theme: "dark" }));
 		const run = (name: string, steps: any[], session?: string) => {
 			const out = join(root, name + ".raw");
-			const plan = { cwd, argv: [HOST, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-builtin-tools", "-e", join(ROOT, "extensions/test-support/agy-recovery-extension.ts"), "--session-dir", sessions, ...(session ? ["--session", session] : []), "--tui-mode", "fullscreen"], env: { PI_CODING_AGENT_DIR: agent, PI214_OFFLINE_ROOT: root }, cols: 100, rows: 38, timeout: 24, out, steps };
+			const plan = { cwd, argv: [HOST, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-builtin-tools", "-e", join(ROOT, "extensions/test-support/agy-recovery-extension.ts"), "--session-dir", sessions, ...(session ? ["--session", session] : []), "--tui-mode", "fullscreen"], env: { PI_CODING_AGENT_DIR: agent, PI_TELEMETRY: "0", PI214_OFFLINE_ROOT: root }, cols: 100, rows: 38, timeout: 24, out, steps };
 			writeFileSync(join(root, name + ".plan.json"), JSON.stringify(plan, null, 2));
 			const result = spawnSync("python3", [join(ROOT, "extensions/test-support/rbf-row-gate-drive.py")], { input: JSON.stringify(plan), encoding: "utf8", timeout: 30000 });
 			writeFileSync(join(root, name + ".result.json"), JSON.stringify(result, null, 2));
@@ -52,7 +52,7 @@ describe("clean recovery in actual daily Pi TUI with fake native", () => {
 		for (const dir of [agent, sessions, cwd]) mkdirSync(dir);
 		writeFileSync(join(agent, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low", theme: "dark" }));
 		const out = join(root, "terminal.raw");
-		const plan = { cwd, argv: [HOST, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-builtin-tools", "-e", join(ROOT, "extensions/test-support/agy-recovery-extension.ts"), "--session-dir", sessions, "--tui-mode", "fullscreen"], env: { PI_CODING_AGENT_DIR: agent, PI214_OFFLINE_ROOT: root, PI214_OFFLINE_FAIL_COMPLETION: "1" }, cols: 100, rows: 38, timeout: 15, out, steps: [{ wait: "OFFLINE_READY" }, ...submit("/model agy-harness/gemini-3.8-flash"), { sleep: .6 }, ...submit("Remember MAPLE-FAULT214."), { wait: "OFFLINE_SAVED_0" }, { sleep: .2 }, { snapshot: "warning" }, ...submit("/quit"), { waitExit: 4 }] };
+		const plan = { cwd, argv: [HOST, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-builtin-tools", "-e", join(ROOT, "extensions/test-support/agy-recovery-extension.ts"), "--session-dir", sessions, "--tui-mode", "fullscreen"], env: { PI_CODING_AGENT_DIR: agent, PI_TELEMETRY: "0", PI214_OFFLINE_ROOT: root, PI214_OFFLINE_FAIL_COMPLETION: "1" }, cols: 100, rows: 38, timeout: 15, out, steps: [{ wait: "OFFLINE_READY" }, ...submit("/model agy-harness/gemini-3.8-flash"), { sleep: .6 }, ...submit("Remember MAPLE-FAULT214."), { wait: "OFFLINE_SAVED_0" }, { sleep: .2 }, { snapshot: "warning" }, ...submit("/quit"), { waitExit: 4 }] };
 		writeFileSync(join(root, "plan.json"), JSON.stringify(plan, null, 2));
 		const result = spawnSync("python3", [join(ROOT, "extensions/test-support/rbf-row-gate-drive.py")], { input: JSON.stringify(plan), encoding: "utf8", timeout: 20000 });
 		writeFileSync(join(root, "result.json"), JSON.stringify(result, null, 2)); expect(result.status, root + " " + result.stderr).toBe(0);
