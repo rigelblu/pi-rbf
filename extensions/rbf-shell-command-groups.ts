@@ -751,9 +751,9 @@ class NativeFault {
 	constructor(readonly error: unknown) {}
 }
 
-/** What the last drawn frame put where: one entry per run of lines, in the shape Pi's own container routes a mouse event through. */
+/** What the last drawn frame put where: one entry per run of lines. */
 type Segment = { component: { handleMouse?: (event: any) => any }; height: number };
-type Layout = { width: number; segments: Segment[] };
+type Layout = { width: number; segments: Segment[]; router?: Container };
 /** A left press on a header or member, waiting for its click. Anything that moved the target since cancels it. */
 type Armed =
 	| {
@@ -813,6 +813,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events"> & Partial
 	let nativeFinals = new WeakMap<object, McpFinal>();
 	let signature: unknown[] = [];
 	let layout: Layout | undefined;
+	let segmentThrew: { error: unknown } | undefined;
 	let armed: Armed | undefined;
 	let disclosureGeneration = 0;
 
@@ -1418,8 +1419,41 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events"> & Partial
 		}
 		// Any competing press, drag, or wheel on any row (outside row, inert row, or group row) clears any prior armed gesture before routing
 		if (event?.type === "press" || event?.type === "drag" || event?.type === "wheel") armed = undefined;
-		// Pi's own routing, over the lines the view drew instead of the lines the container would have drawn.
-		return original.call({ mouseLayout: { width: drawn.width, children: drawn.segments } }, event);
+		segmentThrew = undefined;
+		try {
+			return routerFor(drawn).handleMouse(event);
+		} catch (error) {
+			const thrown = segmentThrew as { error: unknown } | undefined;
+			if (thrown && Object.is(thrown.error, error)) throw error;
+			fail("mouse", error);
+			return { handled: true };
+		} finally {
+			segmentThrew = undefined;
+		}
+	}
+
+	function routerFor(drawn: Layout): Container {
+		if (drawn.router) return drawn.router;
+		const routed = new Container();
+		for (const segment of drawn.segments) {
+			const lines = Array.from({ length: segment.height }, () => "");
+			routed.addChild({
+				render: () => lines,
+				invalidate() {},
+				handleMouse: (event: any) => {
+					try {
+						return segment.component.handleMouse?.(event);
+					} catch (error) {
+						segmentThrew = { error };
+						throw error;
+					}
+				},
+			});
+		}
+		// Routing works without this render, through a miss on Pi's private layout cache; rendering once fills that cache before motion events arrive.
+		routed.render(drawn.width);
+		drawn.router = routed;
+		return routed;
 	}
 
 	// ── what the wrappers reach ──
@@ -1488,7 +1522,7 @@ export function createShellGroupsView(pi: Pick<ExtensionAPI, "events"> & Partial
 	}
 
 	const api = {
-		/** Every wrapper lands here with the method it replaced. Pi's method runs exactly once, and its result or error is the caller's. */
+		/** Every wrapper lands here with the method it replaced. Pi's method runs at most once, and its result or error is the caller's. Over a drawn frame the container's `render` and `handleMouse` are the view's own: Pi's method runs only after a fault of the view's has ended the view (`fail`), and that fault never reaches Pi. */
 		call(name: string, self: any, original: Method, args: any[]): any {
 			if (inert || stopped) return original.apply(self, args);
 			switch (name) {

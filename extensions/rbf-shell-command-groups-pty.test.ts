@@ -796,6 +796,41 @@ describe.skipIf(!READY)("shell command groups in a real Pi (pty)", () => {
 			PTY,
 		);
 
+		it(
+			"pi-57: pointer motion over a group, with no button held, leaves Pi running and the group as it was",
+			async () => {
+				const run = await drive({
+					scenario,
+					host,
+					name: "pointer-motion",
+					extensions: PROFILE,
+					script,
+					cols: 100,
+					rows: 60,
+					steps: [
+						...START,
+						...GO,
+						{ wait: "GATE_DONE" },
+						{ locate: { name: "h0", text: "ran 3 shell commands" } },
+						...[4, 8, 12, 16].map((x) => ({ bytes: `\x1b[<35;${x};{h0}M` })),
+						...mark("moved-closed"),
+						...click("h1", "ran 3 shell commands"),
+						...mark("opened"),
+						{ locate: { name: "out", text: "alpha" } },
+						...[4, 8, 12, 16].map((x) => ({ bytes: `\x1b[<35;${x};{h1}M` })),
+						...[4, 8, 12, 16].map((x) => ({ bytes: `\x1b[<35;${x};{out}M` })),
+						...mark("moved"),
+					],
+				});
+				expect(headers(transcript(run.lines("moved-closed")))).toEqual([" ▸ ran 3 shell commands"]);
+				expect(headers(transcript(run.lines("opened")))).toEqual([" ▾ ran 3 shell commands"]);
+				expect(headers(transcript(run.lines("moved")))).toEqual([" ▾ ran 3 shell commands"]);
+				expect(transcript(run.lines("moved"))).toEqual(transcript(run.lines("opened")));
+				expect(run.lines("moved").join("\n")).not.toContain("unavailable");
+			},
+			PTY,
+		);
+
 		it.each([80, 120])(
 			"C2: at %i columns, clicking an expanded command collapses the group, drag selection leaves it open, and header reopens it",
 			async (cols) => {

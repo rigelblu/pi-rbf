@@ -107,7 +107,8 @@ export default function rbfShellDisplayProbe(pi: ExtensionAPI): void {
 		originalRender = ToolExecutionComponent.prototype.render;
 		if (typeof originalRender === "function") {
 			wrappedRender = function (this: any, width: number) {
-				const lines: string[] = originalRender.call(this, width);
+				// Copy Pi's lines before pushing: Pi hands back its cached array while nothing changed, so a push grows the row every frame.
+				const lines: string[] = [...originalRender.call(this, width)];
 				const cmd = this.args?.command;
 				if (active && this.expanded && typeof cmd === "string" && cmd.includes(linkCmd)) {
 					// Labelled test-only native hyperlink line
