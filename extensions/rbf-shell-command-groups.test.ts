@@ -3040,6 +3040,80 @@ describe("extensions/rbf-shell-command-groups", () => {
 				expect(s.headers()).toEqual([" ▾ ran 1 shell command"]);
 			});
 
+			it("pi-57: a fault outside every segment turns the groups off instead of reaching Pi", async () => {
+				const s = stage();
+				await s.run("c1");
+				await s.run("c2");
+				const y = s.headerRow();
+				const broken = new Error("container routing changed");
+				const real = Container.prototype.handleMouse;
+				const spy = vi.spyOn(Container.prototype, "handleMouse").mockImplementation(function (this: any, event: any) {
+					if (this !== s.chat) throw broken;
+					return real.call(this, event);
+				});
+				try {
+					expect(s.mouse("press", y)).toMatchObject({ handled: true });
+					expect(s.view.fault).toMatchObject({ where: "mouse", error: broken });
+				} finally {
+					spy.mockRestore();
+				}
+				await tick();
+				expect(s.notify.mock.calls).toEqual([[UNAVAILABLE_WARNING, "warning"]]);
+				expect(s.draw()).toEqual(s.native());
+			});
+
+			it("pi-57: a row's own error reaches the caller as the same object, routed or captured", async () => {
+				const s = stage();
+				await s.run("c1");
+				const broken = new Error("leaf row failed");
+				let fails = true;
+				const leaf = {
+					render: () => ["LEAF ROW"],
+					invalidate() {},
+					handleMouse: vi.fn(() => {
+						if (fails) throw broken;
+						return { handled: true };
+					}),
+				};
+				s.chat.addChild(leaf);
+				const y = s.draw().indexOf("LEAF ROW");
+				expect(y).toBeGreaterThanOrEqual(0);
+				let routed: unknown;
+				try {
+					s.mouse("press", y);
+				} catch (error) {
+					routed = error;
+				}
+				expect(routed).toBe(broken);
+				fails = false;
+				const taker = s.mouse("press", y)?.target?.component;
+				expect(taker).toBeDefined();
+				fails = true;
+				let thrown: unknown;
+				try {
+					taker.handleMouse({ type: "release", button: "left", x: 6, y: 0, screenX: 6, screenY: y, width: 80, height: 1, shift: false, alt: false, ctrl: false });
+				} catch (error) {
+					thrown = error;
+				}
+				expect(thrown).toBe(broken);
+				expect(s.view.fault).toBeUndefined();
+				await tick();
+				expect(s.notify).not.toHaveBeenCalled();
+			});
+
+			it("pi-57: a leaf row that asks for focus gives it to the routing child, not to itself (known limit)", async () => {
+				const s = stage();
+				await s.run("c1");
+				const leaf = { render: () => ["FOCUS ROW"], invalidate() {}, handleMouse: vi.fn(() => ({ handled: true, focus: true })) };
+				s.chat.addChild(leaf);
+				const y = s.draw().indexOf("FOCUS ROW");
+				const result = s.mouse("press", y);
+				expect(leaf.handleMouse).toHaveBeenCalledWith(expect.objectContaining({ type: "press", y: 0 }));
+				expect(result.focusTarget).toBeDefined();
+				expect(result.focusTarget).not.toBe(leaf);
+				expect(result.focusTarget).toBe(result.target.component);
+			});
+
 			it("Pi's own methods keep their results and errors: a thrown event, a rejected event, a failed expansion that mirrors nothing", async () => {
 				const failure = new Error("native failure");
 				const s = stage();
