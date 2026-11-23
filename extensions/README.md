@@ -709,6 +709,20 @@ To undo an upgrade, restore the backed-up grouping view and Codex adapter togeth
 
 Verification: project Pi0.85.1 and daily Pi1.3.0, including generic identity, lifecycle/owner isolation, saved replay and original details. Tom passed mixed/long-name scan and light/dark readability, physical whole-group close/reopen, original native local-link opening and exact native drag/paste. Automated coverage includes40/80/120-column rendering and stale gestures. Real remote MCP/provider requests and universal provider compatibility are not claimed; human review used isolated deterministic sessions. Earlier v0.27.0/v0.30.1 evidence and limits remain in their changelog entries.
 
+## Upgrade to v0.32.1 on Pi 1.6.0
+
+v0.32.1 stops Pi 1.6.0 exiting on any mouse event over a group. Only the grouping view changes. Back it up, copy it, and fully restart Pi:
+
+```sh
+mkdir -p ~/.pi/agent-backups/pi-57-v0.32.1
+command cp -f ~/.pi/agent/extensions/rbf-shell-command-groups.ts ~/.pi/agent-backups/pi-57-v0.32.1/
+command cp -f ./extensions/rbf-shell-command-groups.ts ~/.pi/agent/extensions/rbf-shell-command-groups.ts
+```
+
+To undo, copy the backup back and fully restart Pi, or run `pi -ne`.
+
+Verification: project Pi0.85.1 and daily Pi1.6.0. Every click case passes on both, plus pointer motion and the routing-fault fallback. Tom passed motion, header open, member collapse and wheel scrolling in daily Pi 1.6.0 with all daily extensions. Three non-mouse PTY cases still fail on 1.6.0 only (`#pi-59`).
+
 # 🔵⋯ rbf-monitor
 
 Introduced in pi-rbf v0.28.0 (pi-44.1). The agent arms a shell command with `monitor`. Each line the command prints to stdout reaches the agent as an event. An event starts a turn when Pi is idle, and arrives mid-turn when Pi is working, so an agent waiting on something can end its turn and still hear about it:
