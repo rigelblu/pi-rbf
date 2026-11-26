@@ -6,6 +6,24 @@ title: Changelog
 
 ---
 
+# 🔵⋯ v0.33.2 (2026-11-26)
+## 🟠⋯ Added for End Users
+- 2026-11-26 - feat | change AGY's model or effort between turns and keep the same AGY conversation: AGY now runs through its ACP server, `agy acp`, and Pi confirms the model and effort AGY took before it sends (#pi-21.3)
+- 2026-11-26 - feat | allow once or reject each command or file change AGY asks for, in a dialog that shows the whole request, every parameter AGY sends with it, and says when AGY asks to run outside its sandbox. Allow once stays unavailable until you've seen every page (#pi-21.3)
+- 2026-11-26 - feat | see what AGY does after its turn ends, such as a finished background task or a subagent's answer, as its own turn headed `AGY continued on its own.` (#pi-21.3)
+- 2026-11-26 - feat | pick Gemini 4 Carbon, with low, medium or high effort (#pi-21.3)
+
+## 🟠⋯ 🚨 Breaking Changes
+- 2026-11-26 - change | an AGY chat started before this release can't continue: a message in it is refused with nothing sent. Use `/new` to start a new AGY chat (#pi-21.3)
+- 2026-11-26 - change | Pi lists AGY's Gemini models only. AGY's Claude and GPT-OSS models are gone from Pi's model list (#pi-21.3)
+- 2026-11-26 - change | AGY asks before every command it runs in an AGY chat; the old route's default policy ran some without asking (#pi-21.3)
+- 2026-11-26 - change | an `--agy-settings` file with any key other than `enableTerminalSandbox` refuses AGY chats, naming the key, since AGY's ACP server would ignore it without a word (#pi-21.3)
+
+## 🟠⋯ Added for Builders
+- 2026-11-26 - feat (technical) | set `RBF_AGY_WIRE_LOG=1` to log what AGY asked, what Pi answered, the approval dialog's steps and the saved records to `rbf-agy-wire.jsonl` in Pi's agent folder. It holds ids and states only, never AGY's text, a command or its output. Off by default (#pi-21.3)
+
+---
+
 # 🔵⋯ v0.33.1 (2026-11-09)
 ## 🟠⋯ Fixed for End Users
 - 2026-11-09 - fix | roll back safely from a later release: an AGY chat that release started is refused with nothing sent, instead of AGY answering it with none of the chat's context. Start it over with `/new` (#pi-21.3)
