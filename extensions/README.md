@@ -824,3 +824,126 @@ Local Pi extension that restores exact logical lines when selecting and copying 
   cp ./extensions/rbf-copy-wrapped-text.ts ~/.pi/agent/extensions/rbf-copy-wrapped-text.ts
   ```
 - Removal & rollback: restore the backed-up `rbf-clean-markdown-code.ts`, `rbf-tool-parts-indent.ts` and `rbf-path-labels.ts`; delete `rbf-copy-wrapped-text.ts` if it was absent before installation. Then fully restart Pi. Restore the whole four-file installation together; no settings or stored sessions migrate.
+
+# 🔵⋯ rbf-agy
+
+## 🟠⋯ Overview
+Local Pi provider extension that lets you use Google Antigravity (AGY) as the `agy-harness` provider alongside Pi's built-in providers. It talks to AGY over ACP (`agy acp`), with one AGY child process per Pi conversation. It streams AGY's answer, shows the commands AGY runs, asks you before AGY runs one, saves what happened in the Pi session file, and picks the same AGY conversation up again after `/reload` or a restart.
+
+Pi sends AGY only the text you type. Pi's own work (`/compact`, a `/tree` summary, an automatic retry) never goes to AGY.
+
+The implementation consists of eight files:
+- `extensions/rbf-agy.ts` — provider registration, model catalogue, the turn and wake-up lifecycle, and the footer and stop notices
+- `extensions/lib/agy-acp.ts` — the JSON-RPC client over the child's stdin and stdout: frames, size limits, requests and notifications
+- `extensions/lib/agy-acp-session.ts` — the AGY session owner: open or resume a session, set and confirm model and effort, send one prompt, cancel, wake-ups, the stop sequence, and the user-facing messages
+- `extensions/lib/agy-acp-approval.ts` — the approval queue and dialog, AGY's questions, and the saved approval lines
+- `extensions/lib/agy-history.ts` — bounded capture, validation and drawing of AGY's saved command steps
+- `extensions/lib/agy-recovery.ts` — reads the saved session file and checks the chain of AGY records that decides whether a chat can resume; branch fingerprints
+- `extensions/lib/agy-native.ts` — the shared basics: the `agy` path, Pi's minimum version (1.4.0) and version parsing, the size and time limits the stop sequence and the provider use, the clean-stop result type, and the sanitizer that cleans every piece of AGY text before it is drawn or saved
+- `extensions/lib/agy-wire-log.ts` — the opt-in message log: with `RBF_AGY_WIRE_LOG=1` it appends one line per event (what AGY sent, what Pi answered, the approval queue and dialog steps, the saved records) to `rbf-agy-wire.jsonl` in Pi's agent dir. It holds ids and states only, never AGY's text, a command or its output
+
+## 🟠⋯ Capabilities & Behavior
+
+### 🟣⋯ Start and sign in
+1. Sign in with AGY itself (run `agy` in a terminal). Pi never signs in for you.
+2. In Pi, pick an `agy-harness` model with `/model` and send a message. A new chat starts on ACP; there is no flag.
+3. Change effort with `/thinking <level>` (or `/effort <level>`) or the model with `/model`, then send the next message.
+4. To resume, quit Pi, run `pi -c` in the same folder, and send a message.
+- **Not signed in:** Pi shows `AGY needs you to sign in. Your message was not sent. Sign in with AGY itself, then send again.` Sign in with `agy`, then send again.
+- **Where it runs:** only in the Pi TUI, on Pi 1.4.0 or newer, and not in a sandboxed Pi (`--sandbox`). Anywhere else the message is refused with nothing sent.
+- **Chats from the old CLI route:** a chat the old CLI route started can't continue. Its next message is refused with `This chat used AGY's old CLI route, which Pi no longer runs. Your message was not sent. Use /new to start a new AGY chat.` Pi starts no AGY process for it, and `/new` starts an ACP chat. Saved CLI records aren't drawn.
+
+### 🟣⋯ Model and Effort Selection
+- **Provider ID:** `agy-harness`
+- **Model discovery:** configure Pi `enabledModels` with `"agy-harness/*"`. On cold start, open `/model`, wait for `Model catalogs refreshed.`, press `Tab` to switch from Scoped to All, and filter for `agy-harness/`.
+- **Gemini models only, eight of them on AGY 1.5.16.** `Gemini 4 Neon` and `Gemini 4 Hydrogen` take low, medium, high and xhigh. `Gemini 4 Argon`, `Gemini 4 Carbon` and `Gemini 3.8 Flash` take low, medium and high. The three Orchestrators (`Orchestrator (Neon)`, `Orchestrator (Carbon)` and `Orchestrator (Argon)`) have no effort setting. The Claude and GPT-OSS models AGY lists never reach Pi's model list, and a chat saved on one refuses its next message until you select a Gemini model.
+- **Changing model or effort:** change either between messages, in the same chat. The next message sets both on AGY, and Pi sends it only after AGY confirms the exact pair. A change made while AGY works applies to the next message. A setting AGY won't take in the same conversation refuses with nothing sent: select the previous setting to continue, or use `/new`.
+
+### 🟣⋯ Turns and Approvals
+- **Direct input:** only the text you type goes to AGY. System prompts, `AGENTS.md` text and earlier Pi messages are never sent. A new chat that already has earlier Pi messages shows `AGY starts with new context. Earlier Pi messages are not transferred.`
+- **Tools run inside AGY**, not as Pi tool calls. A live line above the editor shows the command AGY is on and whether it is starting, running, or waiting for your approval.
+- **Approval dialog:** when AGY asks to run a command, Pi shows the whole command, its folder and any other parameter AGY sends with it (for example `IsDaemon: false`), paged when long, with `Reject once` focused and `Allow once` next to it. It leaves out AGY's own summary (`toolSummary`) and wait time (`WaitMsBeforeAsync`). Only Pi's own lines (`Run:`, `In:` and one line per parameter) start at the left edge: every row that continues one of AGY's values starts with 2 spaces, so AGY's text can't pose as one of them. A command over about 21,800 characters is rejected with `AGY sent a request Pi can't show safely, so Pi rejected it.`, since AGY sends it three times inside a request's 64 KiB. Esc rejects that one request and the turn continues. There is no "always allow". A request nobody answers is rejected after 15 minutes. Commands and file writes ask, and AGY reads files without asking. When AGY asks to run a command outside its own sandbox, the dialog is headed `AGY needs approval to run outside its sandbox` in place of `AGY needs approval`.
+- **Saved approval lines:** each answer is saved and shown again after a reload, for example `You allowed AGY to run ls -1 once.` or `You rejected AGY's request to run ls -1.` A request to run outside AGY's sandbox says so, for example `You allowed AGY to run touch out.txt once, outside its sandbox.`
+- **Questions:** AGY's own questions get an error reply, so AGY asks them in the chat: `AGY asked a question Pi can't show yet, so AGY asks it in the chat instead.`
+- **A message typed while AGY works** is refused: `AGY is busy. Your message was not sent. Wait for the current request to finish.` It stays in the Up-arrow history, and the turn goes on. Esc stops the turn.
+- **AGY's own commands:** a message that starts with an AGY command such as `/goal` is refused with nothing sent; reword it so it doesn't start with the command. Pi's own commands, `/compact` included, are handled by Pi.
+- **Text only:** an image is refused with `AGY accepts text-only tasks. Your message was not sent. Remove images and send a new request.`
+- **No automatic retry:** after a turn whose outcome is uncertain, Pi never sends the message again. It says so and asks you to check the results.
+- **Authentication & policy:** AGY owns its sign-in and credentials. With no `--agy-settings`, the provider applies no permission or sandbox override.
+- **Optional settings:** `--agy-settings <absolute-file>` names a JSON file, validated and frozen on startup. It must be a regular file you own, not writable by group or others, and at most 64 KiB. Over ACP only `enableTerminalSandbox` applies (`true` starts `agy acp --sandbox`). Any other key is refused by name: `AGY over ACP can't apply these settings: <keys>. Your message was not sent. Remove them from the file, or start Pi without --agy-settings.` A change to the file during a session refuses further input until `/new`.
+
+### 🟣⋯ AGY Waking on Its Own
+- **Each wake-up is its own turn.** AGY 1.5.10 and later keep working after a turn ends: a background task finishes, a subagent answers, a timer fires. AGY 1.5.15 and later keep the turn open until background tasks and subagents finish, except daemon tasks such as dev servers, so this is rarer there. When AGY speaks on its own, Pi shows the dim line `AGY continued on its own.`, then streams AGY's reply and commands like any other turn. Pi sends AGY nothing for it.
+- **It ends** 3 seconds after AGY's last output, and not while an approval dialog is open. Approvals, questions and saved command steps work as in any turn.
+- **Esc stops it.** Pi cancels the turn and saves it as cancelled. AGY 1.5.10 and later also stop that conversation's subagents and background tasks when Pi cancels or closes it. Pi has not measured this on real AGY yet.
+- **A message you type during a wake-up** is refused like any message typed while AGY works. If AGY wakes just as you press Enter, you get that refusal and then the wake-up turn.
+- **If Pi cannot show a wake-up** (its turn did not start in time, or the settings file changed), Pi stops AGY and says so: `AGY's work after its turn couldn't be shown in time, so Pi stopped AGY. The chat continues.`, or `AGY's work after its turn couldn't be shown. Use /new to start a new AGY conversation.` when the chat cannot go on.
+- **If Pi quits during a wake-up,** the next message is refused with `Earlier AGY work has an unknown outcome. Your message was not sent. Check any changes and running commands before starting new work with /new.`
+
+### 🟣⋯ Pi's Own Work Never Goes to AGY
+- **`/compact`** and automatic compaction are cancelled while an AGY model is selected. Pi shows `Compaction cancelled`, or `Nothing to compact` when the session is small.
+- **A `/tree` summary** is supplied by the provider: `AGY branch summaries are unavailable; no native input was sent.` Moving the tree also closes the AGY conversation.
+- **Pi's automatic retry** can't send a message to AGY twice. A message AGY may already have run is refused on the second call, and AGY's own error text is written so Pi's retry check does not take it for a server error.
+
+### 🟣⋯ Streaming and Incomplete Output
+- **Real-time streaming:** assistant output streams live into the TUI. When the turn ends, the finished text is saved whole, even when it is empty.
+- **Size limit:** an answer past 1 MiB stops with `AGY response exceeded the supported output limit. The answer is incomplete.`
+- **Incomplete markings:** an answer that ends in an error, a cancel or the size limit after some text streamed is labeled `Incomplete AGY answer`, so incomplete text is never mistaken for a verified completion. An answer that ends because AGY changed its own model or effort carries no label: it ends with the line `AGY reported different settings for this turn. The task may have run. Review its results before sending again.`
+
+### 🟣⋯ History and Reports
+- **Saved command steps:** each command AGY finishes is saved in the Pi session file on this machine and drawn in history, for example `AGY command · step 1 · reported DONE`. It shows what AGY reported doing, not a checked outcome.
+- **Inspection:** press `Ctrl+O` (Pi's `app.tools.expand`) to expand and collapse tool output, including AGY's saved steps. It applies to all tool output at once, not one row.
+- **Limits:** a saved step holds at most 64 KiB of text and one Pi message at most 256 KiB. Text past either is cut, the step is still saved, and it is drawn with `Recorded output is incomplete.` Only a step that cannot be saved at all (past 192 KiB for one record, 2 MiB for one Pi message, or 256 records) makes Pi warn `AGY activity could not be saved. History may be incomplete.`
+
+### 🟣⋯ Resume and Recovery
+- **Resume:** after `/reload`, or `pi -c` in the same folder, the next message resumes the same AGY conversation in a new child process, sets model and effort again, and sends your message once. Earlier turns are never replayed.
+- **What Pi saves:** a conversation record before the first prompt, a dispatch record before each prompt and a completion record after each saved answer, plus the refusals, wake-ups and approvals between them. Resume reads that chain.
+- **When the chain doesn't hold** (an edited answer, a missing completion, a dispatch with no completion, an unknown record) the message is refused with nothing sent. The line says whether to check earlier work or use `/new`: `AGY history no longer matches this Pi branch.`, `Earlier AGY work has an unknown outcome.`, or `This AGY conversation has no verified recovery checkpoint.`
+- **One Pi per conversation:** keep each AGY conversation in one Pi process, and don't continue it in AGY's own app.
+- **What AGY can't follow:** AGY keeps one conversation per Pi branch. After `/fork`, a `/tree` move to an earlier point, or a copied session file, the next message is refused when the saved records show AGY went on elsewhere. `/new` starts a fresh conversation.
+- **Foreign entries:** other extensions' messages and plain custom entries, and `!` command output, don't disturb the check or end the conversation.
+- **A save that failed:** if a record can't be confirmed on disk, Pi warns `AGY recovery checkpoint could not be confirmed. The answer is visible, but recovery may be unavailable after restart.`
+
+### 🟣⋯ Context and Stop Disclosures
+- **Usage truth:** context metrics show `AGY context: unknown`, and Pi does not price AGY usage.
+- **Stop notice:** after a verified clean stop, the widget and the line under an error read `AGY stopped, along with its subagents and background tasks.` When Pi can't verify the stop, it warns `AGY stop could not be verified. Commands it started may still be running.`
+
+## 🟠⋯ Setup & Verification
+- Compile target is Pi 0.85.1; runtime target is Pi 1.6.0 TUI. The provider refuses to run on Pi older than 1.4.0.
+- Automated verification is the AGY unit and protocol tests plus actual-Pi cases that drive Pi 1.6.0 against a fake `agy acp` server (`extensions/rbf-agy-acp-pty.test.ts`). Nothing in them starts real AGY or makes a model request. The storage check (`extensions/test-support/rbf-agy-history-storage.ts`) refuses any Pi but 1.6.0 until it is revalidated; the actual-Pi cases start the `pi` named at the top of that file and were run on 1.6.0.
+- To run them from the repo root, give the tests an empty folder to work in first (they refuse to run without it), and put Pi's own `pi` on PATH: `rbf-agy.test.ts` fails without it, because it checks the error copies against the installed Pi's retry patterns. The actual-Pi file names the `pi` it starts at its top:
+  ```sh
+  export PI214_TEST_ROOT="$(mktemp -d)" PI_TELEMETRY=0 PATH="$HOME/Library/pnpm/bin:$PATH"
+  ./node_modules/.bin/tsc --noEmit
+  ./node_modules/.bin/vitest run extensions/rbf-agy*.test.ts extensions/lib/agy-*.test.ts --exclude "**/rb-drive/**"
+  ```
+
+## 🟠⋯ Installation & Rollback
+
+### 🟣⋯ Global Installation
+Install from the checkout this README came with. All eight files must match each other.
+
+1. Finish or stop any active AGY turn in Pi, so no AGY child process is running.
+2. Back up any installed copies in `~/.pi/agent/extensions/`. `cp -n` never overwrites a backup, so a second install keeps the first backup:
+   ```bash
+   EXT=~/.pi/agent/extensions
+   mkdir -p "$EXT/lib"
+   for f in rbf-agy.ts lib/agy-native.ts lib/agy-acp.ts lib/agy-acp-session.ts lib/agy-acp-approval.ts lib/agy-history.ts lib/agy-recovery.ts lib/agy-wire-log.ts; do [ -f "$EXT/$f" ] && command cp -n "$EXT/$f" "$EXT/$f.bak"; done
+   ```
+3. Copy the eight files into place and check each one:
+   ```bash
+   for f in rbf-agy.ts lib/agy-native.ts lib/agy-acp.ts lib/agy-acp-session.ts lib/agy-acp-approval.ts lib/agy-history.ts lib/agy-recovery.ts lib/agy-wire-log.ts; do command cp -f "extensions/$f" "$EXT/$f"; done
+   for f in rbf-agy.ts lib/agy-native.ts lib/agy-acp.ts lib/agy-acp-session.ts lib/agy-acp-approval.ts lib/agy-history.ts lib/agy-recovery.ts lib/agy-wire-log.ts; do cmp -s "extensions/$f" "$EXT/$f" && echo "ok $f" || echo "MISMATCH $f"; done
+   ```
+   Run it from the repo root, in the same shell as step 2. Every line must start with `ok`.
+4. Fully restart Pi.
+
+### 🟣⋯ Rollback
+1. Remove the eight files. This restores nothing from the `.bak` files:
+   ```bash
+   EXT=~/.pi/agent/extensions
+   for f in rbf-agy.ts lib/agy-native.ts lib/agy-acp.ts lib/agy-acp-session.ts lib/agy-acp-approval.ts lib/agy-history.ts lib/agy-recovery.ts lib/agy-wire-log.ts; do command rm -f "$EXT/$f"; done
+   ```
+2. Fully restart Pi. Your saved messages stay readable. This puts Pi back to having no AGY provider, so nothing can send a message into a chat that started on ACP.
+
+The `.bak` files keep what was installed before your first install, because `cp -n` keeps the first backup. **Don't copy a CLI-era one (v0.33.x) back over chats that started on ACP.** An `rbf-agy.ts.bak` with no `lib/agy-acp.ts.bak` beside it is that provider, and v0.33.0 would send a chat's next message into a new AGY conversation with none of the earlier context. Leave it where it is, and start a new chat with `/new`.

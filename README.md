@@ -6,6 +6,7 @@ Rigelblu flavor of Pi coding agent extensions and capabilities.
 
 # 🔵⋯ Extensions
 
+- [`rbf-agy`](extensions/rbf-agy.ts) (v0.33.2) — Use AGY's native agent, over its ACP server, through Pi's usual model controls: choose a Gemini model family and effort and change either between turns in the same AGY conversation, stream answers, allow once or reject each command AGY asks to run, see AGY's work after its turn as its own turn, and resume after `/reload` or a restart. Needs the eight AGY files and a full restart; a chat started before v0.33.2 can't continue. [Install, limits and roll back](extensions/README.md#-rbf-agy)
 - [`rbf-copy-wrapped-text`](extensions/rbf-copy-wrapped-text.ts) (v0.30.2) — Copy visually wrapped fullscreen text with its original logical lines. Genuine line breaks and selected source spaces remain. [Install the four matching files and roll back](extensions/README.md#-rbf-copy-wrapped-text)
 
 - [`rbf-effort`](extensions/rbf-effort.ts) (v0.30.0) — Use `/effort` and `/effort <level>` as aliases for native `/thinking`. [Install, limits and roll back](extensions/README.md#-rbf-effort)

@@ -82,7 +82,7 @@ def main() -> int:
     plan = json.load(sys.stdin)
     cols, rows = int(plan.get("cols", 100)), int(plan.get("rows", 40))
     deadline = time.monotonic() + float(plan.get("timeout", 30))
-    env = {**os.environ, **plan.get("env", {}), "TERM": "xterm-256color", "COLUMNS": str(cols), "LINES": str(rows)}
+    env = {**(os.environ if plan.get("inheritEnv", True) else {}), **plan.get("env", {}), "TERM": "xterm-256color", "COLUMNS": str(cols), "LINES": str(rows)}
 
     pid, fd = pty.fork()
     if pid == 0:
@@ -153,6 +153,8 @@ def main() -> int:
                         # A swallowed ping during the reload box is harmless: retry until
                         # the new extension's command handler actually runs in the editor.
                         command = f"{receipt.get('command', '/rbf-reload-ready')} {target}".encode()
+                        if receipt.get("clearDraft", False):
+                            os.write(fd, b"\x15")
                         os.write(fd, b"\x1b[200~" + command + b"\x1b[201~\r")
                         last_ping = time.monotonic()
                     pump(time.monotonic() + 0.1)
@@ -257,6 +259,11 @@ def main() -> int:
                     pump(time.monotonic() + 0.1)
                 if failure:
                     break
+            elif "writeFixtureFile" in step:
+                target = step["writeFixtureFile"]
+                fixture_fd = os.open(target["path"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fixture_fd, "w", encoding="utf-8") as fixture:
+                    fixture.write(target["text"])
             elif "snapshot" in step:
                 name = step["snapshot"]
                 if name in snapshots:
