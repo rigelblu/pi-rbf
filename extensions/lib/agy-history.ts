@@ -1,52 +1,50 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { keyHint, type Theme } from "@earendil-works/pi-coding-agent";
-import { sanitizeDisplayText, type NativeEvent } from "./agy-native.js";
+import { sanitizeDisplayText } from "./agy-native.js";
 
-export const AGY_ACTIVITY = "rbf-agy-activity/v1";
-export const AGY_REPORTED_ACTIVITY = "rbf-agy-activity/v2";
-export const REPORTED_NATIVE_FIELDS_LIMIT = 32;
+export const AGY_ACP_ACTIVITY = "rbf-agy-acp-activity/v1";
 export const AGY_HISTORY_FAILURE = "AGY activity could not be saved. History may be incomplete.";
 export const AGY_HISTORY_UNAVAILABLE = "AGY activity unavailable: saved record is invalid or unsupported.";
 export const ACTIVITY_LIMITS = Object.freeze({ payload: 64 * 1024, requestPayload: 256 * 1024, records: 256, identity: 512, envelope: 192 * 1024, requestSerialized: 2 * 1024 * 1024 });
-export type NativeToolObservation = Extract<NativeEvent, { kind: "tool" }>;
-export type AgyObservationSource = { kind: "root"; conversationId: string } | { kind: "child"; conversationId: string; parentConversationId: string; childId: string };
-export interface AgyObservationScope {
+export interface CapturedText { text: string; originalBytes: number; omittedBytes: number }
+export type AgyAcpApprovalReply = "allow_once" | "reject_once" | "cancelled";
+export type AgyAcpApprovalReason = "user" | "turn-stopped" | "review-cap" | "unsafe";
+export interface AgyAcpApprovalStamp {
+	reply: AgyAcpApprovalReply;
+	reason: AgyAcpApprovalReason;
+}
+export interface AgyAcpActivityInput {
 	piSessionId: string;
 	inputEntryId: string;
-	rootConversationId: string;
-	turnCount: number;
-	source: AgyObservationSource;
+	acpSessionId: string;
+	toolCallId: string;
+	name: string;
+	kind: string;
+	title: string;
+	state: "completed" | "failed";
+	approval?: AgyAcpApprovalStamp;
+	command?: string;
+	parameters?: Record<string, unknown>;
+	output?: string;
+	exitCode?: number;
 }
-export interface CapturedText { text: string; originalBytes: number; omittedBytes: number }
-export interface AgyActivityObservation extends AgyObservationScope {
+export interface AgyAcpActivityObservation {
 	schemaVersion: 1;
-	stepIndex: number;
+	piSessionId: string;
+	inputEntryId: string;
+	acpSessionId: string;
 	sequence: number;
-	toolName: string;
-	state: NativeToolObservation["state"];
+	toolCallId: string;
+	name: string;
+	kind: string;
+	title: string;
+	state: "completed" | "failed";
+	approval?: AgyAcpApprovalStamp;
 	command?: CapturedText;
 	parameters?: CapturedText & { encoding: "json" | "json-prefix" };
 	output?: CapturedText;
-	error?: { type: CapturedText; message: CapturedText };
-}
-/** Project only reported fields from an independently admitted container; never pass raw thinking rows. */
-export interface AgyReportedStep {
-	step_index: number;
-	type: string;
-	source: string;
-	status: string;
-	content: string;
-	created_at?: string;
-	truncated_fields?: readonly string[];
-}
-export interface AgyReportedStepObservation extends AgyObservationScope {
-	schemaVersion: 2;
-	kind: "reported-step";
-	attribution: "container";
-	sequence: number;
-	report: Omit<AgyReportedStep, "content">;
-	content: CapturedText;
+	exitCode?: number;
 }
 export interface AgyActivityBudget { payloadBytes: number; serializedBytes: number; observations: number }
 export function newAgyActivityBudget(): AgyActivityBudget { return { payloadBytes: 0, serializedBytes: 0, observations: 0 }; }
@@ -60,48 +58,34 @@ const object = (v: unknown): v is Record<string, unknown> => v !== null && typeo
 const identity = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0 && Buffer.byteLength(v) <= ACTIVITY_LIMITS.identity && sanitizeDisplayText(v) === v && !/[\t\n]/.test(v);
 const keys = (v: Record<string, unknown>, allowed: readonly string[]) => Object.keys(v).every(k => allowed.includes(k));
 const captured = (v: unknown, parameters = false): v is CapturedText => object(v) && keys(v, parameters ? ["text", "originalBytes", "omittedBytes", "encoding"] : ["text", "originalBytes", "omittedBytes"]) && typeof v.text === "string" && count(v.originalBytes) && count(v.omittedBytes) && Buffer.byteLength(v.text) <= ACTIVITY_LIMITS.payload && Buffer.byteLength(v.text) + v.omittedBytes === v.originalBytes;
-function texts(data: AgyActivityObservation): CapturedText[] { return [data.command, data.parameters, data.output, data.error?.type, data.error?.message].filter((v): v is CapturedText => v !== undefined); }
+function acpTexts(data: AgyAcpActivityObservation): CapturedText[] { return [data.command, data.parameters, data.output].filter((v): v is CapturedText => v !== undefined); }
+const acpActivityKeys = ["schemaVersion", "piSessionId", "inputEntryId", "acpSessionId", "sequence", "toolCallId", "name", "kind", "title", "state", "approval", "command", "parameters", "output", "exitCode"] as const;
+const acpApprovalReplies: readonly string[] = ["allow_once", "reject_once", "cancelled"];
+const acpApprovalReasons: readonly string[] = ["user", "turn-stopped", "review-cap", "unsafe"];
 
-function validScope(value: Record<string, unknown>): boolean {
-	if (![value.piSessionId, value.inputEntryId, value.rootConversationId].every(identity) || !count(value.turnCount) || value.turnCount < 1 || !object(value.source)) return false;
-	const source = value.source;
-	if (!identity(source.conversationId)) return false;
-	if (source.kind === "root") return keys(source, ["kind", "conversationId"]) && source.conversationId === value.rootConversationId;
-	return source.kind === "child" && keys(source, ["kind", "conversationId", "parentConversationId", "childId"]) && identity(source.parentConversationId) && identity(source.childId) && source.conversationId !== value.rootConversationId;
-}
 
-export function parseAgyActivity(value: unknown): AgyActivityObservation | undefined {
+
+
+
+export function parseAgyAcpActivity(value: unknown): AgyAcpActivityObservation | undefined {
 	try {
-		if (!object(value) || !keys(value, ["schemaVersion", "piSessionId", "inputEntryId", "rootConversationId", "turnCount", "source", "stepIndex", "sequence", "toolName", "state", "command", "parameters", "output", "error"]) || value.schemaVersion !== 1 ||
-			!validScope(value) || !identity(value.toolName) || !count(value.stepIndex) || !count(value.sequence) || value.sequence < 1 || value.sequence > ACTIVITY_LIMITS.records || !["ACTIVE", "DONE", "ERROR"].includes(value.state as string)) return undefined;
+		if (!object(value) || !keys(value, acpActivityKeys) || value.schemaVersion !== 1 ||
+			![value.piSessionId, value.inputEntryId, value.acpSessionId, value.toolCallId, value.name, value.kind, value.title].every(identity) ||
+			!count(value.sequence) || value.sequence < 1 || value.sequence > ACTIVITY_LIMITS.records ||
+			(value.state !== "completed" && value.state !== "failed")) return undefined;
+		if (value.approval !== undefined && (!object(value.approval) || !keys(value.approval, ["reply", "reason"]) ||
+			!acpApprovalReplies.includes(value.approval.reply as string) || !acpApprovalReasons.includes(value.approval.reason as string))) return undefined;
 		for (const field of ["command", "parameters", "output"] as const) if (value[field] !== undefined && !captured(value[field], field === "parameters")) return undefined;
+		if (value.command !== undefined && value.name !== "run_command") return undefined;
 		if (value.parameters !== undefined) {
 			const parameters = value.parameters as Record<string, unknown>;
 			if (parameters.encoding !== (parameters.omittedBytes === 0 ? "json" : "json-prefix")) return undefined;
 			if (parameters.encoding === "json" && !object(JSON.parse(parameters.text as string))) return undefined;
 		}
-		if (value.command !== undefined && value.toolName !== "run_command") return undefined;
-		if (value.error !== undefined && (!object(value.error) || !keys(value.error, ["type", "message"]) || !captured(value.error.type) || !captured(value.error.message))) return undefined;
-		const data = value as unknown as AgyActivityObservation;
-		if (texts(data).reduce((n, t) => n + Buffer.byteLength(t.text), 0) > ACTIVITY_LIMITS.payload || Buffer.byteLength(JSON.stringify(data)) > ACTIVITY_LIMITS.envelope) return undefined;
+		if (value.exitCode !== undefined && (typeof value.exitCode !== "number" || !Number.isSafeInteger(value.exitCode))) return undefined;
+		const data = value as unknown as AgyAcpActivityObservation;
+		if (acpTexts(data).reduce((n, t) => n + Buffer.byteLength(t.text), 0) > ACTIVITY_LIMITS.payload || Buffer.byteLength(JSON.stringify(data)) > ACTIVITY_LIMITS.envelope) return undefined;
 		return data;
-	} catch { return undefined; }
-}
-
-const reportKeys = ["step_index", "type", "source", "status", "created_at", "truncated_fields"];
-function nativeReport(value: unknown, input = false): value is Omit<AgyReportedStep, "content"> {
-	if (!object(value) || !keys(value, input ? [...reportKeys, "content"] : reportKeys) || !count(value.step_index) || ![value.type, value.source, value.status].every(identity)) return false;
-	if (input && typeof value.content !== "string") return false;
-	if (value.created_at !== undefined && (typeof value.created_at !== "string" || Buffer.byteLength(value.created_at) > ACTIVITY_LIMITS.identity || sanitizeDisplayText(value.created_at) !== value.created_at || /[\t\n]/.test(value.created_at))) return false;
-	return value.truncated_fields === undefined || Array.isArray(value.truncated_fields) && value.truncated_fields.length <= REPORTED_NATIVE_FIELDS_LIMIT && Array.from(value.truncated_fields).every(identity);
-}
-
-export function parseAgyReportedStep(value: unknown): AgyReportedStepObservation | undefined {
-	try {
-		if (!object(value) || !keys(value, ["schemaVersion", "kind", "attribution", "piSessionId", "inputEntryId", "rootConversationId", "turnCount", "source", "sequence", "report", "content"]) ||
-			value.schemaVersion !== 2 || value.kind !== "reported-step" || value.attribution !== "container" || !validScope(value) || !count(value.sequence) || value.sequence < 1 || value.sequence > ACTIVITY_LIMITS.records ||
-			!nativeReport(value.report) || !captured(value.content) || Buffer.byteLength(JSON.stringify(value)) > ACTIVITY_LIMITS.envelope) return undefined;
-		return value as unknown as AgyReportedStepObservation;
 	} catch { return undefined; }
 }
 
@@ -109,43 +93,66 @@ function validBudget(budget: AgyActivityBudget): boolean {
 	return count(budget.payloadBytes) && budget.payloadBytes <= ACTIVITY_LIMITS.requestPayload && count(budget.serializedBytes) && budget.serializedBytes <= ACTIVITY_LIMITS.requestSerialized && count(budget.observations) && budget.observations <= ACTIVITY_LIMITS.records;
 }
 
-/** This value records container context, never a fabricated per-row native identity or tool state. */
-export function captureAgyReportedStep(input: AgyReportedStep, scope: AgyObservationScope, budget: AgyActivityBudget): { data: AgyReportedStepObservation; payloadBytes: number } {
-	if (!nativeReport(input, true) || !validBudget(budget) || budget.observations >= ACTIVITY_LIMITS.records) throw new Error(AGY_HISTORY_FAILURE);
-	const { content, ...report } = structuredClone(input);
-	const bytes = Buffer.from(sanitizeDisplayText(content), "utf8");
-	let end = Math.min(bytes.length, ACTIVITY_LIMITS.payload, ACTIVITY_LIMITS.requestPayload - budget.payloadBytes);
+
+function clampUtf8(text: string, limit: number): string {
+	const bytes = Buffer.from(text, "utf8");
+	let end = Math.min(bytes.length, Math.max(0, limit));
 	while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
-	const data: AgyReportedStepObservation = { ...structuredClone(scope), schemaVersion: 2, kind: "reported-step", attribution: "container", sequence: budget.observations + 1, report,
-		content: { text: bytes.subarray(0, end).toString("utf8"), originalBytes: bytes.length, omittedBytes: bytes.length - end } };
-	if (!parseAgyReportedStep(data)) throw new Error(AGY_HISTORY_FAILURE);
-	return { data, payloadBytes: end };
+	return bytes.subarray(0, end).toString("utf8");
 }
 
-export function captureAgyActivity(event: NativeToolObservation, scope: AgyObservationScope, budget: AgyActivityBudget): { data: AgyActivityObservation; payloadBytes: number } {
-	if (budget.observations >= ACTIVITY_LIMITS.records || event.conversationId !== scope.source.conversationId) throw new Error(AGY_HISTORY_FAILURE);
+function normalizeAcpLabel(raw: string, fallback: string): string {
+	return clampUtf8(sanitizeDisplayText(raw).replace(/[\t\n]+/g, " ").trim(), ACTIVITY_LIMITS.identity).trim() || fallback;
+}
+
+function createTextCapturer(budget: AgyActivityBudget): (raw: string) => CapturedText {
 	let remaining = Math.min(ACTIVITY_LIMITS.payload, ACTIVITY_LIMITS.requestPayload - budget.payloadBytes);
-	const capture = (raw: string): CapturedText => {
+	return (raw: string): CapturedText => {
 		const bytes = Buffer.from(sanitizeDisplayText(raw), "utf8");
 		let end = Math.min(bytes.length, Math.max(0, remaining));
 		while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
 		remaining -= end;
 		return { text: bytes.subarray(0, end).toString("utf8"), originalBytes: bytes.length, omittedBytes: bytes.length - end };
 	};
-	const data: AgyActivityObservation = { ...structuredClone(scope), schemaVersion: 1, stepIndex: event.index, sequence: budget.observations + 1, toolName: event.toolName, state: event.state };
-	if (event.toolName === "run_command" && typeof event.info?.parameters?.CommandLine === "string") data.command = capture(event.info.parameters.CommandLine);
-	if (event.info?.error !== undefined) data.error = { type: capture(event.info.error.type), message: capture(event.info.error.message) };
-	if (event.info?.output !== undefined) data.output = capture(event.info.output);
-	if (event.info?.parameters !== undefined) {
-		const parameters = capture(JSON.stringify(event.info.parameters));
+}
+
+
+export function captureAgyAcpActivity(input: AgyAcpActivityInput, budget: AgyActivityBudget): { data: AgyAcpActivityObservation; payloadBytes: number } {
+	if (!object(input) || typeof input.name !== "string" || typeof input.kind !== "string" || typeof input.title !== "string" || !validBudget(budget) || budget.observations >= ACTIVITY_LIMITS.records) throw new Error(AGY_HISTORY_FAILURE);
+	const capture = createTextCapturer(budget);
+	const name = normalizeAcpLabel(input.name, "tool");
+	const kind = normalizeAcpLabel(input.kind, "other");
+	const title = normalizeAcpLabel(input.title, name);
+	const data: AgyAcpActivityObservation = {
+		schemaVersion: 1,
+		piSessionId: input.piSessionId,
+		inputEntryId: input.inputEntryId,
+		acpSessionId: input.acpSessionId,
+		sequence: budget.observations + 1,
+		toolCallId: input.toolCallId,
+		name,
+		kind,
+		title,
+		state: input.state,
+	};
+	if (input.approval !== undefined) {
+		try { data.approval = structuredClone(input.approval); } catch { throw new Error(AGY_HISTORY_FAILURE); }
+	}
+	if (name === "run_command" && typeof input.command === "string") data.command = capture(input.command);
+	if (typeof input.output === "string") data.output = capture(input.output);
+	if (input.parameters !== undefined && object(input.parameters)) {
+		let serialized: string;
+		try { serialized = JSON.stringify(input.parameters); } catch { throw new Error(AGY_HISTORY_FAILURE); }
+		const parameters = capture(serialized);
 		data.parameters = { ...parameters, encoding: parameters.omittedBytes === 0 ? "json" : "json-prefix" };
 	}
-	if (!parseAgyActivity(data)) throw new Error(AGY_HISTORY_FAILURE);
-	return { data, payloadBytes: texts(data).reduce((n, t) => n + Buffer.byteLength(t.text), 0) };
+	if (typeof input.exitCode === "number" && Number.isSafeInteger(input.exitCode)) data.exitCode = input.exitCode;
+	if (!parseAgyAcpActivity(data)) throw new Error(AGY_HISTORY_FAILURE);
+	return { data, payloadBytes: acpTexts(data).reduce((n, t) => n + Buffer.byteLength(t.text), 0) };
 }
 
 export interface AgyHistoryEntry { id: string; parentId: string | null; type: string; customType?: string; data?: unknown }
-export interface AgyHistoryGuard<T = AgyActivityObservation> {
+export interface AgyHistoryGuard<T> {
 	/** Check captured session/generation/owner/cwd/provider, including after append. */
 	assertCurrent(): void;
 	entries(): readonly AgyHistoryEntry[];
@@ -185,14 +192,11 @@ function appendGuarded<T>(customType: string, data: T, guard: AgyHistoryGuard<T>
 	finally { state.active = false; }
 }
 
-export function appendAgyActivity(data: AgyActivityObservation, guard: AgyHistoryGuard): { entryId: string; fingerprint: string } {
-	if (!parseAgyActivity(data)) throw new Error(AGY_HISTORY_FAILURE);
-	return appendGuarded(AGY_ACTIVITY, data, guard);
-}
 
-export function appendAgyReportedStep(data: AgyReportedStepObservation, guard: AgyHistoryGuard<AgyReportedStepObservation>): { entryId: string; fingerprint: string } {
-	if (!parseAgyReportedStep(data)) throw new Error(AGY_HISTORY_FAILURE);
-	return appendGuarded(AGY_REPORTED_ACTIVITY, data, guard);
+
+export function appendAgyAcpActivity(data: AgyAcpActivityObservation, guard: AgyHistoryGuard<AgyAcpActivityObservation>): { entryId: string; fingerprint: string } {
+	if (!parseAgyAcpActivity(data)) throw new Error(AGY_HISTORY_FAILURE);
+	return appendGuarded(AGY_ACP_ACTIVITY, data, guard);
 }
 
 /** One shared request budget spans variants/sources. Unconfirmed writes close it, even if counters never advanced. */
@@ -212,103 +216,104 @@ function recordCaptured<T>(capture: () => { data: T; payloadBytes: number }, app
 	finally { state.active = false; }
 }
 
-export function recordAgyActivity(event: NativeToolObservation, scope: AgyObservationScope, budget: AgyActivityBudget, guard: AgyHistoryGuard): { entryId: string; fingerprint: string } {
-	return recordCaptured(() => captureAgyActivity(event, scope, budget), data => appendAgyActivity(data, guard), budget);
-}
 
-export function recordAgyReportedStep(input: AgyReportedStep, scope: AgyObservationScope, budget: AgyActivityBudget, guard: AgyHistoryGuard<AgyReportedStepObservation>): { entryId: string; fingerprint: string } {
-	return recordCaptured(() => captureAgyReportedStep(input, scope, budget), data => appendAgyReportedStep(data, guard), budget);
+
+export function recordAgyAcpActivity(input: AgyAcpActivityInput, budget: AgyActivityBudget, guard: AgyHistoryGuard<AgyAcpActivityObservation>): { entryId: string; fingerprint: string } {
+	return recordCaptured(() => captureAgyAcpActivity(input, budget), data => appendAgyAcpActivity(data, guard), budget);
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Literal Pi transcript rendering, available without a native client
 
-export function renderAgyActivity(value: unknown, expanded: boolean, theme: Theme, hint?: string): Component {
-	const validated = parseAgyActivity(value);
-	const data = validated ? structuredClone(validated) : undefined;
+interface AgyActivityRenderView {
+	toolName: string;
+	stepIndex: number;
+	stateLabel: string;
+	isError: boolean;
+	childId?: string;
+	command?: CapturedText;
+	parameters?: CapturedText & { encoding: "json" | "json-prefix" };
+	output?: CapturedText;
+	error?: { type: CapturedText; message: CapturedText };
+	exitCode?: number;
+	omittedFields: Record<string, CapturedText | undefined>;
+	footerLines: string[];
+}
+
+function drawAgyActivity(view: AgyActivityRenderView | undefined, expanded: boolean, theme: Theme, hint?: string): Component {
 	return {
 		invalidate() {},
 		render(width) {
 			if (width < 1) return [];
 			const wrap = (s: string) => wrapTextWithAnsi(sanitizeDisplayText(s).replace(/\t/g, "    "), width).map(line => truncateToWidth(line, width, ""));
-			if (!data) return wrap(AGY_HISTORY_UNAVAILABLE).map(line => theme.fg("warning", line));
-			const lines: string[] = [], command = data.toolName === "run_command";
+			if (!view) return wrap(AGY_HISTORY_UNAVAILABLE).map(line => theme.fg("warning", line));
+			const lines: string[] = [], command = view.toolName === "run_command";
 			let hidden = false;
 			const add = (s: string, role: "toolTitle" | "toolOutput" | "muted" | "dim" | "error" | "warning" = "toolOutput", max = Infinity) => {
 				const rows = wrap(s);
 				hidden ||= rows.length > max;
 				lines.push(...rows.slice(0, max).map(row => theme.fg(role, row)));
 			};
-			add(`AGY ${command ? "command" : "tool"} · step ${data.stepIndex} · reported ${data.state}`, data.state === "ERROR" ? "error" : "toolTitle");
-			if (data.source.kind === "child") add(`  Child: ${data.source.childId}`, "muted");
-			if (command) add(`  Command: ${data.command ? data.command.text : "not reported"}`, "toolOutput", expanded ? Infinity : 1);
-			else add(`  Tool: ${data.toolName}`, "toolTitle");
-			if (expanded || !command) add(`  Parameters${data.parameters?.encoding === "json-prefix" ? " (JSON prefix)" : ""}: ${data.parameters ? data.parameters.text : "not reported"}`, "toolOutput", expanded ? Infinity : 1);
-			if (texts(data).some(t => t.omittedBytes > 0)) add("  Recorded output is incomplete.", "warning");
+			add(`AGY ${command ? "command" : "tool"} · step ${view.stepIndex} · ${view.stateLabel}`, view.isError ? "error" : "toolTitle");
+			if (view.childId !== undefined) add(`  Child: ${view.childId}`, "muted");
+			if (command) add(`  Command: ${view.command ? view.command.text : "not reported"}`, "toolOutput", expanded ? Infinity : 1);
+			else add(`  Tool: ${view.toolName}`, "toolTitle");
+			if (expanded || !command) add(`  Parameters${view.parameters?.encoding === "json-prefix" ? " (JSON prefix)" : ""}: ${view.parameters ? view.parameters.text : "not reported"}`, "toolOutput", expanded ? Infinity : 1);
+			if (Object.values(view.omittedFields).some(t => t !== undefined && t.omittedBytes > 0)) add("  Recorded output is incomplete.", "warning");
 			let previewRows = expanded ? Infinity : 3;
 			const body = (text: string, role: "toolOutput" | "error") => {
 				const count = wrap(text).length;
 				add(text, role, previewRows);
 				previewRows = Math.max(0, previewRows - count);
 			};
-			if (data.output === undefined) {
-				if (!data.error) add("  Output: not reported", "muted");
+			if (view.output === undefined) {
+				if (!view.error) add("  Output: not reported", "muted");
 			} else {
 				add("  Output:", "muted");
-				body(data.output.text.split("\n").map(line => `    ${line}`).join("\n"), "toolOutput");
+				body(view.output.text.split("\n").map(line => `    ${line}`).join("\n"), "toolOutput");
 			}
-			if (data.error) body(`  Error [${data.error.type.text}]: ${data.error.message.text}`, "error");
-			else if (data.state === "ERROR") add("  Error details: not reported", "error");
-			if (expanded) for (const [name, field] of Object.entries({ command: data.command, parameters: data.parameters, output: data.output, errorType: data.error?.type, error: data.error?.message })) if (field?.omittedBytes) add(`  ${name}: ${Buffer.byteLength(field.text)} bytes retained; ${field.omittedBytes} bytes omitted (capture limit).`, "dim");
+			if (view.error) body(`  Error [${view.error.type.text}]: ${view.error.message.text}`, "error");
+			else if (view.isError) add("  Error details: not reported", "error");
+			if (view.exitCode !== undefined) add(`  Exit code: ${view.exitCode}`, "toolOutput", expanded ? Infinity : 1);
+			if (expanded) for (const [name, field] of Object.entries(view.omittedFields)) if (field?.omittedBytes) add(`  ${name}: ${Buffer.byteLength(field.text)} bytes retained; ${field.omittedBytes} bytes omitted (capture limit).`, "dim");
 			if (!expanded && hidden) lines.push(...wrapTextWithAnsi(`    ... (${hint ?? keyHint("app.tools.expand", "to expand")})`, width).map(line => truncateToWidth(line, width, "")));
 			add(`  ${command ? "Command" : "Tool"} outcome: unknown`, "muted");
-			if (expanded) {
-				add(`  Native conversation: ${data.source.conversationId} · turn ${data.turnCount} · step ${data.stepIndex}`, "dim");
-				add(`  Pi input: ${data.inputEntryId} · report ${data.sequence}`, "dim");
-				add(`  Historical report; current ${command ? "command" : "tool"} state is unknown.`, "dim");
-			}
+			if (expanded) for (const line of view.footerLines) add(line, "dim");
 			return lines;
 		},
 	};
 }
 
 
-/** Literal common reports: supplied native status is never a tool/child completion signal. */
-export function renderAgyReportedStep(value: unknown, expanded: boolean, theme: Theme, hint?: string): Component {
-	const validated = parseAgyReportedStep(value), data = validated ? structuredClone(validated) : undefined;
-	return {
-		invalidate() {},
-		render(width) {
-			if (width < 1) return [];
-			const wrap = (text: string) => wrapTextWithAnsi(sanitizeDisplayText(text).replace(/\t/g, "    "), width).map(line => truncateToWidth(line, width, ""));
-			if (!data) return wrap(AGY_HISTORY_UNAVAILABLE).map(line => theme.fg("warning", line));
-			const lines: string[] = []; let hidden = false;
-			const add = (text: string, role: "toolTitle" | "toolOutput" | "muted" | "dim" | "warning" = "toolOutput", max = Infinity) => {
-				const rows = wrap(text); hidden ||= rows.length > max;
-				lines.push(...rows.slice(0, max).map(row => theme.fg(role, row)));
-			};
-			add("AGY reported step \u00B7 step " + data.report.step_index, "toolTitle");
-			if (data.source.kind === "child") add("  Child: " + data.source.childId, "muted", expanded ? Infinity : 1);
-			add("  Native: type=" + data.report.type + " \u00B7 source=" + data.report.source + " \u00B7 status=" + data.report.status, "toolOutput", expanded ? Infinity : 1);
-			const nativeLoss = data.report.truncated_fields;
-			add("  Native truncation: " + (nativeLoss === undefined ? "not reported" : nativeLoss.length ? nativeLoss.join(", ") : "none reported"), "muted", expanded ? Infinity : 1);
-			if (nativeLoss?.length) add("  Native reported truncation.", "warning");
-			if (data.content.omittedBytes) add("  Local capture is incomplete.", "warning");
-			add("  Reported text:", "muted");
-			add(data.content.text.split("\n").map(line => "    " + line).join("\n"), "toolOutput", expanded ? Infinity : 3);
-			if (expanded && data.content.omittedBytes) add("  content: " + Buffer.byteLength(data.content.text) + " bytes retained; " + data.content.omittedBytes + " bytes omitted (capture limit).", "dim");
-			if (!expanded && hidden) add("    ... (" + (hint ?? keyHint("app.tools.expand", "to expand")) + ")", "muted");
-			add("  Tool identity and command outcome: unknown", "muted");
-			add("  Native status does not establish tool or child completion.", "muted");
-			if (expanded) {
-				add("  Native time: " + (data.report.created_at === undefined ? "not reported" : data.report.created_at === "" ? '""' : data.report.created_at), "dim");
-				add("  Source attribution: container", "dim");
-				add("  Native conversation: " + data.source.conversationId + " \u00B7 root " + data.rootConversationId + " \u00B7 turn " + data.turnCount, "dim");
-				if (data.source.kind === "child") add("  Parent conversation: " + data.source.parentConversationId, "dim");
-				add("  Pi input: " + data.inputEntryId + " \u00B7 report " + data.sequence, "dim");
-			}
-			return lines;
-		},
-	};
+function acpActivityState(data: AgyAcpActivityObservation): { stateLabel: string; isError: boolean } {
+	if (data.state === "completed") return { stateLabel: "reported DONE", isError: false };
+	if (data.approval && data.approval.reply !== "allow_once") {
+		if (data.approval.reply === "reject_once" && data.approval.reason === "user") return { stateLabel: "rejected by you", isError: false };
+		return { stateLabel: "rejected by Pi", isError: false };
+	}
+	return { stateLabel: "reported ERROR", isError: true };
 }
+
+export function renderAgyAcpActivity(value: unknown, expanded: boolean, theme: Theme, hint?: string): Component {
+	const validated = parseAgyAcpActivity(value);
+	const data = validated ? structuredClone(validated) : undefined;
+	const command = data?.name === "run_command";
+	return drawAgyActivity(data ? {
+		toolName: data.name,
+		stepIndex: data.sequence,
+		...acpActivityState(data),
+		command: data.command,
+		parameters: data.parameters,
+		output: data.output,
+		exitCode: data.exitCode,
+		omittedFields: { command: data.command, parameters: data.parameters, output: data.output },
+		footerLines: [
+			`  ACP session: ${data.acpSessionId} · tool call ${data.toolCallId}`,
+			`  Pi input: ${data.inputEntryId} · report ${data.sequence}`,
+			`  Historical report; current ${command ? "command" : "tool"} state is unknown.`,
+		],
+	} : undefined, expanded, theme, hint);
+}
+
+

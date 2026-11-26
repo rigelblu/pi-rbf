@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, appendFileSync, symlinkSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AGY_DISPATCH, AGY_COMPLETION, AGY_REFUSAL, readSavedSession, appendEvidence, selectRecoveryCompletion, historyFingerprint, entryFingerprint, RecoveryError } from "./lib/agy-recovery.js";
-import { AGY_ACTIVITY } from "./lib/agy-history.js";
+import { readSavedSession, appendEvidence, RecoveryError } from "./lib/agy-recovery.js";
 
+// The two things every AGY record depends on, whichever route wrote it: reading a Pi session file back from disk as raw bytes, and appending a record only when the bytes on disk show it. The ACP recovery
+// chain that uses them is tested in lib/agy-acp-recovery.test.ts.
 const fault = vi.hoisted(() => ({ sync: 0, failAt: 0 }));
 vi.mock("node:fs", async original => {
 	const actual = await original<typeof import("node:fs")>();
@@ -23,66 +24,47 @@ function fixture() {
 	const user = (text = "new text") => append({ type: "message", message: { role: "user", content: [{ type: "text", text }], timestamp: 1 } });
 	const assistant = () => append({ type: "message", message: { role: "assistant", provider: "agy-harness", content: [{ type: "text", text: "saved answer" }], stopReason: "stop", timestamp: 2 } });
 	save();
-	const tuple = { sessionId: header.id, sessionFile: file, cwd, conversationId: "native-one", nativeModel: "gemini-3.8-flash-low", nativeEffort: "low", policyHash: null, permissionMode: "request-review" };
-	const checkpoint = () => {
-		const u = user();
-		const d = appendEvidence(pi, sm, cwd, AGY_DISPATCH, { ...tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
-		const a = assistant();
-		const c = appendEvidence(pi, sm, cwd, AGY_COMPLETION, { ...tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(entries), acceptedCount: 1, frontier: 1 });
-		return { u, d, a, c };
-	};
-	return { cwd, file, entries, sm, pi, header, save, append, user, assistant, tuple, checkpoint };
+	return { cwd, file, entries, sm, pi, header, save, append, user, assistant };
 }
+const kind = (run: () => unknown): string | undefined => { try { run(); } catch (error) { return error instanceof RecoveryError ? error.kind : "other"; } return undefined; };
 
-describe("saved clean-turn recovery evidence", () => {
-	it("restores the exact tuple and cumulative native baseline from saved counterparts", () => {
-		const h = fixture(); const { c } = h.checkpoint(); const u = h.user("only this text may be sent");
-		const result = selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), u.id);
-		expect(result.entry.id).toBe(c.id);
-		expect(result.data).toMatchObject({ ...h.tuple, acceptedCount: 1, frontier: 1 });
+describe("saved session evidence", () => {
+	it("reads back exactly the branch Pi holds, from the bytes on disk", () => {
+		const h = fixture(); h.user("one"); h.assistant(); const u = h.user("two");
+		const saved = readSavedSession(h.sm, h.cwd);
+		expect(saved.branch.map(e => e.id)).toEqual(h.entries.map(e => e.id));
+		expect(saved.all.at(-1).id).toBe(u.id);
+		expect(saved.sessionId).toBe("session-one");
 	});
-	it.each(["malformed", "unterminated", "duplicate", "missing-parent", "cycle", "memory-only", "edited-answer", "extra-field", "copy"])("refuses %s evidence", kind => {
-		const h = fixture(); const { a } = h.checkpoint(); const u = h.user();
-		if (kind === "malformed") appendFileSync(h.file, "broken\n");
-		if (kind === "unterminated") writeFileSync(h.file, readFileSync(h.file, "utf8").trimEnd());
-		if (kind === "duplicate") { h.entries.push({ ...u }); h.save(); }
-		if (kind === "missing-parent") { u.parentId = "absent"; h.save(); }
-		if (kind === "cycle") { u.parentId = u.id; h.save(); }
-		if (kind === "memory-only") u.message.content[0].text = "memory changed";
-		if (kind === "edited-answer") { a.message.content[0].text = "edited"; h.save(); }
-		if (kind === "extra-field") u.hostOnlyField = "memory differs from disk";
-		if (kind === "copy") { const copy = join(h.cwd, "copy.jsonl"); writeFileSync(copy, readFileSync(h.file)); h.sm.getSessionFile = () => copy; }
-		expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), u.id)).toThrow();
+	it.each(["malformed", "unterminated", "duplicate", "missing-parent", "cycle", "memory-only", "extra-field"])("refuses a %s session file", problem => {
+		const h = fixture(); h.user(); h.assistant(); const u = h.user();
+		if (problem === "malformed") appendFileSync(h.file, "broken\n");
+		if (problem === "unterminated") writeFileSync(h.file, readFileSync(h.file, "utf8").trimEnd());
+		if (problem === "duplicate") { h.entries.push({ ...u }); h.save(); }
+		if (problem === "missing-parent") { u.parentId = "absent"; h.save(); }
+		if (problem === "cycle") { u.parentId = u.id; h.save(); }
+		if (problem === "memory-only") u.message.content[0].text = "memory changed";
+		if (problem === "extra-field") u.hostOnlyField = "memory differs from disk";
+		expect(kind(() => readSavedSession(h.sm, h.cwd))).toBe("mismatch");
 	});
 	it("refuses a symlink rather than following it", () => {
 		const h = fixture(); const link = join(h.cwd, "link.jsonl"); symlinkSync(h.file, link); h.sm.getSessionFile = () => link;
-		expect(() => readSavedSession(h.sm, h.cwd)).toThrow();
+		expect(kind(() => readSavedSession(h.sm, h.cwd))).toBe("mismatch");
+	});
+	it("refuses a non-regular session descriptor", () => {
+		const h = fixture(); h.sm.getSessionFile = () => h.cwd;
+		expect(kind(() => readSavedSession(h.sm, h.cwd))).toBe("mismatch");
+	});
+	it("appends a record and returns it only when the bytes on disk show exactly it", () => {
+		const h = fixture(); h.user();
+		const entry = appendEvidence(h.pi, h.sm, h.cwd, "test-record", { saved: true });
+		expect(entry).toMatchObject({ type: "custom", customType: "test-record", data: { saved: true } });
+		expect(readSavedSession(h.sm, h.cwd).branch.at(-1).id).toBe(entry.id);
 	});
 	it("never trusts an append that advanced only Pi memory", () => {
 		const h = fixture(); h.user();
 		h.pi.appendEntry = (customType, data) => { h.entries.push({ id: "memory", parentId: h.sm.getLeafId(), type: "custom", customType, data }); return h.entries.at(-1); };
-		expect(() => appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, {})).toThrow();
-	});
-	it("classifies a saved unmatched dispatch as unknown work", () => {
-		const h = fixture(); const { c } = h.checkpoint(); const u = h.user();
-		appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(h.entries), previousCompletionId: c.id, acceptedCount: 1, frontier: 1 });
-		const next = h.user();
-		expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id)).toThrow(/unknown outcome/);
-	});
-	it("accepts only exact certified zero-write refusal pairs", () => {
-		const h = fixture(); const { c } = h.checkpoint(); const u = h.user("unsupported setting"), a = h.assistant();
-		appendEvidence(h.pi, h.sm, h.cwd, AGY_REFUSAL, { ...h.tuple, completionId: c.id, userId: u.id, userFingerprint: entryFingerprint(u), assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(h.entries) });
-		const next = h.user();
-		expect(selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id).entry.id).toBe(c.id);
-		a.message.content[0].text = "mutated refusal"; h.save();
-		expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id)).toThrow();
-	});
-	it.each([AGY_DISPATCH, "rbf-agy-dispatch/v2", "rbf-agy-completion/v2"])("refuses newer %s work on another saved branch", customType => {
-		const h = fixture(); const { c } = h.checkpoint(); const u = h.user();
-		const disk = readFileSync(h.file, "utf8");
-		appendFileSync(h.file, JSON.stringify({ id: "other", parentId: c.id, type: "custom", customType, data: { ...h.tuple, acceptedCount: 1 } }) + "\n");
-		expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), u.id)).toThrow();
-		expect(readFileSync(h.file, "utf8").startsWith(disk)).toBe(true);
+		expect(kind(() => appendEvidence(h.pi, h.sm, h.cwd, "test-record", {}))).toBe("mismatch");
 	});
 	it("does not acknowledge an append when post-write sync fails, then freshly validates surviving bytes", () => {
 		const h = fixture(); h.user(); fault.failAt = fault.sync + 2;
@@ -90,108 +72,4 @@ describe("saved clean-turn recovery evidence", () => {
 		finally { fault.failAt = 0; }
 		expect(readSavedSession(h.sm, h.cwd).branch.at(-1).customType).toBe("test-sync");
 	});
-	it.each(["image-user", "tool-assistant", "old-user"])("refuses internally rehashed unsupported %s history", kind => {
-		const h = fixture(); const { u, d, a, c } = h.checkpoint();
-		if (kind === "image-user") u.message.content = [{ type: "image", data: "a", mimeType: "image/png" }];
-		if (kind === "tool-assistant") a.message.content = [{ type: "toolCall", name: "unknown" }];
-		if (kind === "old-user") { const extra = { ...u, id: "extra-user", parentId: u.id }; h.entries.splice(1, 0, extra); d.parentId = extra.id; }
-		d.data.userFingerprint = entryFingerprint(u); d.data.prefixHash = historyFingerprint(h.entries.slice(0, h.entries.indexOf(d)));
-		c.data.assistantFingerprint = entryFingerprint(a); c.data.prefixHash = historyFingerprint(h.entries.slice(0, h.entries.indexOf(c)));
-		h.save(); const next = h.user(); expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id)).toThrow();
-	});
-	it.each(["compaction", "branch_summary", "custom_message", "image-record"])("refuses context-changing %s after a completion", kind => {
-		const h = fixture(); h.checkpoint();
-		h.append(kind === "image-record" ? { type: "custom", customType: "rbf-agy-image/v1", data: {} } : { type: kind });
-		const u = h.user(); expect(() => selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), u.id)).toThrow();
-	});
-	it("permits passive model metadata without claiming a native transition", () => {
-		const h = fixture(); h.checkpoint(); h.append({ type: "model_change", provider: "agy-harness", modelId: "gemini-3.8-flash" });
-		const u = h.user(); expect(selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), u.id).data.acceptedCount).toBe(1);
-	});
-
-	it("refuses a non-regular session descriptor", () => {
-		const h = fixture(); h.sm.getSessionFile = () => h.cwd; expect(() => readSavedSession(h.sm, h.cwd)).toThrow();
-	});
-
-	it.each(["before-dispatch", "between-completion-and-user", "between-dispatch-and-activity", "between-answer-and-completion"])("permits foreign custom entry placement: %s", placement => {
-		const h = fixture();
-		const u = h.user();
-		if (placement === "before-dispatch") {
-			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "before dispatch" } });
-		}
-		const d = appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(h.entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
-		if (placement === "between-dispatch-and-activity") {
-			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "between dispatch and activity" } });
-			h.append({
-				type: "custom",
-				customType: AGY_ACTIVITY,
-				data: {
-					schemaVersion: 1,
-					piSessionId: d.data.sessionId,
-					inputEntryId: d.data.userId,
-					rootConversationId: d.data.conversationId,
-					turnCount: d.data.acceptedCount + 1,
-					source: { kind: "root", conversationId: d.data.conversationId },
-					stepIndex: 1,
-					sequence: 1,
-					toolName: "run_command",
-					state: "DONE",
-				},
-			});
-		}
-		const a = h.assistant();
-		if (placement === "between-answer-and-completion") {
-			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "between answer and completion" } });
-		}
-		const c = appendEvidence(h.pi, h.sm, h.cwd, AGY_COMPLETION, { ...h.tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(h.entries), acceptedCount: 1, frontier: 1 });
-		if (placement === "between-completion-and-user") {
-			h.append({ type: "custom", customType: "rbf-other-ext", data: { note: "between completion and user" } });
-		}
-		const next = h.user("next question");
-		const selected = selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id);
-		expect(selected.entry.id).toBe(c.id);
-	});
-
-	it.each(["unknown-agy-type", "v2-activity-after-dispatch", "custom_message-after-dispatch", "model_change-between-dispatch-and-activity"])("rejects invalid entries as mismatch: %s", kind => {
-		const h = fixture();
-		const u = h.user();
-		const d = appendEvidence(h.pi, h.sm, h.cwd, AGY_DISPATCH, { ...h.tuple, userId: u.id, userFingerprint: entryFingerprint(u), prefixHash: historyFingerprint(h.entries), previousCompletionId: null, acceptedCount: 0, frontier: -1 });
-		if (kind === "unknown-agy-type") {
-			h.append({ type: "custom", customType: "rbf-agy-unknown/v1", data: {} });
-		} else if (kind === "v2-activity-after-dispatch") {
-			h.append({ type: "custom", customType: "rbf-agy-activity/v2", data: {} });
-		} else if (kind === "custom_message-after-dispatch") {
-			h.append({ type: "custom_message", message: { role: "user", content: "custom" } });
-		} else if (kind === "model_change-between-dispatch-and-activity") {
-			h.append({ type: "model_change", provider: "agy-harness", modelId: "other" });
-			h.append({
-				type: "custom",
-				customType: AGY_ACTIVITY,
-				data: {
-					schemaVersion: 1,
-					piSessionId: d.data.sessionId,
-					inputEntryId: d.data.userId,
-					rootConversationId: d.data.conversationId,
-					turnCount: d.data.acceptedCount + 1,
-					source: { kind: "root", conversationId: d.data.conversationId },
-					stepIndex: 1,
-					sequence: 1,
-					toolName: "run_command",
-					state: "DONE",
-				},
-			});
-		}
-		const a = h.assistant();
-		appendEvidence(h.pi, h.sm, h.cwd, AGY_COMPLETION, { ...h.tuple, dispatchId: d.id, assistantId: a.id, assistantFingerprint: entryFingerprint(a), prefixHash: historyFingerprint(h.entries), acceptedCount: 1, frontier: 1 });
-		const next = h.user("next question");
-		let thrown: unknown;
-		try {
-			selectRecoveryCompletion(readSavedSession(h.sm, h.cwd), next.id);
-		} catch (error) {
-			thrown = error;
-		}
-		expect(thrown).toBeInstanceOf(RecoveryError);
-		expect((thrown as RecoveryError).kind).toBe("mismatch");
-	});
-
 });
